@@ -1,0 +1,567 @@
+diff --git a/src/astf/astf_cost_metrics.h b/src/astf/astf_cost_metrics.h
+new file mode 100644
+--- /dev/null
++++ b/src/astf/astf_cost_metrics.h
+@@ -0,0 +1,172 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++#ifndef TREX_ASTF_COST_METRICS_H
++#define TREX_ASTF_COST_METRICS_H
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++
++// One DP writer, concurrent CP readers. Independent relaxed counters are not
++// a transactional snapshot. No heap allocations or locked RMW in probes.
++namespace astf_cost {
++enum Metric { FLOW_CREATE_C, FLOW_CREATE_S, FLOW_FREE_C, FLOW_FREE_S,
++    HANDSHAKE_C, HANDSHAKE_S, READ_C, READ_S, WRITE_C, WRITE_S,
++    FEED_C, FEED_S, SHUTDOWN_C, SHUTDOWN_S, WIRE_COPY, MBUF_ALLOC,
++    APP_CREATE, APP_FREE, PUMP, RX_BATCH, HS_RESULT_C, HS_RESULT_S,
++    HS_POST_C, HS_POST_S, HS_SSL_C, HS_SSL_S,
++    HS_STATE_BASE, COUNT = HS_STATE_BASE + 128 };
++inline std::string name(unsigned i) {
++    static const char *names[] = {"flow_create_client", "flow_create_server",
++        "flow_free_client", "flow_free_server", "handshake_client", "handshake_server",
++        "read_client", "read_server", "write_client", "write_server",
++        "feed_client", "feed_server", "shutdown_client", "shutdown_server",
++        "wire_copy", "mbuf_alloc", "app_create", "app_free", "pump", "rx_batch",
++        "handshake_result_client", "handshake_result_server",
++        "handshake_post_client", "handshake_post_server", "handshake_ssl_client", "handshake_ssl_server"};
++    static_assert(sizeof(names)/sizeof(names[0]) == HS_STATE_BASE, "metric names");
++    if (i < HS_STATE_BASE) return names[i];
++    unsigned state = (i-HS_STATE_BASE) % 64;
++    return std::string("handshake_state_") + ((i-HS_STATE_BASE)/64 ? "server_" : "client_") + std::to_string(state);
++}
++struct Snapshot {
++    uint64_t calls, bytes, samples, sampled_ns, max_sampled_ns;
++    std::array<uint64_t, 32> histogram;
++};
++// First successful negotiation on each side; immutable after release publication.
++// Later differing tuples are counted instead of silently overwriting evidence.
++struct Negotiation {
++    uint32_t version=0, cipher=0, group=0, signature=0, signature_type=0;
++    char group_name[80]={0};
++    bool operator==(const Negotiation &o) const {
++        return version==o.version && cipher==o.cipher && group==o.group && signature==o.signature && signature_type==o.signature_type;
++    }
++};
++class Metrics {
++    struct Counter {
++        std::atomic<uint64_t> calls{0}, bytes{0}, samples{0}, ns{0}, maximum{0};
++        std::array<std::atomic<uint64_t>, 32> histogram;
++        uint32_t random = 1; // DP-only sampling state
++        Counter() { for (auto &v : histogram) v.store(0, std::memory_order_relaxed); }
++    };
++    std::array<Counter, COUNT> counters;
++    struct StateLabel { char text[96]={0}; std::atomic<bool> ready{false}; } state_labels[128];
++    struct Negotiated {
++        Negotiation first;
++        std::atomic<bool> ready{false};
++        std::atomic<uint64_t> completed{0}, different{0};
++    } negotiated[2];
++    int shift_ = 8;
++    bool config_valid_ = true;
++    static void add(std::atomic<uint64_t> &v, uint64_t n) {
++        v.store(v.load(std::memory_order_relaxed) + n, std::memory_order_relaxed);
++    }
++public:
++    // Read once at DP object construction, before traffic. Invalid values
++    // disable collection and are explicitly reported by RPC.
++    Metrics() {
++        const char *v = std::getenv("TREX_ASTF_COST_SHIFT");
++        if (v) {
++            if (!std::strcmp(v, "off")) shift_ = -1;
++            else {
++                char *end = nullptr;
++                long n = std::strtol(v, &end, 10);
++                if (!*v || *end || n < 0 || n > 20) { shift_ = -1; config_valid_ = false; }
++                else shift_ = static_cast<int>(n);
++            }
++        }
++        for (unsigned i=0; i<COUNT; ++i) {
++            uint32_t seed = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(this)) ^ (0x9e3779b9u * (i+1));
++            counters[i].random = seed ? seed : i+1;
++        }
++    }
++    void state_label(unsigned index, const char *text) {
++        if (index>=128 || !text) return;
++        auto &s=state_labels[index];
++        if (!s.ready.load(std::memory_order_relaxed)) {
++            std::strncpy(s.text,text,sizeof(s.text)-1);
++            s.ready.store(true,std::memory_order_release);
++        }
++    }
++    const char *state_label(unsigned index) const {
++        if(index>=128 || !state_labels[index].ready.load(std::memory_order_acquire)) return "";
++        return state_labels[index].text;
++    }
++    void observe(bool server, const Negotiation &value) {
++        auto &n=negotiated[server ? 1 : 0];
++        if (!n.ready.load(std::memory_order_relaxed)) {
++            n.first=value;
++            n.ready.store(true, std::memory_order_release);
++        } else if (!(n.first==value)) add(n.different, 1);
++        add(n.completed, 1);
++    }
++    bool negotiation(bool server, Negotiation &value, uint64_t &completed, uint64_t &different) const {
++        const auto &n=negotiated[server ? 1 : 0];
++        if (!n.ready.load(std::memory_order_acquire)) return false;
++        value=n.first;
++        completed=n.completed.load(std::memory_order_relaxed);
++        different=n.different.load(std::memory_order_relaxed);
++        return true;
++    }
++    bool enabled() const { return shift_ >= 0; }
++    bool config_valid() const { return config_valid_; }
++    int shift() const { return shift_; }
++    bool select(Metric m) {
++        auto &x = counters[m].random;
++        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
++        return (x & ((1u << shift_) - 1)) == 0;
++    }
++    void finish(Metric m, uint64_t bytes, bool sampled, uint64_t ns) {
++        auto &c = counters[m];
++        add(c.calls, 1);
++        if (bytes) add(c.bytes, bytes);
++        if (!sampled) return;
++        add(c.samples, 1); add(c.ns, ns);
++        if (ns > c.maximum.load(std::memory_order_relaxed)) c.maximum.store(ns, std::memory_order_relaxed);
++        unsigned bin=0; uint64_t n=ns;
++        while (n > 1 && bin < 31) { n >>= 1; ++bin; }
++        add(c.histogram[bin], 1);
++    }
++    Snapshot snapshot(Metric m) const {
++        const auto &c = counters[m];
++        Snapshot s{c.calls.load(std::memory_order_relaxed), c.bytes.load(std::memory_order_relaxed),
++            c.samples.load(std::memory_order_relaxed), c.ns.load(std::memory_order_relaxed),
++            c.maximum.load(std::memory_order_relaxed), {}};
++        for (unsigned i=0;i<32;++i) s.histogram[i]=c.histogram[i].load(std::memory_order_relaxed);
++        return s;
++    }
++};
++// Function-local TLS in an inline function is shared across translation units.
++inline Metrics *&current() { static thread_local Metrics *p = nullptr; return p; }
++class Binding {
++    Metrics *previous;
++public:
++    explicit Binding(Metrics *p): previous(current()) { current() = p && p->enabled() ? p : nullptr; }
++    ~Binding() { current() = previous; }
++    Binding(const Binding &) = delete;
++    Binding &operator=(const Binding &) = delete;
++};
++class Probe {
++    Metrics *owner;
++    Metric metric;
++    uint64_t started=0, bytes_=0;
++    bool sampled=false;
++    static uint64_t now() {
++        return std::chrono::duration_cast<std::chrono::nanoseconds>(
++            std::chrono::steady_clock::now().time_since_epoch()).count();
++    }
++public:
++    explicit Probe(Metric m): owner(current()), metric(m) {
++        if (owner && (sampled=owner->select(m))) started=now();
++    }
++    void bytes(uint64_t n) { bytes_=n; }
++    ~Probe() {
++        if (owner) owner->finish(metric, bytes_, sampled, sampled ? now()-started : 0);
++    }
++    Probe(const Probe &) = delete;
++    Probe &operator=(const Probe &) = delete;
++};
++}
++#endif
+diff --git a/src/astf/astf_scheduler.h b/src/astf/astf_scheduler.h
+new file mode 100644
+--- /dev/null
++++ b/src/astf/astf_scheduler.h
+@@ -0,0 +1,60 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++#ifndef TREX_ASTF_SCHEDULER_H
++#define TREX_ASTF_SCHEDULER_H
++#include <array>
++#include <atomic>
++#include <cstdint>
++
++// DP-owned policy. Only snapshot() may be called by the control plane.
++// Diagnostics are monotonic per DP instance, not per profile/run; RPC readers
++// must use baseline deltas. Independent relaxed counters are not one transaction.
++class CAstfScheduler {
++public:
++    enum Counter { RECOVERIES, RECOVERED, STRETCHES, STRETCH_US, MAX_LAG_US,
++                   WAITS, WAIT_US, BATCH_YIELDS, RX_POLLS, COUNT };
++    static constexpr double recovery_seconds() { return 0.010; }
++    static constexpr double service_seconds() { return 0.0001; }
++    static constexpr unsigned batch_nodes() { return 32; }
++    CAstfScheduler() { for (auto &v : stats) v.store(0, std::memory_order_relaxed); }
++    void begin() { recovering = false; }
++    bool should_stretch(double now, double lag, double threshold, bool automatic) {
++        if (lag > 0) {
++            auto us = micros(lag);
++            if (us > stats[MAX_LAG_US].load(std::memory_order_relaxed))
++                stats[MAX_LAG_US].store(us, std::memory_order_relaxed);
++        }
++        if (lag <= threshold) {
++            if (recovering) add(RECOVERED);
++            recovering = false;
++            return false;
++        }
++        if (automatic) {
++            if (!recovering) { recovering = true; started = now; add(RECOVERIES); }
++            // Limit both continuous recovery work and queued time debt. A
++            // single event cannot be preempted; bounds apply between events.
++            if (lag <= recovery_seconds() && now - started < recovery_seconds())
++                return false;
++        }
++        recovering = false;
++        add(STRETCHES); add(STRETCH_US, micros(lag));
++        return true;
++    }
++    void waited(double seconds) { add(WAITS); if (seconds > 0) add(WAIT_US, micros(seconds)); }
++    void yielded() { add(BATCH_YIELDS); }
++    void polled_rx() { add(RX_POLLS); }
++    std::array<uint64_t, COUNT> snapshot() const {
++        std::array<uint64_t, COUNT> result{};
++        for (unsigned i=0;i<COUNT;++i) result[i]=stats[i].load(std::memory_order_relaxed);
++        return result;
++    }
++private:
++    static uint64_t micros(double seconds) { return static_cast<uint64_t>(seconds * 1000000.0); }
++    void add(Counter c, uint64_t value=1) {
++        // Single DP writer; the CP only loads. No locked RMW in packet work.
++        stats[c].store(stats[c].load(std::memory_order_relaxed)+value, std::memory_order_relaxed);
++    }
++    bool recovering = false;
++    double started = 0;
++    std::array<std::atomic<uint64_t>, COUNT> stats;
++};
++#endif
+diff --git a/src/bp_sim.cpp b/src/bp_sim.cpp
+--- a/src/bp_sim.cpp
++++ b/src/bp_sim.cpp
+@@ -3597,6 +3597,15 @@
+         }
+     }
+ 
++    const bool astf = SCH_MODE == smASTF;
++    // Explicit positive overrides keep their legacy meaning. Zero selects
++    // bounded recovery only for ASTF; STL and legacy STF are unchanged.
++    const bool automatic_recovery = astf && CGlobalInfo::m_burst_offset_dtime == 0.0;
++    if (astf) m_astf_scheduler.begin();
++#ifdef TREX_TLS
++    astf_cost::Binding cost_binding(astf ? &m_astf_cost : nullptr);
++#endif
++    dsec_t last_rx_service = now_sec();
+     thread->m_cpu_dp_u.start_work1();
+ 
+     sch_state_t state = scINIT;
+@@ -3612,15 +3621,30 @@
+             {
+                 dsec_t dt = cur_time - n_time ;
+ 
++                if (astf && dt > BURST_OFFSET_DTIME &&
++                    cur_time - last_rx_service >= CAstfScheduler::service_seconds()) {
++                    // Queued RX nodes can be behind a backlog of flow starts.
++                    // Poll without advancing the timer wheel or dropping nodes.
++                    thread->handle_rx_pkts(false);
++                    m_astf_scheduler.polled_rx();
++                    last_rx_service = now_sec();
++                    cur_time = last_rx_service;
++                    node = m_p_queue.top();
++                    n_time = node->m_time + offset;
++                    dt = cur_time - n_time;
++                }
+                 if (dt > BURST_OFFSET_DTIME) {
+                     // real time clock (not stretched)
+                     if ((cur_time - m_last_sync_time_sec) > SYNC_TIME_OUT) {
+                         handle_maintenance_job(node, n_time, offset, thread);
++                        if (astf) cur_time = now_sec();
+                         dt = cur_time - n_time;
+                     }
+                 }
+ 
+-                if (dt > burst_size) {
++                const bool stretch = astf ? m_astf_scheduler.should_stretch(
++                    cur_time, dt, burst_size, automatic_recovery) : dt > burst_size;
++                if (stretch) {
+                     state = scSTRECH;
+                 } else if (dt > 0) {
+                     state = scWORK;
+@@ -3634,9 +3658,12 @@
+          case scWORK:
+             {
+                 int node_count = 0;
++                const dsec_t batch_started = cur_time;
+                 do {
+ 
++                    const bool rx_node = astf && node->m_type == CGenNode::TCP_RX_FLUSH;
+                     bool s=do_work<SCH_MODE,ON_TERIMATE>(node,thread,d_time);
++                    if (rx_node) last_rx_service = now_sec();
+                     if (s) { // can we remove this IF ?
+                         state=scTERMINATE;
+                         break;
+@@ -3645,6 +3672,15 @@
+                     n_time = node->m_time + offset;
+                     node_count++;
+ 
++                    // Recheck wall-clock debt and service opportunities even
++                    // when one callback (e.g. TLS handshake) was expensive.
++                    if (astf && (node_count >= CAstfScheduler::batch_nodes() ||
++                        now_sec() - batch_started >= CAstfScheduler::service_seconds())) {
++                        m_astf_scheduler.yielded();
++                        state = scINIT;
++                        break;
++                    }
++
+                     /* we either out of the time frame or every 1024 nodes we get out for time checking */
+                     if ( ( (n_time - cur_time) > EAT_WINDOW_DTIME ) || (node_count > 1024) ) {
+                         state = scINIT;
+@@ -3656,7 +3692,11 @@
+             }
+ 
+          case scWAIT:
+-                do_sleep(cur_time,thread,n_time); // estimate  loop
++                {
++                    const dsec_t wait_started = cur_time;
++                    do_sleep(cur_time,thread,n_time); // estimate loop
++                    if (astf) m_astf_scheduler.waited(cur_time - wait_started);
++                }
+                 state=scWORK;
+                 break;
+ 
+@@ -3774,12 +3814,16 @@
+       if (on_terminate) {
+           if ( get_is_stateless() ) {
+               return ( flush_file_realtime<smSTATELESS,true>(max_time, d_time,thread,old_offset) );
++          }else if (get_is_tcp_mode()) {
++              return ( flush_file_realtime<smASTF,true>(max_time, d_time,thread,old_offset) );
+           }else{
+               return ( flush_file_realtime<smSTATEFUL,true>(max_time, d_time,thread,old_offset) );
+           }
+       }else{
+           if ( get_is_stateless() ) {
+               return ( flush_file_realtime<smSTATELESS,false>(max_time, d_time,thread,old_offset) );
++          }else if (get_is_tcp_mode()) {
++              return ( flush_file_realtime<smASTF,false>(max_time, d_time,thread,old_offset) );
+           }else{
+               return ( flush_file_realtime<smSTATEFUL,false>(max_time, d_time,thread,old_offset) );
+           }
+diff --git a/src/bp_sim.h b/src/bp_sim.h
+--- a/src/bp_sim.h
++++ b/src/bp_sim.h
+@@ -21,6 +21,8 @@
+ limitations under the License.
+ */
+ 
++#include "astf/astf_scheduler.h"
++#include "astf/astf_cost_metrics.h"
+ #include <stddef.h>
+ #include <stdio.h>
+ #include <stdint.h>
+@@ -1256,6 +1258,7 @@
+ 
+    typedef enum { smSTATELESS = 0x17,
+                   smSTATEFUL  ,
++                  smASTF      ,
+                  } sch_mode_t;
+ 
+    #define BURST_OFFSET_DTIME    (100.0/1000000)
+@@ -1411,6 +1414,8 @@
+     uint64_t                  m_non_active;
+     uint64_t                  m_limit;
+     CTimeHistogram            m_realtime_his;
++    CAstfScheduler            m_astf_scheduler;
++    astf_cost::Metrics        m_astf_cost;
+     dsec_t                    m_scheduler_offset;
+     dsec_t                    nanosleep_overhead; // approx
+ 
+@@ -2930,31 +2935,31 @@
+ 
+ struct CFlowsYamlInfo {
+ public:
+-    double          m_duration_sec;    //duration in sec for the cap file
++    double          m_duration_sec = 0;    //duration in sec for the cap file
+ // IPv6 addressing
+     std::vector     <uint16_t> m_src_ipv6;
+     std::vector     <uint16_t> m_dst_ipv6;
+-    bool             m_ipv6_set;
++    bool             m_ipv6_set = 0;
+ 
+ // new section
+-    bool            m_cap_mode;
+-    bool            m_cap_mode_set;
+-
+-    double          m_cap_ipg_min;
+-    bool            m_cap_ipg_min_set;
+-
+-    double          m_cap_overide_ipg;
+-    bool            m_cap_overide_ipg_set;
+-
+-    bool            m_one_app_server;
+-    bool            m_one_app_server_was_set;
+-    uint8_t         m_mac_ip_overide_mode;
++    bool            m_cap_mode = 0;
++    bool            m_cap_mode_set = 0;
++
++    double          m_cap_ipg_min = 0;
++    bool            m_cap_ipg_min_set = 0;
++
++    double          m_cap_overide_ipg = 0;
++    bool            m_cap_overide_ipg_set = 0;
++
++    bool            m_one_app_server = 0;
++    bool            m_one_app_server_was_set = 0;
++    uint8_t         m_mac_ip_overide_mode = 0;
+ 
+     CVlanYamlInfo   m_vlan_info;
+     CTupleGenYamlInfo m_tuple_gen;
+-    bool              m_tuple_gen_was_set;
++    bool              m_tuple_gen_was_set = 0;
+     std::vector     <CFlowYamlInfo> m_vec;
+-    bool            m_is_plugin_configured; /* any plugin  is configured */
++    bool            m_is_plugin_configured = 0; /* any plugin  is configured */
+ 
+     CTimerWheelYamlInfo         m_tw;
+ 
+diff --git a/src/bp_sim_tcp.cpp b/src/bp_sim_tcp.cpp
+--- a/src/bp_sim_tcp.cpp
++++ b/src/bp_sim_tcp.cpp
+@@ -306,6 +306,9 @@
+ 
+ template<bool ASTF_SOFTWARE_RSS>
+ uint16_t CFlowGenListPerThread::handle_rx_pkts(bool is_idle) {
++    #ifdef TREX_TLS
++    astf_cost::Probe cost_probe(astf_cost::RX_BATCH);
++    #endif
+     CVirtualIF * v_if=m_node_gen.m_v_if;
+     rte_mbuf_t * rx_pkts[64];
+     int dir;
+@@ -813,6 +816,16 @@
+     if ( !template_db ) {
+         throw TrexException("Could not create RO template database");
+     }
++#ifdef TREX_TLS
++    try {
++        m_c_tcp->get_profile_ctx(profile_id)->m_tls_contexts.prepare(template_db->tls_programs(false));
++        m_s_tcp->get_profile_ctx(profile_id)->m_tls_contexts.prepare(template_db->tls_programs(true));
++    } catch (const std::exception &error) {
++        m_c_tcp->get_profile_ctx(profile_id)->m_tls_contexts.clear();
++        m_s_tcp->get_profile_ctx(profile_id)->m_tls_contexts.clear();
++        throw TrexException(std::string("Could not prepare worker TLS: ") + error.what());
++    }
++#endif
+     m_c_tcp->set_template_ro(template_db, profile_id);
+     m_c_tcp->resize_stats(profile_id);
+     m_s_tcp->set_template_ro(template_db, profile_id);
+@@ -854,6 +867,10 @@
+     m_c_tcp->remove_active_profile(profile_id);
+     m_s_tcp->remove_active_profile(profile_id);
+ 
++#ifdef TREX_TLS
++    m_c_tcp->get_profile_ctx(profile_id)->m_tls_contexts.clear();
++    m_s_tcp->get_profile_ctx(profile_id)->m_tls_contexts.clear();
++#endif
+     if (astf_db) {
+         astf_db->clear_db_ro_rw(nullptr, m_thread_id);
+     }
+diff --git a/src/main_dpdk.cpp b/src/main_dpdk.cpp
+--- a/src/main_dpdk.cpp
++++ b/src/main_dpdk.cpp
+@@ -19,6 +19,9 @@
+   limitations under the License.
+ */
+ #include <assert.h>
++#ifdef TREX_TLS
++#include <openssl/crypto.h>
++#endif
+ #include <pthread.h>
+ #include <signal.h>
+ #include <pwd.h>
+@@ -7549,6 +7552,57 @@
+         CFlowGenListPerThread *lp = g_trex.m_fl.m_threads_info[thread_id];
+         cpu_vct_st &per_cpu = cpu_util_full[thread_id];
+         lp->m_cpu_cp_u.GetHistory(per_cpu);
++        if (get_is_tcp_mode()) {
++            const char *names[] = {"recoveries", "recovered", "stretches", "stretch_us",
++                "max_lag_us", "waits", "wait_us", "batch_yields", "rx_polls"};
++            static_assert(sizeof(names)/sizeof(names[0]) == CAstfScheduler::COUNT, "scheduler counters");
++#ifdef TREX_TLS
++            auto &cost = lp->m_node_gen.m_astf_cost;
++            auto &json = per_cpu.m_tls_cost;
++            json["schema"] = 2;
++            json["openssl_runtime"] = OpenSSL_version(OPENSSL_VERSION); // Legacy collector field.
++            json["tls_backend"] = "aws-lc";
++            json["tls_backend_version"] = OpenSSL_version(OPENSSL_VERSION);
++            json["scope"] = "dp_lifetime_realtime_scheduler";
++            json["clock"] = "steady_clock_elapsed_ns";
++            json["enabled"] = cost.enabled();
++            json["config_valid"] = cost.config_valid();
++            json["sample_shift"] = cost.shift();
++            json["metrics"] = Json::objectValue;
++            json["negotiated"] = Json::objectValue;
++            if (cost.enabled()) for (unsigned side=0; side<2; ++side) {
++                astf_cost::Negotiation n; uint64_t completed=0, different=0;
++                if (!cost.negotiation(side != 0, n, completed, different)) continue;
++                auto &v=json["negotiated"][side ? "server" : "client"];
++                v["tls_version_id"]=n.version;
++                v["cipher_protocol_id"]=n.cipher;
++                v["group_id"]=n.group;
++                v["group_name"]=n.group_name;
++                v["signature_digest_nid"]=n.signature;
++                v["signature_type_nid"]=n.signature_type;
++                v["completed"]=Json::UInt64(completed);
++                v["different_from_first"]=Json::UInt64(different);
++            }
++            if (cost.enabled()) for (unsigned i=0; i<astf_cost::COUNT; ++i) {
++                auto v = cost.snapshot(static_cast<astf_cost::Metric>(i));
++                if (i >= astf_cost::HS_STATE_BASE && !v.calls) continue;
++                auto &row = json["metrics"][astf_cost::name(i)];
++                if (i>=astf_cost::HS_STATE_BASE) row["entry_state"]=cost.state_label(i-astf_cost::HS_STATE_BASE);
++                row["calls"] = Json::UInt64(v.calls);
++                row["bytes"] = Json::UInt64(v.bytes);
++                row["samples"] = Json::UInt64(v.samples);
++                row["sampled_ns"] = Json::UInt64(v.sampled_ns);
++                row["max_sampled_ns"] = Json::UInt64(v.max_sampled_ns);
++                row["histogram_log2_ns"] = Json::objectValue;
++                for (unsigned bin=0; bin<32; ++bin)
++                    if (v.histogram[bin]) row["histogram_log2_ns"][std::to_string(bin)] = Json::UInt64(v.histogram[bin]);
++            }
++#endif
++            auto values = lp->m_node_gen.m_astf_scheduler.snapshot();
++            per_cpu.m_scheduler["scope"] = "dp_lifetime";
++            for (unsigned i=0; i<CAstfScheduler::COUNT; ++i)
++                per_cpu.m_scheduler[names[i]] = Json::UInt64(values[i]);
++        }
+ 
+ 
+         /* active ports */
+diff --git a/src/stx/common/trex_rpc_cmds_common.cpp b/src/stx/common/trex_rpc_cmds_common.cpp
+--- a/src/stx/common/trex_rpc_cmds_common.cpp
++++ b/src/stx/common/trex_rpc_cmds_common.cpp
+@@ -615,6 +615,10 @@
+         section["cpu"][thread_id]["ports"] = Json::arrayValue;
+         section["cpu"][thread_id]["ports"].append(cpu_util_full[thread_id].m_port1);
+         section["cpu"][thread_id]["ports"].append(cpu_util_full[thread_id].m_port2);
++        if (!cpu_util_full[thread_id].m_tls_cost.isNull())
++            section["cpu"][thread_id]["tls_cost"] = cpu_util_full[thread_id].m_tls_cost;
++        if (!cpu_util_full[thread_id].m_scheduler.isNull())
++            section["cpu"][thread_id]["scheduler"] = cpu_util_full[thread_id].m_scheduler;
+     }
+     
+     return (TREX_RPC_CMD_OK);
+diff --git a/src/trex_defs.h b/src/trex_defs.h
+--- a/src/trex_defs.h
++++ b/src/trex_defs.h
+@@ -63,6 +63,8 @@
+         m_port2 = -1;
+     }
+     std::vector<uint8_t> m_history;
++    Json::Value m_scheduler; // optional ASTF per-DP diagnostics
++    Json::Value m_tls_cost; // optional sampled C++ timings
+     int m_port1;
+     int m_port2;
+ };

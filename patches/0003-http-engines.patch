@@ -1,0 +1,599 @@
+diff --git a/src/44bsd/http/astf_http.h b/src/44bsd/http/astf_http.h
+new file mode 100644
+--- /dev/null
++++ b/src/44bsd/http/astf_http.h
+@@ -0,0 +1,197 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++#ifndef TREX_ASTF_HTTP_H
++#define TREX_ASTF_HTTP_H
++#include <algorithm>
++#include <cstdint>
++#include <cstring>
++#include <vector>
++#include <string>
++namespace astf_http {
++struct Config {
++    bool enabled=false;
++    uint32_t responses=1, max_header_bytes=16384;
++    uint64_t max_body_bytes=1073741824;
++    unsigned expected_status=200;
++    std::string body_contains; // UTF-8 bytes in the dechunked body, per response.
++    bool transactions=false;
++};
++enum class Error { NONE, STATUS, FRAMING, LIMIT, TRUNCATED, EXCESS, CONTENT, TRANSACTION };
++// Streaming HTTP/1.x GET response validator. A single bounded allocation at
++// flow creation; body bytes are skipped, never retained or copied. No callbacks
++// into the application while the parser holds an input buffer.
++class Response {
++public:
++    typedef bool (*Event)(void *, bool); // false: first byte; true: validated response end
++    explicit Response(const Config &c, Event event=nullptr, void *owner=nullptr):
++        cfg(c), line(c.max_header_bytes+1), prefix(c.body_contains.size()), event(event), owner(owner) {
++        for (size_t i=1,j=0;i<prefix.size();++i) {
++            while (j && cfg.body_contains[i]!=cfg.body_contains[j]) j=prefix[j-1];
++            if (cfg.body_contains[i]==cfg.body_contains[j]) ++j;
++            prefix[i]=j;
++        }
++    }
++    uint32_t completed() const { return count; }
++    bool done() const { return error==Error::NONE && count==cfg.responses; }
++    Error failure() const { return error; }
++    bool feed(const uint8_t *p, size_t len) {
++        if (error!=Error::NONE) return false;
++        while (len) {
++            if (error!=Error::NONE) return false;
++            if (done()) return fail(Error::EXCESS);
++            if (!started) {
++                if (event && !event(owner,false)) return fail(Error::TRANSACTION);
++                started=true;
++            }
++            if (state==BODY || state==CHUNK_BODY) {
++                size_t n=size_t(std::min<uint64_t>(left,len));
++                body_data(p,n); p+=n; len-=n; left-=n;
++                if (!left) { if (state==BODY) finish(); else state=CHUNK_CR; }
++                continue;
++            }
++            if (state==CLOSE_BODY) {
++                if (len>cfg.max_body_bytes-body) return fail(Error::LIMIT);
++                body_data(p,len); body+=len; return true;
++            }
++            if (state==CHUNK_CR || state==CHUNK_LF) {
++                if (*p++ != (state==CHUNK_CR ? '\r' : '\n')) return fail(Error::FRAMING);
++                --len; state=state==CHUNK_CR ? CHUNK_LF : CHUNK_SIZE; continue;
++            }
++            unsigned char c=*p++; --len;
++            if ((c<32 && c!='\r' && c!='\n' && c!='\t') || c==127) return fail(Error::FRAMING);
++            if (used>=cfg.max_header_bytes) return fail(Error::LIMIT);
++            line[used++]=char(c);
++            if (state!=CHUNK_SIZE && ++header_bytes>cfg.max_header_bytes) return fail(Error::LIMIT);
++            if (c!='\n') continue;
++            if (used<2 || line[used-2]!='\r') return fail(Error::FRAMING);
++            size_t n=used-2; line[n]=0;
++            if (std::memchr(line.data(),'\r',n)) return fail(Error::FRAMING);
++            used=0;
++            if (state==STATUS_LINE) {
++                if (n<12 || (std::memcmp(line.data(),"HTTP/1.1 ",9) && std::memcmp(line.data(),"HTTP/1.0 ",9)) ||
++                    (n>12 && line[12]!=' ')) return fail(Error::FRAMING);
++                status=0;
++                for (size_t i=9;i<12;++i) {
++                    if (line[i]<'0'||line[i]>'9') return fail(Error::FRAMING);
++                    status=status*10+unsigned(line[i]-'0');
++                }
++                if (status<100 || status>599 || status==101) return fail(Error::FRAMING);
++                state=HEADERS;
++            } else if (state==HEADERS) {
++                if (n) { if (!field(n,false)) return false; }
++                else {
++                    if (has_length && chunked) return fail(Error::FRAMING);
++                    if (status<200) {
++                        if (has_length || chunked || ++interims>16) return fail(Error::FRAMING);
++                        state=STATUS_LINE; // Bound all informational headers together.
++                    } else {
++                        if (status!=cfg.expected_status) return fail(Error::STATUS);
++                        if (status==204 || status==304) {
++                            if (chunked || (status==204 && left)) return fail(Error::FRAMING);
++                            finish();
++                        } else if (chunked) state=CHUNK_SIZE;
++                        else if (has_length) { if (left) state=BODY; else finish(); }
++                        else state=CLOSE_BODY;
++                    }
++                }
++            } else if (state==CHUNK_SIZE) {
++                uint64_t value=0; size_t i=0;
++                for (;i<n && line[i]!=';';++i) {
++                    int digit=hex(line[i]);
++                    if (digit<0) return fail(Error::FRAMING);
++                    if (uint64_t(digit)>cfg.max_body_bytes || value>(cfg.max_body_bytes-uint64_t(digit))/16)
++                        return fail(Error::LIMIT);
++                    value=value*16+unsigned(digit);
++                }
++                if (!i) return fail(Error::FRAMING);
++                if (value>cfg.max_body_bytes-body) return fail(Error::LIMIT);
++                body+=value; left=value;
++                if (value) state=CHUNK_BODY;
++                else { state=TRAILERS; header_bytes=0; }
++            } else if (state==TRAILERS) {
++                if (n) { if (!field(n,true)) return false; }
++                else finish();
++            }
++        }
++        return error==Error::NONE;
++    }
++    bool eof() {
++        if (error!=Error::NONE) return false;
++        if (state==CLOSE_BODY) finish();
++        if (error!=Error::NONE) return false;
++        return done() || fail(Error::TRUNCATED);
++    }
++private:
++    enum State { STATUS_LINE, HEADERS, BODY, CLOSE_BODY, CHUNK_SIZE, CHUNK_BODY, CHUNK_CR, CHUNK_LF, TRAILERS };
++    Config cfg;
++    std::vector<char> line;
++    std::vector<size_t> prefix;
++    Event event; void *owner;
++    size_t matched=0;
++    bool found=false, started=false;
++    void body_data(const uint8_t *p, size_t n) {
++        if (cfg.body_contains.empty() || found) return;
++        for (size_t i=0;i<n;++i) {
++            while (matched && p[i]!=uint8_t(cfg.body_contains[matched])) matched=prefix[matched-1];
++            if (p[i]==uint8_t(cfg.body_contains[matched])) ++matched;
++            if (matched==cfg.body_contains.size()) { found=true; return; }
++        }
++    }
++    State state=STATUS_LINE;
++    Error error=Error::NONE;
++    uint32_t count=0, interims=0;
++    size_t used=0, header_bytes=0;
++    uint64_t left=0, body=0;
++    unsigned status=0;
++    bool has_length=false, chunked=false;
++    bool fail(Error e) { error=e; return false; }
++    static int hex(char c) {
++        if (c>='0' && c<='9') return c-'0';
++        if (c>='a' && c<='f') return c-'a'+10;
++        if (c>='A' && c<='F') return c-'A'+10;
++        return -1;
++    }
++    static bool equal(const char *p, size_t n, const char *expected) {
++        if (n!=std::strlen(expected)) return false;
++        for (size_t i=0;i<n;++i) {
++            char c=p[i]; if (c>='A' && c<='Z') c+=('a'-'A');
++            if (c!=expected[i]) return false;
++        }
++        return true;
++    }
++    bool field(size_t n, bool trailer) {
++        size_t colon=0;
++        while (colon<n && line[colon]!=':') {
++            unsigned char c=line[colon++];
++            if (!((c>='a'&&c<='z') || (c>='A'&&c<='Z') || (c>='0'&&c<='9') ||
++                  std::strchr("!#$%&'*+-.^_`|~",c))) return fail(Error::FRAMING);
++        }
++        if (!colon || colon==n) return fail(Error::FRAMING);
++        size_t first=colon+1;
++        while (first<n && (line[first]==' ' || line[first]=='\t')) ++first;
++        while (n>first && (line[n-1]==' ' || line[n-1]=='\t')) --n;
++        if (equal(line.data(),colon,"content-length")) {
++            if (trailer || has_length || first==n) return fail(Error::FRAMING);
++            uint64_t value=0;
++            for (size_t i=first;i<n;++i) {
++                if (line[i]<'0' || line[i]>'9') return fail(Error::FRAMING);
++                unsigned digit=unsigned(line[i]-'0');
++                if (digit>cfg.max_body_bytes || value>(cfg.max_body_bytes-digit)/10) return fail(Error::LIMIT);
++                value=value*10+digit;
++            }
++            has_length=true; left=value;
++        } else if (equal(line.data(),colon,"transfer-encoding")) {
++            if (trailer || chunked || !equal(line.data()+first,n-first,"chunked")) return fail(Error::FRAMING);
++            chunked=true;
++        }
++        return true;
++    }
++    void finish() {
++        if (!cfg.body_contains.empty() && !found) { fail(Error::CONTENT); return; }
++        if (event && !event(owner,true)) { fail(Error::TRANSACTION); return; }
++        matched=0; found=started=false;
++        ++count; state=STATUS_LINE; used=header_bytes=0; left=body=0;
++        has_length=chunked=false; interims=0;
++    }
++};
++}
++#endif
+diff --git a/src/44bsd/http/astf_http_transactions.h b/src/44bsd/http/astf_http_transactions.h
+new file mode 100644
+--- /dev/null
++++ b/src/44bsd/http/astf_http_transactions.h
+@@ -0,0 +1,29 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++#ifndef TREX_HTTP_TRANSACTIONS_H
++#define TREX_HTTP_TRANSACTIONS_H
++#include <array>
++#include <cstdint>
++namespace astf_http {
++class Transactions {
++    struct Entry { uint64_t start=0, first=0; bool received=false; };
++    std::array<Entry,64> entries{};
++    unsigned head=0, count=0;
++public:
++    bool request(uint64_t now) {
++        if (count==entries.size()) return false;
++        auto &e=entries[(head+count)%entries.size()]; e=Entry(); e.start=now; ++count;
++        return true;
++    }
++    bool first(uint64_t now) {
++        if (!count || entries[head].received || now<entries[head].start) return false;
++        entries[head].first=now; entries[head].received=true; return true;
++    }
++    bool complete(uint64_t now,uint64_t &first_ns,uint64_t &last_ns) {
++        if (!count || !entries[head].received || now<entries[head].first) return false;
++        const auto &e=entries[head]; first_ns=e.first-e.start; last_ns=now-e.start;
++        head=(head+1)%entries.size(); --count; return true;
++    }
++    unsigned pending() const { return count; }
++};
++}
++#endif
+diff --git a/src/44bsd/http2/astf_http2.cpp b/src/44bsd/http2/astf_http2.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/44bsd/http2/astf_http2.cpp
+@@ -0,0 +1,301 @@
++#include "astf_http2.h"
++#ifdef TREX_TLS
++#include <nghttp2/nghttp2.h>
++#include <array>
++#include <vector>
++#include <cstdio>
++#include <algorithm>
++#include <cstring>
++#include <stdexcept>
++namespace astf_http2 {
++struct Session::Impl {
++    struct Stream {
++        int32_t id=0;
++        uint64_t start=0, first=0, last=0, received=0, sent=0;
++        size_t headers=0;
++        unsigned status=0;
++        bool first_seen=false, responding=false, valid_method=false;
++    };
++    const Config &cfg;
++    Callback callback; void *owner;
++    nghttp2_session *session=nullptr;
++    std::vector<Stream> streams;
++    // Stable application-owned output until fully accepted by TLS. nghttp2
++    // receive callbacks may run while an SSL_write retry still refers to it.
++    // output() exposes only [offset, used), written before publication.
++    std::array<uint8_t,65536> wire;
++    size_t used=0, offset=0;
++    uint64_t now=0, response_first=0, response_last=0, frame_first=0, frame_last=0;
++    bool response_seen=false;
++    // Client-side framing cursor: retain the first fragment's timestamp even
++    // when the 9-byte HEADERS header or its HPACK block spans input calls.
++    std::array<uint8_t,9> rx_header{};
++    size_t rx_header_used=0;
++    uint32_t rx_remaining=0;
++    uint32_t submitted=0, completed=0, active=0;
++    uint64_t wait_until=0, pacing_now=0;
++    bool external_clock=false;
++    bool incomplete=false;
++    bool bad=false, sent_goaway=false, received_goaway=false, transport_eof=false, remote_settings=false;
++    void event(Event e,uint64_t a=0,uint64_t b=0) { if(callback) callback(owner,e,a,b); }
++    void fail() { if(!bad) {bad=true;event(Event::ERROR);} }
++    Stream *find(int32_t id) { for(auto &s:streams) if(s.id==id) return &s; return nullptr; }
++    Stream *allocate(int32_t id) {
++        if(active>=cfg.concurrency) return nullptr;
++        for(auto &s:streams) if(!s.id) {s=Stream{};s.id=id;s.start=now;++active;return &s;}
++        return nullptr;
++    }
++    static Impl &self(void *v) {return *static_cast<Impl *>(v);}
++    static nghttp2_nv nv(const char *n,const char *v) {
++        return {reinterpret_cast<uint8_t *>(const_cast<char *>(n)),
++                reinterpret_cast<uint8_t *>(const_cast<char *>(v)),strlen(n),strlen(v),NGHTTP2_NV_FLAG_NONE};
++    }
++    static int begin(nghttp2_session *,const nghttp2_frame *f,void *v) {
++        auto &p=self(v);
++        if(p.cfg.server && f->hd.type==NGHTTP2_HEADERS && f->headers.cat==NGHTTP2_HCAT_REQUEST) {
++            if(!p.allocate(f->hd.stream_id)) {p.fail();return NGHTTP2_ERR_CALLBACK_FAILURE;}
++            p.event(Event::REQUEST);
++        }
++        return 0;
++    }
++    static int header(nghttp2_session *,const nghttp2_frame *f,const uint8_t *name,size_t n,
++                      const uint8_t *value,size_t len,uint8_t,void *v) {
++        auto &p=self(v);auto s=p.find(f->hd.stream_id);
++        if(!s) return 0;
++        if(n>p.cfg.max_header_size || len>p.cfg.max_header_size-n ||
++           s->headers>p.cfg.max_header_size-n-len) {p.fail();return NGHTTP2_ERR_CALLBACK_FAILURE;}
++        s->headers+=n+len;
++        if(!p.cfg.server && n==7 && !memcmp(name,":status",7)) {
++            if(len!=3 || value[0]<'1' || value[0]>'5' || value[1]<'0' || value[1]>'9' || value[2]<'0' || value[2]>'9') {
++                p.fail();return NGHTTP2_ERR_CALLBACK_FAILURE;
++            }
++            s->status=(value[0]-'0')*100+(value[1]-'0')*10+value[2]-'0';
++        }
++        if(p.cfg.server && n==7 && !memcmp(name,":method",7)) s->valid_method=len==3 && !memcmp(value,"GET",3);
++        return 0;
++    }
++    static ssize_t read_length(nghttp2_session *,uint8_t,int32_t,int32_t connection_window,
++                               int32_t stream_window,uint32_t frame_size,void *) {
++        return std::min<int64_t>(16384,std::min<int64_t>(frame_size,std::min(connection_window,stream_window)));
++    }
++    static ssize_t body(nghttp2_session *,int32_t id,uint8_t *out,size_t len,uint32_t *flags,
++                        nghttp2_data_source *,void *v) {
++        auto &p=self(v);auto s=p.find(id);
++        if(!s) return NGHTTP2_ERR_CALLBACK_FAILURE;
++        size_t n=std::min<uint64_t>(len,p.cfg.response_size(id)-s->sent);
++        memset(out,'x',n);s->sent+=n;
++        if(s->sent==p.cfg.response_size(id)) *flags|=NGHTTP2_DATA_FLAG_EOF;
++        return n;
++    }
++    static int data(nghttp2_session *,uint8_t,int32_t id,const uint8_t *,size_t len,void *v) {
++        auto &p=self(v);auto s=p.find(id);
++        if(s) {
++            if(len>p.cfg.max_body_size-s->received) {p.fail();return NGHTTP2_ERR_CALLBACK_FAILURE;}
++            s->received+=len;
++        }
++        return 0;
++    }
++    void goaway() {
++        if(!sent_goaway) {
++            sent_goaway=true;
++            if(nghttp2_submit_goaway(session,NGHTTP2_FLAG_NONE,
++                nghttp2_session_get_last_proc_stream_id(session),NGHTTP2_NO_ERROR,nullptr,0)) fail();
++        }
++    }
++    static int frame(nghttp2_session *,const nghttp2_frame *f,void *v) {
++        auto &p=self(v);auto s=p.find(f->hd.stream_id);
++        if(f->hd.type==NGHTTP2_SETTINGS && !(f->hd.flags&NGHTTP2_FLAG_ACK)) p.remote_settings=true;
++        if(f->hd.type==NGHTTP2_GOAWAY) {
++            p.received_goaway=true;p.event(Event::GOAWAY);
++            // nghttp2 closes streams above last_stream_id as REFUSED_STREAM.
++            // Streams accepted by the peer may still receive their responses.
++            if(f->goaway.error_code) p.fail();
++        }
++        if(s && p.cfg.server && !s->responding &&
++            (f->hd.type==NGHTTP2_HEADERS || f->hd.type==NGHTTP2_DATA) && (f->hd.flags&NGHTTP2_FLAG_END_STREAM)) {
++            if(!s->valid_method) {p.fail();return NGHTTP2_ERR_CALLBACK_FAILURE;}
++            char status[4], length[24];snprintf(status,sizeof(status),"%u",p.cfg.status);
++            snprintf(length,sizeof(length),"%u",p.cfg.response_size(s->id));
++            nghttp2_nv headers[]={nv(":status",status),nv("content-length",length),nv("content-type","application/octet-stream")};
++            nghttp2_data_provider provider{};provider.read_callback=body;
++            s->responding=true;
++            if(nghttp2_submit_response(p.session,s->id,headers,3,p.cfg.response_size(s->id)?&provider:nullptr)) {
++                p.fail();return NGHTTP2_ERR_CALLBACK_FAILURE;
++            }
++        }
++        return 0;
++    }
++    static int close(nghttp2_session *,int32_t id,uint32_t error,void *v) {
++        auto &p=self(v);auto s=p.find(id);
++        if(!s) return 0;
++        if(error) {
++            p.event(Event::RESET);
++            // A graceful GOAWAY can refuse higher stream IDs while lower
++            // accepted streams are still in flight. Preserve their responses.
++            if(!p.cfg.server && error==NGHTTP2_REFUSED_STREAM) p.incomplete=true;
++            else p.fail();
++        }
++        else if(!p.cfg.server) {
++            if(!s->first_seen || s->status!=p.cfg.expected_status ||
++               (!p.cfg.body_sizes.empty() && s->received!=p.cfg.response_size(id))) p.fail();
++            else {++p.completed;p.response_last=std::max(p.response_last,s->last);p.event(Event::RESPONSE,s->first>=s->start?s->first-s->start:0,s->last>=s->start?s->last-s->start:0);}
++        } else {++p.completed;p.event(Event::RESPONSE);}
++        if(!p.cfg.server && !p.bad && !error) {
++            const uint32_t pause=p.completed==p.cfg.requests?p.cfg.final_hold_ms:p.cfg.request_interval_ms;
++            p.wait_until=pause?p.pacing_now+uint64_t(pause)*1000000:0;
++        }
++        s->id=0;--p.active;
++        return 0;
++    }
++    static int invalid(nghttp2_session *,const nghttp2_frame *,int,void *v) {
++        self(v).fail();return 0;
++    }
++    Impl(const Config &c,Callback cb,void *o):cfg(c),callback(cb),owner(o) {
++        if(cfg.request_interval_ms>3600000 || cfg.final_hold_ms>3600000 ||
++           (cfg.request_interval_ms && cfg.concurrency!=1) ||
++           (cfg.server && (cfg.request_interval_ms || cfg.final_hold_ms)) ||
++           !cfg.concurrency || cfg.concurrency>128 || !cfg.requests ||
++           cfg.status<200 || cfg.status>599 || cfg.body_sizes.size()>128) throw std::invalid_argument("invalid HTTP/2 configuration");
++        auto valid_size=[&](uint32_t size) {
++            return size<=1073741824 && size<=cfg.max_body_size &&
++                   (!size || (cfg.status!=204 && cfg.status!=304));
++        };
++        if(cfg.body_sizes.empty()) {
++            if(!valid_size(cfg.body_size)) throw std::invalid_argument("invalid HTTP/2 body size");
++        } else for(auto size:cfg.body_sizes) {
++            if(!valid_size(size)) throw std::invalid_argument("invalid HTTP/2 body sizes");
++        }
++        streams.resize(cfg.concurrency);
++        nghttp2_session_callbacks *callbacks=nullptr;nghttp2_option *options=nullptr;
++        if(nghttp2_session_callbacks_new(&callbacks)) throw std::bad_alloc();
++        if(nghttp2_option_new(&options)) {nghttp2_session_callbacks_del(callbacks);throw std::bad_alloc();}
++        nghttp2_session_callbacks_set_data_source_read_length_callback(callbacks,read_length);
++        nghttp2_session_callbacks_set_on_begin_headers_callback(callbacks,begin);
++        nghttp2_session_callbacks_set_on_header_callback(callbacks,header);
++        nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks,data);
++        nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks,frame);
++        nghttp2_session_callbacks_set_on_stream_close_callback(callbacks,close);
++        nghttp2_session_callbacks_set_on_invalid_frame_recv_callback(callbacks,invalid);
++        nghttp2_option_set_max_outbound_ack(options,32);
++        nghttp2_option_set_max_continuations(options,8);
++        nghttp2_option_set_max_send_header_block_length(options,16384);
++        nghttp2_option_set_max_deflate_dynamic_table_size(options,4096);
++        int rc=cfg.server ? nghttp2_session_server_new2(&session,callbacks,this,options) : nghttp2_session_client_new2(&session,callbacks,this,options);
++        nghttp2_option_del(options);nghttp2_session_callbacks_del(callbacks);
++        if(rc) throw std::bad_alloc();
++        nghttp2_settings_entry settings[]={{NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS,cfg.concurrency},
++            {NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE,cfg.max_header_size},{NGHTTP2_SETTINGS_ENABLE_PUSH,0}};
++        if(nghttp2_submit_settings(session,NGHTTP2_FLAG_NONE,settings,cfg.server?2:3)) {nghttp2_session_del(session);throw std::bad_alloc();}
++    }
++    ~Impl() {if(session) nghttp2_session_del(session);}
++    void schedule() {
++        if(bad)return;
++        if(wait_until && pacing_now>=wait_until)wait_until=0;
++        if(!cfg.server && remote_settings && !received_goaway && !incomplete) {
++            while(!wait_until && submitted<cfg.requests && active<std::min(cfg.concurrency,
++                nghttp2_session_get_remote_settings(session,NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS))) {
++                nghttp2_nv h[]={nv(":method","GET"),nv(":scheme",cfg.secure?"https":"http"),nv(":authority",cfg.authority.c_str()),nv(":path",cfg.path.c_str())};
++                int32_t id=nghttp2_submit_request(session,nullptr,h,4,nullptr,nullptr);
++                if(id<0 || !allocate(id)) {fail();return;}
++                ++submitted;event(Event::REQUEST);
++            }
++        }
++        if(!cfg.server && !active && (received_goaway || incomplete) && completed<cfg.requests) {
++            fail();return;
++        }
++        if(!active && ((!cfg.server && completed==cfg.requests && !wait_until) || received_goaway)) goaway();
++    }
++};
++Session::Session(const Config &c,Callback cb,void *o):p(new Impl(c,cb,o)) {}
++Session::~Session()=default;
++bool Session::input(const uint8_t *data,size_t len,uint64_t now) {
++    return input(data,len,now,now);
++}
++bool Session::input(const uint8_t *data,size_t len,uint64_t first,uint64_t last) {
++    p->now=last;
++    if(!p->external_clock)p->pacing_now=last;
++    if(p->bad)return false;
++    while(len && !p->bad) {
++        size_t chunk=len;
++        if(!p->cfg.server) {
++            if(p->rx_header_used<9) {
++                if(!p->rx_header_used) {p->frame_first=first;p->frame_last=last;}
++                chunk=std::min(len,9-p->rx_header_used);
++                memcpy(p->rx_header.data()+p->rx_header_used,data,chunk);
++                p->rx_header_used+=chunk;
++                if(p->rx_header_used==9) {
++                    const auto &h=p->rx_header;
++                    p->rx_remaining=(uint32_t(h[0])<<16)|(uint32_t(h[1])<<8)|h[2];
++                    int32_t id=(uint32_t(h[5]&0x7f)<<24)|(uint32_t(h[6])<<16)|(uint32_t(h[7])<<8)|h[8];
++                    auto stream=p->find(id);
++                    if(h[3]==NGHTTP2_HEADERS && stream && !stream->first_seen) {
++                        stream->first_seen=true;stream->first=p->frame_first;
++                        if(!p->response_seen) {p->response_seen=true;p->response_first=p->frame_first;}
++                    }
++                    // Feed contiguous header+payload in one library call.
++                    size_t body=std::min<size_t>(len-chunk,p->rx_remaining);
++                    chunk+=body;p->rx_remaining-=body;
++                }
++            } else {
++                chunk=std::min<size_t>(len,p->rx_remaining);
++                p->rx_remaining-=chunk;
++            }
++        }
++        if(!p->cfg.server) {
++            p->frame_last=std::max(p->frame_last,last);
++            if(p->rx_header_used==9) {
++                const auto &h=p->rx_header;
++                int32_t id=(uint32_t(h[5]&0x7f)<<24)|(uint32_t(h[6])<<16)|(uint32_t(h[7])<<8)|h[8];
++                auto stream=p->find(id);
++                if(stream && (h[3]==NGHTTP2_HEADERS || h[3]==NGHTTP2_CONTINUATION || h[3]==NGHTTP2_DATA))
++                    stream->last=std::max(stream->last,p->frame_last);
++            }
++        }
++        auto n=nghttp2_session_mem_recv(p->session,data,chunk);
++        if(n<0 || size_t(n)!=chunk) {p->fail();break;}
++        data+=chunk;len-=chunk;
++        if(!p->cfg.server && p->rx_header_used==9 && !p->rx_remaining)p->rx_header_used=0;
++    }
++    return !p->bad;
++}
++size_t Session::output(const uint8_t **out,uint64_t now) {
++    p->now=now;
++    if(!p->external_clock)p->pacing_now=now;
++    if(p->bad || p->transport_eof)return 0;
++    if(p->offset==p->used) {
++        p->offset=p->used=0;p->schedule();
++        if(p->bad)return 0;
++        // Gather already available frames, without waiting for more input.
++        // A HEADERS/WINDOW_UPDATE frame must not occupy a whole TCP queue slot
++        // or a separate TLS record. Never modify this buffer during a write retry.
++        unsigned budget=16;
++        while(p->used<16384 && budget--) {
++            const uint8_t *data=nullptr;auto n=nghttp2_session_mem_send(p->session,&data);
++            if(n<0 || size_t(n)>p->wire.size()-p->used) {p->fail();return 0;}
++            if(!n)break;
++            memcpy(p->wire.data()+p->used,data,n);p->used+=n;
++        }
++    }
++    *out=p->wire.data()+p->offset;
++    return p->used-p->offset;
++}
++void Session::consume(size_t n) {if(n>p->used-p->offset)p->fail();else p->offset+=n;}
++void Session::set_pacing_clock(uint64_t now) {p->external_clock=true;p->pacing_now=now;}
++uint64_t Session::next_wakeup_ns() const {return p->bad || p->received_goaway || p->transport_eof ? 0 : p->wait_until;}
++bool Session::failed() const {return p->bad;}
++bool Session::finished() const {return !p->bad && (p->transport_eof || (p->sent_goaway && !p->active && p->used==p->offset && !nghttp2_session_want_write(p->session)));}
++bool Session::response_times(uint64_t &first_ns,uint64_t &last_ns) const {
++    if(p->cfg.server || p->bad || !p->response_seen || p->completed!=p->cfg.requests)return false;
++    first_ns=p->response_first;last_ns=p->response_last;return true;
++}
++bool Session::eof() {
++    // GOAWAY has no mandatory acknowledgement. A TLS 1.2 peer can close
++    // after sending it; do not require writing our own GOAWAY after close_notify.
++    // Only discard remaining control output after every stream has completed.
++    if(p->active || (!p->cfg.server && p->completed!=p->cfg.requests) ||
++       (p->cfg.server && !p->completed)) p->fail();
++    p->transport_eof=true;
++    return !p->bad;
++}
++}
++#endif
+diff --git a/src/44bsd/http2/astf_http2.h b/src/44bsd/http2/astf_http2.h
+new file mode 100644
+--- /dev/null
++++ b/src/44bsd/http2/astf_http2.h
+@@ -0,0 +1,52 @@
++#ifndef ASTF_HTTP2_H
++#define ASTF_HTTP2_H
++#include <stdint.h>
++#include <stddef.h>
++#include <string>
++#include <memory>
++#include <vector>
++namespace astf_http2 {
++struct Config {
++    bool enabled=false, server=false, secure=true;
++    uint32_t requests=10, concurrency=1, body_size=16384, timeout_ms=30000;
++    // Optional cyclic response sizes, indexed by client stream ID (1, 3, ...).
++    // Shared immutable program configuration; no per-request allocation.
++    std::vector<uint32_t> body_sizes;
++    uint32_t response_size(int32_t stream_id) const {
++        return body_sizes.empty()?body_size:body_sizes[(uint32_t(stream_id-1)/2)%body_sizes.size()];
++    }
++    // Client-only pacing; positive intervals require sequential streams.
++    uint32_t request_interval_ms=0, final_hold_ms=0;
++    uint32_t max_body_size=1073741824, max_header_size=16384;
++    uint16_t status=200, expected_status=200;
++    std::string authority="localhost", path="/";
++};
++enum class Event { REQUEST, RESPONSE, RESET, GOAWAY, ERROR };
++using Callback = void (*)(void *, Event, uint64_t, uint64_t);
++// One session per TCP flow, owned and driven by its DP core. No socket I/O.
++class Session {
++public:
++    Session(const Config &, Callback, void *);
++    ~Session();
++    Session(const Session &)=delete;
++    Session &operator=(const Session &)=delete;
++    bool input(const uint8_t *, size_t, uint64_t now_ns);
++    bool input(const uint8_t *, size_t, uint64_t first_ns, uint64_t last_ns);
++    size_t output(const uint8_t **, uint64_t now_ns);
++    void consume(size_t);
++    // Next pacing wakeup, or zero. Caller also maintains the absolute session deadline.
++    uint64_t next_wakeup_ns() const;
++    // Separate scheduler time from RX timestamps (simulator clocks may differ).
++    void set_pacing_clock(uint64_t now_ns);
++    bool failed() const;
++    bool finished() const;
++    bool eof();
++    // Absolute software RX times for a complete, validated client connection.
++    // Control frames and connection shutdown do not extend this sample.
++    bool response_times(uint64_t &first_ns, uint64_t &last_ns) const;
++private:
++    struct Impl;
++    std::unique_ptr<Impl> p;
++};
++}
++#endif

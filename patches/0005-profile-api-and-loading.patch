@@ -1,0 +1,744 @@
+diff --git a/scripts/astf_schema.json b/scripts/astf_schema.json
+--- a/scripts/astf_schema.json
++++ b/scripts/astf_schema.json
+@@ -272,6 +272,16 @@
+                 "required": ["name","min_pkts"]
+            },
+            
++          "program_command_udp_request_t": {
++              "type": "object",
++              "properties": {
++                  "name": {"type": "string", "enum": ["udp_request"]},
++                  "buf_index": {"type": "integer", "minimum": 0},
++                  "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 60000}
++              },
++              "required": ["name", "buf_index", "timeout_ms"],
++              "additionalProperties": false
++          },
+           "program_command_tx_msg_t" : {
+                "type": "object",
+                 "properties": {
+@@ -293,7 +303,7 @@
+                 "properties": {
+                       "name": {
+                           "type" : "string",
+-                          "enum" : ["close_msg","connect","reset","nc"]
++                          "enum" : ["close_msg","connect","reset","nc","http_request","http2"]
+                       }
+                 },
+                 "required": ["name"]
+@@ -571,6 +581,33 @@
+               "type": "object",
+               
+               "properties": {
++                      "http2": {"type": "object", "additionalProperties": false, "properties": {"request_interval_ms": {"type": "integer", "minimum": 0, "maximum": 3600000}, "final_hold_ms": {"type": "integer", "minimum": 0, "maximum": 3600000},"server": {"type": "boolean"},"requests": {"type": "integer", "minimum": 1, "maximum": 1000000}, "concurrency": {"type": "integer", "minimum": 1, "maximum": 128}, "body_sizes": {"type": "array", "minItems": 1, "maxItems": 128, "items": {"type": "integer", "minimum": 0, "maximum": 1073741824}}, "body_size": {"type": "integer", "minimum": 0, "maximum": 1073741824}, "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 600000}, "max_body_size": {"type": "integer", "minimum": 0, "maximum": 1073741824}, "max_header_size": {"type": "integer", "minimum": 512, "maximum": 65536}, "status": {"type": "integer", "minimum": 200, "maximum": 599}, "expected_status": {"type": "integer", "minimum": 200, "maximum": 599}, "authority": {"type": "string", "minLength": 1, "maxLength": 1024}, "path": {"type": "string", "minLength": 1, "maxLength": 1024}}},
++                      "http": {"type": "object", "additionalProperties": false, "properties": {"body_contains": {"type": "string", "minLength": 1, "maxLength": 4096}, "transactions": {"type": "boolean"}, "responses": {"type": "integer", "minimum": 1, "maximum": 1000000}, "expected_status": {"type": "integer", "minimum": 200, "maximum": 599}, "max_header_bytes": {"type": "integer", "minimum": 512, "maximum": 65536}, "max_body_bytes": {"type": "integer", "minimum": 0, "maximum": 1073741824}}},
++                      "tls": {
++                          "type": "object",
++                          "additionalProperties": false,
++                          "properties": {
++                              "server": {"type": "boolean"},
++                              "verify": {"type": "boolean"},
++                              "version": {"enum": ["1.2", "1.3"]},
++                              "cipher_suite": {"enum": ["ECDHE-ECDSA-AES128-GCM-SHA256", "ECDHE-RSA-AES128-GCM-SHA256", "ECDHE-ECDSA-AES256-GCM-SHA384", "ECDHE-RSA-AES256-GCM-SHA384", "ECDHE-ECDSA-CHACHA20-POLY1305", "ECDHE-RSA-CHACHA20-POLY1305", "TLS_AES_128_GCM_SHA256", "TLS_AES_256_GCM_SHA384", "TLS_CHACHA20_POLY1305_SHA256"]},
++                              "require_client_cert": {"type": "boolean"},
++                              "groups": {"type": "array", "minItems": 1, "maxItems": 4, "uniqueItems": true, "items": {"enum": ["X25519", "P-256", "P-384", "P-521"]}},
++                              "signature_algorithms": {"type": "array", "minItems": 1, "maxItems": 10, "uniqueItems": true, "items": {"enum": ["rsa_pss_rsae_sha256", "rsa_pss_rsae_sha384", "rsa_pss_rsae_sha512", "ecdsa_secp256r1_sha256", "ecdsa_secp384r1_sha384", "ecdsa_secp521r1_sha512", "ed25519", "rsa_pkcs1_sha256", "rsa_pkcs1_sha384", "rsa_pkcs1_sha512"]}},
++                              "alpn": {"enum": ["http/1.1", "h2"]},
++                              "sni": {"type": "string"},
++                              "cert": {"type": "string"},
++                              "key": {"type": "string"},
++                              "ca": {"type": "string"},
++                              "psk_identity": {"type": "string"},
++                              "psk_hex": {"type": "string"},
++                              "resumption": {"type": "boolean"},
++                              "session_timeout": {"type": "integer", "minimum": 1, "maximum": 86400},
++                              "handshake_timeout_ms": {"type": "integer", "minimum": 1, "maximum": 600000},
++                              "close_timeout_ms": {"type": "integer", "minimum": 1, "maximum": 600000}
++                          },
++                          "required": ["server"]
++                      },
+                       "commands": {
+                             "type": "array",
+                             "items": {
+@@ -580,6 +617,7 @@
+                                     {"$ref": "#/definitions/program_command_keepalive_t"},
+                                     {"$ref": "#/definitions/program_command_rx_msg_t"},
+                                     {"$ref": "#/definitions/program_command_tx_msg_t"},
++                                    {"$ref": "#/definitions/program_command_udp_request_t"},
+                                     {"$ref": "#/definitions/program_command_gen_t"},
+                                     {"$ref": "#/definitions/program_command_delay_t"},
+                                     {"$ref": "#/definitions/program_command_delay_rnd_t"},
+diff --git a/scripts/automation/trex_control_plane/interactive/trex/astf/trex_astf_profile.py b/scripts/automation/trex_control_plane/interactive/trex/astf/trex_astf_profile.py
+--- a/scripts/automation/trex_control_plane/interactive/trex/astf/trex_astf_profile.py
++++ b/scripts/automation/trex_control_plane/interactive/trex/astf/trex_astf_profile.py
+@@ -199,6 +199,12 @@
+         self.fields['name'] = 'nc'
+         self.stream=True
+ 
++class ASTFCmdHTTPRequest(ASTFCmd):
++    def __init__(self):
++        super(ASTFCmdHTTPRequest, self).__init__()
++        self.fields['name'] = 'http_request'
++        self.stream = True
++
+ class ASTFCmdConnect(ASTFCmd):
+     def __init__(self):
+         super(ASTFCmdConnect, self).__init__()
+@@ -336,7 +342,7 @@
+     MAX_DELAY = 700000 
+     MAX_KEEPALIVE = 500000 
+ 
+-    def __init__(self, file=None, side="c", commands=None,stream=True, s_delay=None, udp_mtu=None, addon=None):
++    def __init__(self, file=None, side="c", commands=None,stream=True, s_delay=None, udp_mtu=None, addon=None, tls=None, http=None, http2=None):
+         """
+ 
+         :parameters:
+@@ -358,6 +364,24 @@
+ 
+                   udp_mtu: int or None
+                       MTU for udp packets, if packets exceeding the specified value they will be cut down from L7 in order to fit. defaults to None.
++
++                  tls : dict
++                     Native TLS options: version (1.2/1.3), sni, cert/key/ca paths
++                     on the TRex host, verify, alpn (http/1.1 or h2),
++                     cipher_suite (one explicit suite for the selected TLS version),
++                     groups and signature_algorithms (ordered lists),
++                     require_client_cert (server mTLS with explicit ca),
++                     psk_identity, psk_hex, resumption and session_timeout. Requires a --rfc9411 build.
++                     Use side="s" on the server program. send/recv count plaintext.
++
++                  http : dict or None
++                     Opt-in HTTP/HTTPS GET response validation on the client. responses
++                     defaults to 1, expected_status to 200, max_header_bytes to
++                     16384 and max_body_bytes to 1073741824. Requires a TCP client; TLS is optional.
++                     body_contains optionally requires exact UTF-8 bytes in every
++                     dechunked response body (1..4096 bytes). transactions=True
++                     enables per-request latency; mark each request with
++                     http_request_start() before its send commands (64 outstanding).
+ 
+                   addon : string
+                       add-on name to handle data between program and base protocol.
+@@ -388,6 +412,109 @@
+         self.udp_mtu = udp_mtu
+         self.s_delay = s_delay
+         self.addon = addon
++        self.http2 = None
++        if http2 is not None:
++            if not isinstance(http2,dict) or not stream or addon or http is not None or file is not None or commands is not None:
++                raise ASTFError('http2 requires a TCP program without HTTP/1, addon, PCAP or commands')
++            if tls is not None:
++                if not isinstance(tls,dict) or tls.get('alpn','h2') != 'h2': raise ASTFError('http2 requires ALPN h2')
++                tls=dict(tls,alpn='h2')
++            limits={'request_interval_ms':(0,3600000),'final_hold_ms':(0,3600000),'requests':(1,1000000),'concurrency':(1,128),'body_size':(0,1073741824),
++                    'timeout_ms':(1,600000),'max_body_size':(0,1073741824),'max_header_size':(512,65536),
++                    'status':(200,599),'expected_status':(200,599)}
++            if set(http2)-set(limits)-{'authority','path','body_sizes'}: raise ASTFError('Unknown HTTP/2 option')
++            for name,value in http2.items():
++                if name == 'body_sizes':
++                    if not isinstance(value, list) or not 1 <= len(value) <= 128 or any(type(x) is not int or not 0 <= x <= 1073741824 for x in value):
++                        raise ASTFError('body_sizes must contain 1..128 integer byte sizes')
++                elif name in ('authority','path'):
++                    if not isinstance(value,str) or not 1<=len(value)<=1024 or any(ord(c)<33 or ord(c)>126 for c in value):
++                        raise ASTFError('HTTP/2 authority/path must be printable ASCII without spaces')
++                    if name=='path' and not value.startswith('/'): raise ASTFError('HTTP/2 path must begin with /')
++                else:
++                    lo,hi=limits[name]
++                    if type(value) is not int or not lo<=value<=hi: raise ASTFError('Invalid HTTP/2 option: '+name)
++            sizes = http2.get('body_sizes', [http2.get('body_size',16384)])
++            if max(sizes)>http2.get('max_body_size',1073741824): raise ASTFError('HTTP/2 body exceeds limit')
++            if http2.get('status',200) in (204,304) and any(sizes): raise ASTFError('HTTP/2 status requires empty body')
++            if http2.get('request_interval_ms',0) and http2.get('concurrency',1)!=1:
++                raise ASTFError('HTTP/2 request interval requires concurrency=1')
++            if side=='s' and (http2.get('request_interval_ms',0) or http2.get('final_hold_ms',0)):
++                raise ASTFError('HTTP/2 pacing is client-only')
++            self.http2=dict(http2,server=(side=="s"))
++            if 'body_sizes' in http2: self.http2['body_sizes']=list(http2['body_sizes'])
++            cmd=ASTFCmd();cmd.fields['name']='http2';cmd.stream=True
++            self.fields['commands'].append(cmd)
++        self.tls = None
++        if tls is not None:
++            if not isinstance(tls, dict) or not stream or addon:
++                raise ASTFError("tls must be an option dict on a TCP program without an addon")
++            allowed = {'groups', 'signature_algorithms', 'require_client_cert', 'cipher_suite', 'version', 'sni', 'cert', 'key', 'ca', 'alpn', 'psk_identity', 'psk_hex', 'verify', 'resumption', 'session_timeout', 'handshake_timeout_ms', 'close_timeout_ms'}
++            if set(tls) - allowed:
++                raise ASTFError("Unknown TLS option")
++            self.tls = {k: list(v) if isinstance(v, list) else v for k, v in tls.items()}
++            self.tls['server'] = side == 's'
++            for name, value in self.tls.items():
++                integer_option = name in ('session_timeout', 'handshake_timeout_ms', 'close_timeout_ms')
++                expected = int if integer_option else bool if name in ('server', 'verify', 'resumption', 'require_client_cert') else list if name in ('groups', 'signature_algorithms') else str
++                if not isinstance(value, expected) or (integer_option and isinstance(value, bool)):
++                    raise ASTFError("Invalid TLS option type: " + name)
++            for name in ('handshake_timeout_ms', 'close_timeout_ms'):
++                if not 1 <= self.tls.get(name, 10000) <= 600000:
++                    raise ASTFError("TLS timeout outside 1..600000 ms: " + name)
++            if not 1 <= self.tls.get('session_timeout', 300) <= 86400:
++                raise ASTFError("TLS session_timeout outside 1..86400")
++            if self.tls.get('resumption') and self.tls.get('psk_hex'):
++                raise ASTFError("TLS resumption currently requires certificate authentication")
++            if self.tls.get('version', '1.3') not in ('1.2', '1.3'):
++                raise ASTFError("TLS version must be 1.2 or 1.3")
++            if 'cipher_suite' in self.tls:
++                suites = (
++                    ['ECDHE-ECDSA-AES128-GCM-SHA256', 'ECDHE-RSA-AES128-GCM-SHA256',
++                     'ECDHE-ECDSA-AES256-GCM-SHA384', 'ECDHE-RSA-AES256-GCM-SHA384',
++                     'ECDHE-ECDSA-CHACHA20-POLY1305', 'ECDHE-RSA-CHACHA20-POLY1305']
++                    if self.tls.get('version', '1.3') == '1.2' else
++                    ['TLS_AES_128_GCM_SHA256', 'TLS_AES_256_GCM_SHA384',
++                     'TLS_CHACHA20_POLY1305_SHA256'])
++                if self.tls['cipher_suite'] not in suites or self.tls.get('psk_hex'):
++                    raise ASTFError("Unsupported cipher_suite for TLS version")
++            policies = {
++                'groups': ['X25519', 'P-256', 'P-384', 'P-521'],
++                'signature_algorithms': [
++                    'rsa_pss_rsae_sha256', 'rsa_pss_rsae_sha384', 'rsa_pss_rsae_sha512',
++                    'ecdsa_secp256r1_sha256', 'ecdsa_secp384r1_sha384', 'ecdsa_secp521r1_sha512',
++                    'ed25519', 'rsa_pkcs1_sha256', 'rsa_pkcs1_sha384', 'rsa_pkcs1_sha512']}
++            for option, supported in policies.items():
++                if option in self.tls:
++                    items = self.tls[option]
++                    if (not items or any(not isinstance(v, str) or v not in supported for v in items)
++                            or len(set(items)) != len(items)):
++                        raise ASTFError("Invalid or duplicate TLS policy entry: " + option)
++            if self.tls.get('require_client_cert') and (side != 's' or not self.tls.get('ca') or not self.tls.get('verify', True)):
++                raise ASTFError("require_client_cert needs a verified server and explicit client CA")
++            if self.tls.get('alpn', 'http/1.1') not in ('http/1.1', 'h2'):
++                raise ASTFError("TLS ALPN must be http/1.1 or h2")
++        self.http = None
++        if http is not None:
++            if (not isinstance(http, dict) or not stream or addon is not None or side != 'c'
++                    or (self.tls is not None and self.tls.get('alpn', 'http/1.1') != 'http/1.1')):
++                raise ASTFError("http response validation requires a TCP HTTP/1.1 client program without an addon")
++            limits = {'responses': (1, 1000000), 'expected_status': (200, 599),
++                      'max_header_bytes': (512, 65536), 'max_body_bytes': (0, 1073741824)}
++            if set(http) - set(limits) - {'body_contains', 'transactions'}:
++                raise ASTFError("Unknown HTTP validation option")
++            for name, value in http.items():
++                if name == 'body_contains':
++                    if not isinstance(value,str) or not 1 <= len(value.encode('utf-8')) <= 4096:
++                        raise ASTFError('body_contains must be a nonempty UTF-8 string, at most 4096 bytes')
++                    continue
++                if name == 'transactions':
++                    if not isinstance(value,bool): raise ASTFError('transactions must be boolean')
++                    continue
++                lo, hi = limits[name]
++                if isinstance(value, bool) or not isinstance(value, int) or not lo <= value <= hi:
++                    raise ASTFError("Invalid HTTP validation option: " + name)
++            self.http = dict(http)
+         if file is not None:
+             cap = pcap_reader(_ASTFCapPath.get_pcap_file_path(file))
+             cap.analyze()
+@@ -510,6 +637,21 @@
+         cmd.index = None
+         self.fields['commands'].append(cmd)
+ 
++    def udp_request(self, buf, timeout_ms=1000, size=0, fill=None):
++        """Send one unchanged UDP datagram and measure RTT to the next received
++        datagram. Blocks until response; timeout closes the flow. Sequential
++        request/response protocols only: no payload validation or request IDs.
++        The response is consumed here; do not add recv_msg(1) for this response.
++        """
++        if self.stream or self.addon:
++            raise ASTFError('udp_request requires UDP without addon')
++        if type(timeout_ms) is not int or not 1 <= timeout_ms <= 60000:
++            raise ASTFError('timeout_ms must be an integer in 1..60000')
++        self.send_msg(buf, size=size, fill=fill)
++        cmd = self.fields['commands'][-1]
++        cmd.fields['name'] = 'udp_request'
++        cmd.fields['timeout_ms'] = timeout_ms
++
+     def set_send_blocking (self,block):
+         """
+            set_send_blocking (block), set the stream transmit mode 
+@@ -679,6 +821,16 @@
+         """
+ 
+         self.fields['commands'].append(ASTFCmdNoClose())
++
++    def http_request_start(self):
++        """Mark one logical request before its send(s). At most 64 outstanding.
++
++        Automatically waits for TCP establishment. TLS programs start after
++        the TLS handshake. Histograms describe validated responses, not ACKs.
++        """
++        if self.http is None or not self.http.get('transactions',False):
++            raise ASTFError('http_request_start requires http transactions=True')
++        self.fields['commands'].append(ASTFCmdHTTPRequest())
+ 
+     def connect(self):
+         """
+@@ -1141,10 +1293,19 @@
+ 
+     def to_json(self):
+         self.__compile()
++        if self.http2 is not None and (len(self.fields['commands'])!=1 or self.fields['commands'][0].fields['name']!='http2'):
++            raise ASTFError('HTTP/2 program owns its session; additional ASTF commands are not supported')
+         ret = {}
++        if self.http2 is not None: ret['http2']=dict(self.http2)
+         ret['commands'] = []
+         for cmd in self.fields['commands']:
+             ret['commands'].append(cmd.to_json())
++        if self.tls is not None:
++            if not self.stream:
++                raise ASTFError("TLS requires TCP")
++            ret['tls'] = {k: list(v) if isinstance(v, list) else v for k, v in self.tls.items()}
++        if self.http is not None:
++            ret['http'] = dict(self.http)
+         if self.stream==False:
+             ret['stream']=False
+         if self.addon:
+@@ -1156,7 +1317,14 @@
+         for cmd in self.fields['commands']:
+             out.write("cmd_list.append({0})\n".format(cmd.dump()))
+ 
+-        out.write("{0} = {1}()\n".format(var_name, self.__class__.__name__))
++        if self.tls is not None:
++            options = dict(self.tls)
++            side = 's' if options.pop('server') else 'c'
++            out.write("{0} = {1}(side={2!r}, tls={3!r}, http={4!r})\n".format(var_name, self.__class__.__name__, side, options, self.http))
++        elif self.http is not None:
++            out.write("{0} = {1}(http={2!r})\n".format(var_name, self.__class__.__name__, self.http))
++        else:
++            out.write("{0} = {1}()\n".format(var_name, self.__class__.__name__))
+         out.write("{0}.set_cmds(cmd_list)\n".format(var_name))
+ 
+     @property
+@@ -1907,6 +2075,9 @@
+                     }
+         ArgVerify.verify(self.__class__.__name__, ver_args)
+ 
++        if any(cmd.fields['name'] == 'udp_request' for cmd in server_template.program.fields['commands']):
++            raise ASTFError('udp_request is supported on the client template only')
++
+         if client_template.is_stream() != server_template.is_stream() :
+             raise ASTFError(" Client template stream mode is {0} and different from server template mode {1}".format( client_template.is_stream(), server_template.is_stream() ) )
+ 
+diff --git a/src/astf/astf_db.cpp b/src/astf/astf_db.cpp
+--- a/src/astf/astf_db.cpp
++++ b/src/astf/astf_db.cpp
+@@ -323,10 +323,23 @@
+ }
+ 
+ bool CAstfDB::convert_from_json(uint8_t socket_id) {
+-    if ( !convert_bufs(socket_id) ) {
+-        return false;
+-    }
+-    if ( !convert_progs(socket_id) ) {
++    // Buffers and earlier programs already belong to this socket's RO DB
++    // when TLS context creation throws. Roll back before releasing the init
++    // lock so retries cannot append to a half-built profile.
++    const size_t previous_prog_lens = m_prog_lens.size();
++    auto rollback_programs = [&]() {
++        m_tcp_data[socket_id].Delete();
++        m_prog_lens.resize(previous_prog_lens);
++    };
++    bool programs_ready;
++    try {
++        programs_ready = convert_bufs(socket_id) && convert_progs(socket_id);
++    } catch (...) {
++        rollback_programs();
++        throw;
++    }
++    if (!programs_ready) {
++        rollback_programs();
+         return false;
+     }
+     m_tcp_data[socket_id].m_init = 1;
+@@ -345,7 +358,7 @@
+     Json::Value cmd;
+ 
+     try {
+-        cmd = m_val["program_list"][program_index]["commands"][cmd_index];
++        cmd = static_cast<const Json::Value &>(m_val)["program_list"][program_index]["commands"][cmd_index];
+     } catch(std::exception &e) {
+         assert(0);
+     }
+@@ -369,7 +382,7 @@
+     }
+     try {
+         uint32_t program_index = m_val["templates"][temp_index][temp_str]["program_index"].asInt();
+-        cmd = m_val["program_list"][program_index]["commands"][cmd_index];
++        cmd = static_cast<const Json::Value &>(m_val)["program_list"][program_index]["commands"][cmd_index];
+     } catch(std::exception &e) {
+         assert(0);
+     }
+@@ -430,11 +443,14 @@
+     Json::Value cmd;
+ 
+     try {
+-        cmd = m_val["program_list"][program_index]["commands"][cmd_index];
++        cmd = static_cast<const Json::Value &>(m_val)["program_list"][program_index]["commands"][cmd_index];
+     } catch(std::exception &e) {
+         return tcNO_CMD;
+     }
+ 
++    if (cmd["name"] == "http2") return tcHTTP2;
++    if (cmd["name"] == "udp_request") return tcUDP_REQUEST;
++    if (cmd["name"] == "http_request") return tcHTTP_REQUEST;
+     if (cmd["name"] == "tx") {
+         return tcTX_BUFFER;
+     }
+@@ -505,7 +521,7 @@
+     Json::Value cmd;
+ 
+     try {
+-        cmd = m_val["program_list"][program_index]["commands"][cmd_index];
++        cmd = static_cast<const Json::Value &>(m_val)["program_list"][program_index]["commands"][cmd_index];
+     } catch(std::exception &e) {
+         assert(0);
+     }
+@@ -517,7 +533,7 @@
+ 
+ void CAstfDB::assert_cmd(uint32_t program_index, uint32_t cmd_index, const std::string &cmd_name, Json::Value &cmd) {
+     try {
+-        cmd = m_val["program_list"][program_index]["commands"][cmd_index];
++        cmd = static_cast<const Json::Value &>(m_val)["program_list"][program_index]["commands"][cmd_index];
+     } catch(std::exception &e) {
+         assert(0);
+     }
+@@ -1723,6 +1739,150 @@
+         bool is_stream = get_emul_stream(program_index);
+         prog->set_stream(is_stream);
+         prog->set_addon(get_emul_addon(program_index));
++        const auto &tls = m_val["program_list"][program_index]["tls"];
++        if (!tls.isNull()) {
++#ifndef TREX_TLS
++            delete prog;
++            throw TrexException("TLS profile requires a --rfc9411 build");
++#else
++            try {
++                if (!tls.isObject() || !is_stream || prog->get_addon())
++                    throw std::runtime_error("TLS requires a TCP program without an addon");
++                astf_tls::Config cfg;
++                for (const auto &name : tls.getMemberNames()) {
++                    if (name == "server" || name == "verify" || name == "resumption" || name == "require_client_cert") {
++                        if (!tls[name].isBool()) throw std::runtime_error("TLS boolean option has wrong type");
++                    } else if (name == "session_timeout" || name == "handshake_timeout_ms" || name == "close_timeout_ms") {
++                        if (!tls[name].isUInt()) throw std::runtime_error("TLS timeout must be an unsigned integer");
++                    } else if (name == "groups" || name == "signature_algorithms") {
++                        if (!tls[name].isArray() || !tls[name].size())
++                            throw std::runtime_error("TLS policy list must be nonempty");
++                        auto &items = name == "groups" ? cfg.groups : cfg.signature_algorithms;
++                        for (const auto &item : tls[name]) {
++                            if (!item.isString()) throw std::runtime_error("TLS policy entry must be a string");
++                            items.push_back(item.asString());
++                        }
++                        continue;
++                    } else if (!tls[name].isString()) throw std::runtime_error("TLS string option has wrong type");
++                    if (name == "server") cfg.server = tls[name].asBool();
++                    else if (name == "resumption") cfg.resumption = tls[name].asBool();
++                    else if (name == "handshake_timeout_ms") cfg.handshake_timeout_ms = tls[name].asUInt();
++                    else if (name == "close_timeout_ms") cfg.close_timeout_ms = tls[name].asUInt();
++                    else if (name == "session_timeout") cfg.session_timeout = tls[name].asUInt();
++                    else if (name == "require_client_cert") cfg.require_client_cert = tls[name].asBool();
++                    else if (name == "verify") cfg.verify = tls[name].asBool();
++                    else if (name == "version") cfg.version = tls[name].asString();
++                    else if (name == "sni") cfg.sni = tls[name].asString();
++                    else if (name == "cert") cfg.cert = tls[name].asString();
++                    else if (name == "key") cfg.key = tls[name].asString();
++                    else if (name == "ca") cfg.ca = tls[name].asString();
++                    else if (name == "cipher_suite") {
++                        cfg.cipher_suite = tls[name].asString();
++                        if (cfg.cipher_suite.empty()) throw std::runtime_error("TLS cipher_suite must not be empty");
++                    }
++                    else if (name == "alpn") cfg.alpn = tls[name].asString();
++                    else if (name == "psk_identity") cfg.psk_identity = tls[name].asString();
++                    else if (name == "psk_hex") cfg.psk_hex = tls[name].asString();
++                    else throw std::runtime_error("Unknown TLS option: " + name);
++                }
++                prog->m_tls_context = std::make_shared<astf_tls::Context>(cfg);
++            } catch (const std::exception &e) {
++                delete prog;
++                throw TrexException(std::string("TLS profile: ") + e.what());
++            }
++#endif
++        }
++        const auto &http = m_val["program_list"][program_index]["http"];
++        if (!http.isNull()) {
++            try {
++                if (!http.isObject() || !m_val["program_list"][program_index].get("stream",true).asBool())
++                    throw std::runtime_error("HTTP response validation requires a TCP client");
++#ifdef TREX_TLS
++                if (prog->m_tls_context && (prog->m_tls_context->config.server || prog->m_tls_context->config.alpn != "http/1.1"))
++                    throw std::runtime_error("HTTP response validation requires HTTP/1.1 on the client");
++#endif
++                auto &cfg=prog->m_http; cfg.enabled=true;
++                for (const auto &name : http.getMemberNames()) {
++                    if (name=="body_contains") {
++                        if (!http[name].isString() || http[name].asString().empty() || http[name].asString().size()>4096)
++                            throw std::runtime_error("body_contains must be 1..4096 UTF-8 bytes");
++                        cfg.body_contains=http[name].asString(); continue;
++                    }
++                    if (name=="transactions") {
++                        if (!http[name].isBool()) throw std::runtime_error("transactions must be boolean");
++                        cfg.transactions=http[name].asBool(); continue;
++                    }
++                    if (!http[name].isUInt()) throw std::runtime_error("HTTP option must be an unsigned integer");
++                    uint32_t v=http[name].asUInt();
++                    if (name=="responses") cfg.responses=v;
++                    else if (name=="expected_status") cfg.expected_status=v;
++                    else if (name=="max_header_bytes") cfg.max_header_bytes=v;
++                    else if (name=="max_body_bytes") cfg.max_body_bytes=v;
++                    else throw std::runtime_error("Unknown HTTP option: " + name);
++                }
++                if (!cfg.responses || cfg.responses>1000000 || cfg.expected_status<200 || cfg.expected_status>599 ||
++                    cfg.max_header_bytes<512 || cfg.max_header_bytes>65536 || cfg.max_body_bytes>1073741824)
++                    throw std::runtime_error("HTTP option outside supported bounds");
++            } catch (const std::exception &e) {
++                delete prog;
++                throw TrexException(std::string("HTTP profile: ") + e.what());
++            }
++        }
++        const auto &h2=m_val["program_list"][program_index]["http2"];
++        if(!h2.isNull()) {
++            try {
++#ifndef TREX_TLS
++                throw std::runtime_error("HTTP/2 requires a TLS build");
++#else
++                if(!h2.isObject() || !is_stream || prog->get_addon() || prog->m_http.enabled ||
++                   (prog->m_tls_context && prog->m_tls_context->config.alpn!="h2")) throw std::runtime_error("HTTP/2 requires TCP; TLS, when enabled, requires ALPN h2");
++                const auto &commands=m_val["program_list"][program_index]["commands"];
++                if(commands.size()!=1 || commands[0]["name"]!="http2") throw std::runtime_error("HTTP/2 must be the only program command");
++                auto &cfg=prog->m_http2;cfg.enabled=true;cfg.secure=bool(prog->m_tls_context);
++                cfg.server=h2.isMember("server")?h2["server"].asBool():(cfg.secure && prog->m_tls_context->config.server);
++                for(const auto &key:h2.getMemberNames()) {
++                    if(key=="server") {if(!h2[key].isBool()) throw std::runtime_error("invalid HTTP/2 role");continue;}
++                    if(key=="authority" || key=="path") {
++                        if(!h2[key].isString()) throw std::runtime_error("invalid HTTP/2 string");
++                        auto value=h2[key].asString();
++                        if(value.empty() || value.size()>1024 || (key=="path" && value[0]!='/')) throw std::runtime_error("invalid HTTP/2 authority/path");
++                        for(unsigned char c:value) if(c<33 || c>126) throw std::runtime_error("invalid HTTP/2 authority/path character");
++                        (key=="authority"?cfg.authority:cfg.path)=value;continue;
++                    }
++                    if(key=="body_sizes") {
++                        const auto &sizes=h2[key];
++                        if(!sizes.isArray() || sizes.empty() || sizes.size()>128) throw std::runtime_error("invalid HTTP/2 body sizes");
++                        for(const auto &size:sizes) {
++                            if(!size.isUInt() || size.asUInt()>1073741824) throw std::runtime_error("invalid HTTP/2 body size");
++                            cfg.body_sizes.push_back(size.asUInt());
++                        }
++                        continue;
++                    }
++                    if(!h2[key].isUInt()) throw std::runtime_error("invalid HTTP/2 integer");
++                    auto v=h2[key].asUInt();
++                    if(key=="requests" && v>=1 && v<=1000000)cfg.requests=v;
++                    else if(key=="request_interval_ms" && v<=3600000)cfg.request_interval_ms=v;
++                    else if(key=="final_hold_ms" && v<=3600000)cfg.final_hold_ms=v;
++                    else if(key=="concurrency" && v>=1 && v<=128)cfg.concurrency=v;
++                    else if(key=="body_size" && v<=1073741824)cfg.body_size=v;
++                    else if(key=="max_body_size" && v<=1073741824)cfg.max_body_size=v;
++                    else if(key=="max_header_size" && v>=512 && v<=65536)cfg.max_header_size=v;
++                    else if(key=="timeout_ms" && v>=1 && v<=600000)cfg.timeout_ms=v;
++                    else if(key=="status" && v>=200 && v<=599)cfg.status=v;
++                    else if(key=="expected_status" && v>=200 && v<=599)cfg.expected_status=v;
++                    else throw std::runtime_error("unknown or out-of-range HTTP/2 option: "+key);
++                }
++                if((cfg.request_interval_ms && cfg.concurrency!=1) ||
++                   (cfg.server && (cfg.request_interval_ms || cfg.final_hold_ms))) throw std::runtime_error("invalid HTTP/2 pacing");
++                auto valid_size=[&](uint32_t size) {return size<=cfg.max_body_size && (!(cfg.status==204 || cfg.status==304) || !size);};
++                if(cfg.body_sizes.empty()) {
++                    if(!valid_size(cfg.body_size)) throw std::runtime_error("invalid HTTP/2 response size");
++                } else for(auto size:cfg.body_sizes) {
++                    if(!valid_size(size)) throw std::runtime_error("invalid HTTP/2 response size");
++                }
++#endif
++            } catch(const std::exception &e) {delete prog;throw TrexException(std::string("HTTP/2 profile: ")+e.what());}
++        }
+         uint64_t total_rx_wm = 0;
+ 
+         cmd_index = 0;
+@@ -1757,6 +1917,15 @@
+                 cmd.m_cmd = tcDONT_CLOSE;
+                 prog->add_cmd(cmd);
+                 break;
++            case tcHTTP2:
++                if(!prog->m_http2.enabled) {delete prog;throw TrexException("http2 command requires HTTP/2 options");}
++                cmd.m_cmd=tcHTTP2;prog->add_cmd(cmd);break;
++            case tcHTTP_REQUEST:
++                if (!prog->m_http.enabled || !prog->m_http.transactions) {
++                    delete prog;
++                    throw TrexException("http_request requires HTTP transactions");
++                }
++                cmd.m_cmd=tcHTTP_REQUEST; prog->add_cmd(cmd); break;
+             case tcCONNECT_WAIT:
+                 cmd.m_cmd = tcCONNECT_WAIT;
+                 prog->add_cmd(cmd);
+@@ -1802,6 +1971,21 @@
+                 prog->add_cmd(cmd);
+                 break;
+ 
++            case tcUDP_REQUEST: {
++                const auto &request=m_val["program_list"][program_index]["commands"][cmd_index];
++                if (is_stream || prog->get_addon() || !request["timeout_ms"].isUInt() ||
++                    request["timeout_ms"].asUInt()<1 || request["timeout_ms"].asUInt()>60000 ||
++                    !request["buf_index"].isUInt() ||
++                    request["buf_index"].asUInt()>=m_tcp_data[socket_id].m_buf_list.size()) {
++                    delete prog;
++                    throw TrexException("udp_request requires UDP without addon, valid buffer, timeout_ms 1..60000");
++                }
++                cmd.m_cmd=tcUDP_REQUEST;
++                cmd.u.m_udp_request.m_buf=m_tcp_data[socket_id].m_buf_list[request["buf_index"].asUInt()];
++                cmd.u.m_udp_request.m_timeout_ms=request["timeout_ms"].asUInt();
++                prog_len += cmd.u.m_udp_request.m_buf->len();
++                prog->add_cmd(cmd); break;
++            }
+             case tcTX_PKT :
+                 cmd.m_cmd = tcTX_PKT;
+                 fill_tx_pkt(program_index, cmd_index,socket_id,cmd);
+@@ -1862,8 +2046,13 @@
+         if (!prog->sanity_check(err)){
+             prog->Dump(stdout);
+             fprintf(stdout,"ERROR program is not valid '%s' \n",err.c_str());
++            delete prog;
+             return(false);
+         }
++#ifdef TREX_TLS
++        try { prog->prepare_tls_buffers(); }
++        catch (...) { delete prog; throw; }
++#endif
+         m_tcp_data[socket_id].m_prog_list.push_back(prog);
+         m_prog_lens.push_back(prog_len);
+         prog_len = 0;
+@@ -1949,9 +2138,8 @@
+ }
+ 
+ void CAstfDbRO::Delete() {
+-    if (m_init==0)
+-        return;
+-
++    // m_init describes readiness, not ownership: failed initialization may
++    // have populated buffers/programs while m_init is still zero.
+     int i;
+     for (i = 0; i < m_buf_list.size(); i++) {
+         m_buf_list[i]->Delete();
+diff --git a/src/astf/astf_db.h b/src/astf/astf_db.h
+--- a/src/astf/astf_db.h
++++ b/src/astf/astf_db.h
+@@ -395,6 +395,16 @@
+         return m_templates.size();
+     }
+ 
++#ifdef TREX_TLS
++    std::vector<std::shared_ptr<astf_tls::Context>> tls_programs(bool server) const {
++        std::vector<std::shared_ptr<astf_tls::Context>> result;
++        for (auto program : m_prog_list) {
++            if (program->m_tls_context && program->m_tls_context->config.server == server)
++                result.push_back(program->m_tls_context);
++        }
++        return result;
++    }
++#endif
+     // for tests in simulation
+     void set_test_assoc_table(uint16_t port, CEmulAppProgram *prog, CTcpTuneables *tune);
+ 
+diff --git a/src/astf/astf_json_validator.cpp b/src/astf/astf_json_validator.cpp
+--- a/src/astf/astf_json_validator.cpp
++++ b/src/astf/astf_json_validator.cpp
+@@ -99,6 +99,13 @@
+     int i;
+     for (i=0; i<profile["templates"].size(); i++) {
+         Json::Value temp= profile["templates"][i];
++        for (const char *side : {"client_template", "server_template"}) {
++            const auto &index = temp[side]["program_index"];
++            if (!index.isUInt() || index.asUInt() >= profile["program_list"].size()) {
++                err = "Validation failed: program_index must reference an existing program";
++                return false;
++            }
++        }
+         int pinx_c=temp["client_template"]["program_index"].asInt();
+         int pinx_s=temp["server_template"]["program_index"].asInt();
+         int ip_gen_c=temp["client_template"]["ip_gen"]["dist_client"]["index"].asInt();
+@@ -122,6 +129,55 @@
+         err = ss.str();
+         return(false);
+     }
++    /* Validate TLS roles and unsupported plaintext-based association before DP setup. */
++    for (const auto &temp : profile["templates"]) {
++        for (const char *side : {"client_template", "server_template"}) {
++            bool server = std::string(side) == "server_template";
++            int index = temp[side]["program_index"].asInt();
++            const auto &program = profile["program_list"][index];
++            for (const auto &command : program["commands"]) {
++                if (command["name"] == "udp_request" &&
++                    (server || program.get("stream",true).asBool() || !program["addon"].isNull())) {
++                    err = "udp_request requires a UDP client program without addon";
++                    return false;
++                }
++            }
++            if (!program["http"].isNull() && (server || !program.get("stream",true).asBool() || !program["addon"].isNull())) {
++                err = "HTTP response validation requires a TCP client program";
++                return false;
++            }
++            const auto &tls = profile["program_list"][index]["tls"];
++            const auto &h2=program["http2"];
++            if (!h2.isNull()) {
++                const auto &role=h2.isMember("server")?h2["server"]:tls["server"];
++                if (!h2.isObject() || !role.isBool() || role.asBool()!=server) {
++                    err="HTTP/2 program role does not match template side";return false;
++                }
++                if (server) for (const auto &assoc:temp[side]["assoc"]) {
++                    if (assoc.isMember("l7_map") || assoc.isMember("assoc_id")) {
++                        err="HTTP/2 requires port/IP association";return false;
++                    }
++                }
++            }
++            if (!tls.isNull()) {
++#ifndef TREX_TLS
++                err = "TLS profile requires a --rfc9411 build";
++                return false;
++#endif
++                if (!tls.isObject() || !tls["server"].isBool() || tls["server"].asBool() != server) {
++                    err = "TLS program role does not match template side";
++                    return false;
++                }
++                if (server) for (const auto &assoc : temp[side]["assoc"]) {
++                    if (assoc.isMember("l7_map") || assoc.isMember("assoc_id")) {
++                        err = "TLS requires port/IP association, not plaintext payload association";
++                        return false;
++                    }
++                }
++            }
++        }
++    }
++
+     /* check # ip_gen */
+     if ( ip_gen_max >= profile["ip_gen_dist_list"].size() ) {
+         std::stringstream ss;
+diff --git a/src/sim/trex_sim_astf.cpp b/src/sim/trex_sim_astf.cpp
+--- a/src/sim/trex_sim_astf.cpp
++++ b/src/sim/trex_sim_astf.cpp
+@@ -287,7 +287,10 @@
+ int SimAstfSimple::run() {
+     CParserOption * po=&CGlobalInfo::m_options;
+     bool rc = CAstfDB::instance()->parse_file(CGlobalInfo::m_options.astf_cfg_file);
+-    assert(rc);
++    if (!rc) {
++        CAstfDB::free_instance();
++        return 1;
++    }
+     CClientServerTcp *lpt = new CClientServerTcp;
+     // run
+     lpt->Create("", CGlobalInfo::m_options.out_file);
+@@ -325,12 +328,18 @@
+         lpt->set_cfg_ext(&cfg);
+     }
+ 
+-    lpt->fill_from_file();
++    int status = 0;
++    try {
++        lpt->fill_from_file();
++    } catch (const std::exception &e) {
++        fprintf(stderr, "ASTF profile: %s\n", e.what());
++        status = 1;
++    }
+ 
+     // free stuff
+     lpt->close_file();
+     lpt->Delete();
+     delete lpt;
+     CAstfDB::free_instance();
+-    return 0;
+-}
++    return status;
++}

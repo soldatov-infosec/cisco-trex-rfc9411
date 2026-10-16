@@ -1,0 +1,2644 @@
+diff --git a/src/44bsd/netinet/tcp_input.c b/src/44bsd/netinet/tcp_input.c
+--- a/src/44bsd/netinet/tcp_input.c
++++ b/src/44bsd/netinet/tcp_input.c
+@@ -293,6 +293,7 @@
+ void
+ tcp_input(struct tcpcb *tp, struct mbuf *m, struct tcphdr *th, int toff, int tlen, uint8_t iptos)
+ {
++    if (tlen > 0) so_rx_timestamp(tcp_getsocket(tp));
+     struct socket *so = NULL;
+     u_char *optp = NULL;
+     int optlen = 0;
+@@ -861,7 +862,10 @@
+                     tcp_timer_activate(tp, TT_REXMT,
+                               tp->t_rxtcur);
+                 tp->t_flags |= TF_WAKESOW;
+-                if (sbavail(&so->so_snd))
++                /* An application may release RX backpressure from the ACK
++                 * callback even when it has no further data to transmit. */
++                if (sbavail(&so->so_snd) ||
++                    ((tp->t_flags & TF_ACKNOW) && so_requires_tls_ack_output(so)))
+                     (void) tp->t_fb->tfb_tcp_output(tp);
+                 goto check_delack;
+             }
+diff --git a/src/44bsd/netinet/tcp_latency.h b/src/44bsd/netinet/tcp_latency.h
+new file mode 100644
+--- /dev/null
++++ b/src/44bsd/netinet/tcp_latency.h
+@@ -0,0 +1,62 @@
++/* ASTF connection latency, measured in nanoseconds. */
++#ifndef TREX_TCP_LATENCY_H
++#define TREX_TCP_LATENCY_H
++#include <stdint.h>
++
++struct tcp_latency_stats {
++    uint64_t count, sum_ns, sum_carry, min_ns, max_ns;
++};
++
++static inline void tcp_latency_add(struct tcp_latency_stats *s, uint64_t ns) {
++    if (!s->count || ns < s->min_ns) s->min_ns = ns;
++    if (!s->count || ns > s->max_ns) s->max_ns = ns;
++    ++s->count;
++    uint64_t old = s->sum_ns;
++    s->sum_ns += ns;
++    s->sum_carry += s->sum_ns < old;
++}
++
++static inline struct tcp_latency_stats tcp_latency_merge(
++        struct tcp_latency_stats a, struct tcp_latency_stats b) {
++    if (!a.count) return b;
++    if (!b.count) return a;
++    a.count += b.count;
++    uint64_t old = a.sum_ns;
++    a.sum_ns += b.sum_ns;
++    a.sum_carry += b.sum_carry + (a.sum_ns < old);
++    if (b.min_ns < a.min_ns) a.min_ns = b.min_ns;
++    if (b.max_ns > a.max_ns) a.max_ns = b.max_ns;
++    return a;
++}
++static inline double tcp_latency_average_ns(struct tcp_latency_stats s) {
++    return s.count ? ((double)s.sum_carry * 18446744073709551616.0 + (double)s.sum_ns) / s.count : 0;
++}
++#define TCP_TXN_BUCKETS 32
++struct tcp_transaction_latency {
++    struct tcp_latency_stats values;
++    uint64_t buckets[TCP_TXN_BUCKETS];
++};
++static inline void tcp_transaction_add(struct tcp_transaction_latency *s, uint64_t ns) {
++    tcp_latency_add(&s->values,ns);
++    uint64_t us=ns/1000 + (ns%1000!=0), bound=1;
++    unsigned i=0;
++    while (i+1<TCP_TXN_BUCKETS && us>bound) { ++i; bound<<=1; }
++    ++s->buckets[i];
++}
++/* Approximate percentile: bucket upper bound, capped at observed maximum.
++ * Bucket 31 includes all remaining values. This is not an exact quantile. */
++static inline double tcp_transaction_percentile_ms(const struct tcp_transaction_latency *s, unsigned percent) {
++    uint64_t count=s->values.count;
++    if (!count) return 0;
++    uint64_t rank=(count/100)*percent + ((count%100)*percent+99)/100, seen=0;
++    for (unsigned i=0;i<TCP_TXN_BUCKETS;++i) {
++        seen+=s->buckets[i];
++        if (seen>=rank) {
++            uint64_t upper=i==31 ? s->values.max_ns : (UINT64_C(1)<<i)*1000;
++            if (upper>s->values.max_ns) upper=s->values.max_ns;
++            return (double)upper/1e6;
++        }
++    }
++    return (double)s->values.max_ns/1e6;
++}
++#endif
+diff --git a/src/44bsd/netinet/tcp_output.c b/src/44bsd/netinet/tcp_output.c
+--- a/src/44bsd/netinet/tcp_output.c
++++ b/src/44bsd/netinet/tcp_output.c
+@@ -944,6 +944,7 @@
+      * m->m_pkthdr.len should have been set before checksum calculation,
+      * because in6_cksum() need it.
+      */
++    if ((flags & (TH_SYN | TH_ACK)) == TH_SYN) so_http_syn(so);
+     error = tcp_ip_output(tp, m, iptos);
+ 
+ out:
+diff --git a/src/44bsd/netinet/tcp_socket.h b/src/44bsd/netinet/tcp_socket.h
+--- a/src/44bsd/netinet/tcp_socket.h
++++ b/src/44bsd/netinet/tcp_socket.h
+@@ -63,6 +63,10 @@
+ /* for so_snd */
+ void sbdrop(struct sockbuf *sb, int len, struct socket *so);
+ 
++/* C ABI: no TLS-dependent structure layout is exposed to the TCP C code. */
++int so_requires_tls_ack_output(struct socket *so);
++void so_http_syn(struct socket *so);
++void so_rx_timestamp(struct socket *so);
+ void sorwakeup(struct socket *so);
+ void sowwakeup(struct socket *so);
+ void soisconnecting(struct socket *so);
+diff --git a/src/44bsd/netinet/tcp_var.h b/src/44bsd/netinet/tcp_var.h
+--- a/src/44bsd/netinet/tcp_var.h
++++ b/src/44bsd/netinet/tcp_var.h
+@@ -131,6 +131,8 @@
+  * Organized for 64 byte cacheline efficiency based
+  * on common tcp_input/tcp_output processing.
+  */
++#include "tcp_latency.h"
++
+ struct tcpcb {
+     /* data structures per tcpcb */
+     struct tcp_timer m_timer;	/* TCP timer */
+@@ -484,6 +486,9 @@
+     uint64_t tcps_ecn_ect0;		/* ECN Capable Transport */
+     uint64_t tcps_ecn_ect1;		/* ECN Capable Transport */
+     uint64_t tcps_ecn_shs;		/* ECN successful handshakes */
++    struct tcp_latency_stats tcps_ttfb, tcps_ttlb;
++    struct tcp_transaction_latency tcps_http_req_ttfb, tcps_http_req_ttlb;
++
+     uint64_t tcps_ecn_rcwnd;	/* # times ECN reduced the cwnd */
+ 
+ };
+diff --git a/src/44bsd/rx_timestamp.h b/src/44bsd/rx_timestamp.h
+new file mode 100644
+--- /dev/null
++++ b/src/44bsd/rx_timestamp.h
+@@ -0,0 +1,57 @@
++#ifndef TREX_RX_TIMESTAMP_H
++#define TREX_RX_TIMESTAMP_H
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <deque>
++#include <vector>
++
++namespace astf_rx {
++// First wire byte and latest arrival needed for this byte range. Zero is valid.
++struct Stamp {
++    uint64_t first, last;
++    Stamp(uint64_t a=0,uint64_t b=0):first(a),last(b) {}
++};
++struct Span {
++    size_t size;
++    Stamp time;
++    Span(size_t n,Stamp t):size(n),time(t) {}
++};
++// Allocated only for measured TLS flows. Adjacent equal stamps coalesce;
++// storage follows retained ciphertext, never total connection lifetime.
++class Queue {
++    std::deque<Span> spans;
++    size_t bytes=0;
++public:
++    void append(size_t n,Stamp t) {
++        if(!n)return;
++        if(!spans.empty() && spans.back().time.first==t.first && spans.back().time.last==t.last)
++            spans.back().size+=n;
++        else spans.emplace_back(n,t);
++        bytes+=n;
++    }
++    size_t size() const {return bytes;}
++    const Span &front() const {return spans.front();}
++    bool consume(size_t n,Stamp &t) {
++        if(!n || n>bytes)return false;
++        t=spans.front().time;bytes-=n;
++        while(n) {
++            auto &s=spans.front();size_t used=std::min(n,s.size);
++            t.last=std::max(t.last,s.time.last);s.size-=used;n-=used;
++            if(!s.size)spans.pop_front();
++        }
++        return true;
++    }
++};
++// Keep metadata with the exact bytes selected by the existing overlap policy.
++struct Payload : std::vector<uint8_t> {
++    std::vector<Span> times;
++    void append_times(const Payload &other,size_t skip) {
++        for(const auto &s:other.times) {
++            if(skip>=s.size) {skip-=s.size;continue;}
++            times.emplace_back(s.size-skip,s.time);skip=0;
++        }
++    }
++};
++}
++#endif
+diff --git a/src/44bsd/tcp_input.cpp b/src/44bsd/tcp_input.cpp
+--- a/src/44bsd/tcp_input.cpp
++++ b/src/44bsd/tcp_input.cpp
+@@ -49,6 +49,28 @@
+ #include "astf/astf_db.h"
+ #include "astf/astf_template_db.h"
+ 
++#include <new>
++#ifdef TREX_SIM
++static bool tls_reass_length_fault = false;
++void tls_test_reass_bad_length(bool enabled) { tls_reass_length_fault = enabled; }
++static int tls_reass_failure_site = -1;
++static unsigned tls_reass_failure_skip = 0;
++void tls_test_reass_failure(int site, unsigned skip) {
++    tls_reass_failure_site = site;
++    tls_reass_failure_skip = skip;
++}
++static void tls_reass_alloc_check(int site) {
++    if (tls_reass_failure_site == site) {
++        if (tls_reass_failure_skip) { --tls_reass_failure_skip; return; }
++        tls_reass_failure_site = -1;
++        throw std::bad_alloc();
++    }
++}
++#define TLS_REASS_ALLOC(site) tls_reass_alloc_check(site)
++#else
++#define TLS_REASS_ALLOC(site) ((void)0)
++#endif
++
+ 
+ 
+ 
+@@ -146,6 +168,7 @@
+             block.Dump(fd);
+             fprintf(fd,"Expected :\n");
+             lpkts[i].Dump(fd);
++            return false;
+         }
+     }
+     return(true);
+@@ -168,6 +191,7 @@
+         return (0);
+     }
+ 
++    if (m_blocks.empty()) return 0;
+     auto first = m_blocks.begin();
+     auto& block = first->second;
+ 
+@@ -182,6 +206,22 @@
+ 
+     flags = (block.m_flags==1) ? TH_FIN :0;
+ 
++    if (block.m_payload) {
++        auto app = tp->m_socket.m_app;
++        bool interrupt = app->get_interrupt();
++        app->set_interrupt(true);
++        const auto saved=app->m_rx_time;
++        size_t offset=0;
++        if(block.m_payload->times.empty())
++            app->rx_reassembled(block.m_payload->data(),block.m_payload->size());
++        for(const auto &span:block.m_payload->times) {
++            app->m_rx_time=span.time;
++            app->rx_reassembled(block.m_payload->data()+offset,span.size);
++            offset+=span.size;
++        }
++        app->m_rx_time=saved;
++        app->set_interrupt(interrupt);
++    } else
+     sbappend_bytes((struct tcp_socket*)&tp->m_socket,
+                    &tp->m_socket.so_rcv ,
+                    block.m_len);
+@@ -227,8 +267,17 @@
+         }
+     }
+     if (next.m_len > diff) {
++        if (base.m_payload && next.m_payload) {
++            TLS_REASS_ALLOC(TLS_REASS_MERGE);
++            base.m_payload->insert(base.m_payload->end(), next.m_payload->begin() + diff, next.m_payload->end());
++            base.m_payload->append_times(*next.m_payload,diff);
++        }
+         base.m_len += (next.m_len - diff);
+         base.m_flags |= next.m_flags; /* or the overlay FIN */
++    } else if (next.m_len == diff) {
++        // FIN consumes sequence space after the payload. A zero-length FIN
++        // or duplicate ending at the same byte must not disappear on merge.
++        base.m_flags |= next.m_flags;
+     }
+ 
+     return true;
+@@ -241,8 +290,41 @@
+                          struct rte_mbuf *m){
+ 
+     assert(ti);
++    try {
++    std::shared_ptr<astf_rx::Payload> payload;
++    if (tp->m_socket.m_app && tp->m_socket.m_app->needs_rx_payload()) {
++        TLS_REASS_ALLOC(TLS_REASS_SHARED);
++        payload = std::make_shared<astf_rx::Payload>();
++        TLS_REASS_ALLOC(TLS_REASS_RESERVE);
++        payload->reserve(ti->ti_len);
++        if(ti->ti_len && tp->m_socket.m_app->needs_rx_timestamps())payload->times.emplace_back(ti->ti_len,tp->m_socket.m_app->m_rx_time);
++        bool invalid_length = false;
++        for (auto seg = m; seg; seg = seg->next) {
++            if (seg->data_len > size_t(ti->ti_len) - payload->size()) {
++                invalid_length = true;
++                break;
++            }
++            auto data = rte_pktmbuf_mtod(seg, const uint8_t *);
++            TLS_REASS_ALLOC(TLS_REASS_COPY);
++            payload->insert(payload->end(), data, data + seg->data_len);
++        }
++#ifdef TREX_SIM
++        if (tls_reass_length_fault) {
++            tls_reass_length_fault = false;
++            invalid_length = true;
++        }
++#endif
++        if (invalid_length || payload->size() != ti->ti_len) {
++            if (m) rte_pktmbuf_free(m);
++            m_blocks.clear();
++            ti->ti_len = 0;
++            tp->m_socket.m_app->payload_fail(false);
++            return 0;
++        }
++    }
+     if (m) {
+         rte_pktmbuf_free(m);
++        m = nullptr;
+     }
+ 
+     uint16_t tg_id = tp->m_flow->m_tg_id;
+@@ -251,10 +333,12 @@
+     tp->t_rcvoopack++;
+ 
+     CTcpReassBlock cur{ti->ti_seq, ti->ti_len, !!(ti->ti_flags & TH_FIN)};
++    cur.m_payload = std::move(payload);
+     CTcpSeqKey cur_seq{cur.m_seq};
+ 
+     if (m_blocks.empty()) {
+         /* first one - just add it to the list */
++        if (cur.m_payload) { TLS_REASS_ALLOC(TLS_REASS_MAP); }
+         m_blocks.insert(std::pair<CTcpSeqKey,CTcpReassBlock>(cur_seq, cur));
+         m_max_used = std::max(m_max_used, get_active_blocks());
+         return 0;
+@@ -266,6 +350,7 @@
+      * so, the current block should be merged to the previous block(--it).
+      */
+     if ((it == m_blocks.begin()) || !tcp_reass_merge_block(pctx, tp, (--it)->second, cur)) {
++        if (cur.m_payload) { TLS_REASS_ALLOC(TLS_REASS_MAP); }
+         it = m_blocks.insert(it, std::pair<CTcpSeqKey,CTcpReassBlock>(cur_seq, cur));
+     }
+ 
+@@ -303,6 +388,17 @@
+ 
+     m_max_used = std::max(m_max_used, get_active_blocks());
+     return 0;
++    } catch (const std::bad_alloc &) {
++        auto app = tp->m_socket.m_app;
++        if (!app || !app->needs_rx_payload()) throw;
++        // A preceding merge may already have extended a block. Discard the
++        // entire queue: continuing could deliver overlapping ciphertext twice.
++        if (m) rte_pktmbuf_free(m);
++        m_blocks.clear();
++        ti->ti_len = 0;
++        app->payload_fail(true);
++        return 0;
++    }
+ }
+ 
+ 
+@@ -343,7 +439,21 @@
+             }
+             return(ti->ti_flags & TH_FIN);
+         }
++        try {
++#ifdef TREX_SIM
++            if (tp->m_socket.m_app && tp->m_socket.m_app->needs_rx_payload()) {
++                TLS_REASS_ALLOC(TLS_REASS_OBJECT);
++            }
++#endif
+         tcp_reass_alloc(pctx,tp);
++        } catch (const std::bad_alloc &) {
++            auto app = tp->m_socket.m_app;
++            if (!app || !app->needs_rx_payload()) throw;
++            if (m) rte_pktmbuf_free(m);
++            ti->ti_len = 0;
++            app->payload_fail(true);
++            return 0;
++        }
+     }
+ 
+     int res=tp->m_tpc_reass->tcp_reass(pctx,tp,ti,m);
+@@ -367,8 +477,18 @@
+ bool tcp_check_no_delay(struct tcpcb *_tp,int bytes) {
+     CTcpCb *tp = static_cast<CTcpCb*>(_tp);
+ 
+-    if ( tp->m_delay_limit == 0 )
++    if (tp->m_delay_limit == 0) {
++#ifdef TREX_TLS
++        // A TLS record can exceed the sender's initial congestion window.
++        // Waiting for PUSH/the complete record to ACK then stalls both peers
++        // until TT_DELACK. Use the usual ACK-on-second-segment policy for
++        // native TLS; keep nonzero byte thresholds and ordinary TCP intact.
++        auto app = tp->m_socket.m_app;
++        return app && app->is_tls() && tcp_timer_active(_tp, TT_DELACK);
++#else
+         return false;
++#endif
++    }
+ 
+     if (bytes < 0) {
+         tp->t_pkts_cnt = 0;
+diff --git a/src/44bsd/tcp_socket.cpp b/src/44bsd/tcp_socket.cpp
+--- a/src/44bsd/tcp_socket.cpp
++++ b/src/44bsd/tcp_socket.cpp
+@@ -31,11 +31,198 @@
+ #include "tcp_debug.h"
+ #include "tcp_socket.h"
+ #include "timer_types.h"
++#include "os_time.h"
+ #include <fstream>
+ #include <iostream>
+ #include <sstream>
+ #include <unistd.h>
+ #include "bp_sim.h"
++#include <array>
++#include <algorithm>
++#include "http/astf_http_transactions.h"
++
++// Allocated only for profiles requesting response validation.
++struct CEmulAppHttp {
++    CEmulAppHttp(const astf_http::Config &cfg, CEmulApp *owner): parser(cfg,CEmulApp::http_event,owner) {
++        if (cfg.transactions) transactions.reset(new astf_http::Transactions());
++    }
++    std::unique_ptr<astf_http::Transactions> transactions;
++    uint64_t now_ns=0;
++    bool waiting_request=false;
++    astf_http::Response parser;
++    uint64_t http_first_ns=0, http_last_ns=0;
++    bool http_received=false, http_eof=false, http_error=false, aborted=false;
++};
++
++#ifdef TREX_TLS
++#include "tls/astf_tls_mbuf.h"
++#include "tls/astf_h2_tx.h"
++#include "tls/astf_tls_metadata.h"
++#ifdef TREX_SIM
++static int tls_invariant_fault = -1;
++void CEmulApp::tls_test_invariant(int site) { tls_invariant_fault = site; }
++static int tls_allocation_budget = -1;
++void CEmulApp::tls_test_allocations(int remaining) { tls_allocation_budget = remaining; }
++#endif
++static rte_mbuf *tls_alloc_wire(uint8_t socket, uint16_t size, bool http2=false) {
++    astf_cost::Probe cost_probe(astf_cost::MBUF_ALLOC);
++#ifdef TREX_SIM
++    if (tls_allocation_budget == 0) return nullptr;
++    if (tls_allocation_budget > 0) --tls_allocation_budget;
++#endif
++    auto m = http2 ? astf_tls::alloc_h2_mbuf(socket,size) : astf_tls::alloc_mbuf(socket, size);
++    cost_probe.bytes(m ? size : 0);
++    return m;
++}
++// Only materialize data that TCP can use in its current flight. Keep a small
++// floor for zero-window probes; the HTTP/2 session deadline still bounds stalls.
++static uint32_t h2_tx_limit(const CTcpCb &tcp) {
++    return std::min<uint32_t>(65536, std::max<uint32_t>(2048,
++        std::min<uint32_t>(tcp.snd_cwnd,tcp.snd_wnd)));
++}
++
++// Under sustained pool pressure, do not poll every stalled flow at 1 kHz.
++// ACK/input events can still resume immediately; successful TX resets backoff.
++static htw_ticks_t h2_retry_delay(uint8_t &shift) {
++    const uint32_t usec=1000u<<shift;
++    if(shift<4)++shift;
++    return std::max<htw_ticks_t>(1,tw_time_usec_to_ticks(usec));
++}
++
++// Release cumulatively ACKed blocks immediately, even if the last block of a
++// multi-mbuf buffer is still in flight. Queue offsets remain unchanged, and TCP
++// retransmissions can only refer to the unacknowledged suffix.
++static void release_acked_blocks(CMbufBuffer &buffer, uint32_t before, uint32_t after) {
++    const auto first=(buffer.len()-before)/buffer.m_blk_size;
++    const auto end=(buffer.len()-after)/buffer.m_blk_size;
++    for(auto i=first;i<end;++i)buffer.object(i).Free();
++}
++
++// Cleartext HTTP/2 retains each output mbuf until acknowledged by TCP.
++// Fixed descriptors bound queued memory and avoid per-frame vector allocation.
++struct CEmulAppH2 {
++    CEmulAppH2(const astf_http2::Config &cfg, astf_http2::Callback cb, void *owner):session(cfg,cb,owner) {
++        for(size_t i=0;i<buffers.size();++i) {
++            buffers[i].use_fixed_storage(descriptors[i].data(),descriptors[i].size());
++            buffers[i].Create(2048);
++        }
++    }
++    ~CEmulAppH2() {for(auto &b:buffers)b.Delete();}
++    astf_http2::Session session;
++    CAstfTimerObj work_timer;
++    std::array<std::array<CMbufObject,8>,8> descriptors;
++    std::array<CMbufBuffer,8> buffers;
++    std::array<uint32_t,8> remaining{};
++    uint32_t head=0,count=0,queued=0;
++    uint8_t tx_retry_shift=0;
++    bool pumping=false,terminal=false,closed=false;
++};
++struct CEmulAppTls {
++    explicit CEmulAppTls(std::shared_ptr<astf_tls::Context> ctx): session(ctx),
++        close_timeout_ms(ctx->config.close_timeout_ms), work_budget(ctx->config.pump_budget) {
++        // Current AEAD suites need at most 29 bytes of record overhead; leave
++        // room for a TLS 1.3 KeyUpdate response as well. A whole write must fit
++        // in an empty BIO, otherwise simultaneous writers with small receive
++        // windows could both wait for output space while SSL_read is forbidden.
++        write_chunk = std::min<size_t>(16384, ctx->config.bio_capacity - 64);
++        for (size_t i = 0; i < buffers.size(); ++i) {
++            buffers[i].use_fixed_storage(descriptors[i].data(), descriptors[i].size());
++            buffers[i].Create(2048);
++        }
++    }
++    ~CEmulAppTls() {
++        // SSL emitting close_notify into its BIO is not a TCP flush. A forced
++        // stop or deadline before that flush must not publish a resumable ticket.
++        if (!close_done || error_reported) session.discard_session();
++        if (rx_head) rte_pktmbuf_free(rx_head);
++        for (auto &b : buffers) b.Delete();
++    }
++    // Intrusive segment FIFO. No per-packet heap descriptor allocation.
++    std::unique_ptr<astf_rx::Queue> rx_times;
++    rte_mbuf *rx_head = nullptr, *rx_tail = nullptr;
++    size_t rx_bytes = 0, rx_offset = 0;
++    bool tcp_eof = false, eof_delivered = false, terminal = false;
++    bool draining_alert = false;
++    astf_tls::Flow session;
++    std::unique_ptr<astf_http2::Session> http2;
++    CAstfTimerObj work_timer, close_timer;
++    uint32_t close_timeout_ms;
++    uint16_t work_budget;
++    size_t write_chunk;
++    // Nine 2-KiB descriptors hold a full 16-KiB TLS record plus AEAD
++    // overhead. Avoid splitting its tag into a separate TCP buffer slot.
++    std::array<std::array<CMbufObject, 9>, 8> descriptors;
++    std::array<CMbufBuffer, 8> buffers;
++    std::array<uint32_t, 8> remaining{};
++    uint32_t head = 0, count = 0;
++    CMbufBuffer *plain = nullptr;
++    const uint8_t *plain_data = nullptr;
++    uint32_t offset = 0, queued = 0;
++    uint8_t tx_retry_shift=0;
++    bool pumping = false, started = false, closing = false, close_done = false, error_reported = false;
++    // Plaintext is counted and discarded before any application callback.
++    // The read call is synchronous; no buffer address is retained by this adapter.
++    static uint8_t *scratch() { static thread_local uint8_t bytes[16384]; return bytes; }
++};
++#endif
++
++CEmulApp::~CEmulApp() {
++    force_stop_timer();
++    close_emul_addon();
++    if (m_udp_rtt_deadline_ns) {
++        INC_UDP_STAT(m_pctx, m_flow->m_tg_id, udps_rtt_aborted);
++    }
++    if (m_http) {
++        const auto &t=*m_http;
++        bool clean=t.http_eof && (!t.transactions || !t.transactions->pending()) && !t.aborted && !m_flow->m_tcp.m_socket.so_error;
++#ifdef TREX_TLS
++        if (m_tls) clean=clean && !m_tls->error_reported && !m_tls->session.failed() &&
++            m_tls->close_done && m_tls->session.peer_closed();
++#endif
++        if (clean && t.parser.done() && !t.http_error && m_http_syn_started && t.http_received &&
++            t.http_first_ns>=m_http_syn_ns && t.http_last_ns>=t.http_first_ns) {
++            auto &tp=m_flow->m_tcp;
++            tcp_latency_add(&tp.t_stat->tcps_ttfb, t.http_first_ns-m_http_syn_ns);
++            tcp_latency_add(&tp.t_stat->tcps_ttlb, t.http_last_ns-m_http_syn_ns);
++            if (tp.t_stat_ex) {
++                tcp_latency_add(&tp.t_stat_ex->tcps_ttfb, t.http_first_ns-m_http_syn_ns);
++                tcp_latency_add(&tp.t_stat_ex->tcps_ttlb, t.http_last_ns-m_http_syn_ns);
++            }
++        } else if (!t.http_error) INC_STAT(m_pctx, m_flow->m_tg_id, tcps_http_aborted);
++        delete m_http;
++    }
++#ifdef TREX_TLS
++    // Commit one sample per successful HTTP/2 connection. Keep response RX
++    // timestamps: FIN, GOAWAY, close_notify and delayed destruction add no time.
++    const astf_http2::Session *h2=m_h2?&m_h2->session:
++        (m_tls && m_tls->http2?m_tls->http2.get():nullptr);
++    bool h2_clean=h2 && (m_h2?(!m_h2->terminal && m_h2->closed):
++        (m_tls && !m_tls->error_reported && !m_tls->session.failed() &&
++         m_tls->close_done && m_tls->session.peer_closed()));
++    uint64_t first=0,last=0;
++    if(h2 && h2_clean && !m_flow->m_tcp.m_socket.so_error && m_http_syn_started &&
++       h2->response_times(first,last) && first>=m_http_syn_ns && last>=first) {
++        for(auto base:{m_flow->m_tcp.t_stat,m_flow->m_tcp.t_stat_ex}) {
++            if(!base)continue;
++            auto stats=static_cast<tcpstat_int_t *>(base);
++            tcp_transaction_add(&stats->tcps_http2_ttfb,first-m_http_syn_ns);
++            tcp_transaction_add(&stats->tcps_http2_ttlb,last-m_http_syn_ns);
++            tcp_latency_add(&stats->tcps_ttfb,first-m_http_syn_ns);
++            tcp_latency_add(&stats->tcps_ttlb,last-m_http_syn_ns);
++        }
++    }
++    if (m_h2) {
++        if(m_h2->work_timer.is_running()) m_pctx->m_ctx->m_timer_w.timer_stop(&m_h2->work_timer);
++        delete m_h2;
++    }
++    tls_stop_timers();
++    if (m_tls) {
++        astf_cost::Probe cost_probe(astf_cost::APP_FREE);
++        delete m_tls;
++    }
++#endif
++}
++
+ 
+ #if 0
+ void sbreserve(struct sockbuf *sb, u_int cc) {
+@@ -157,6 +344,123 @@
+     so->m_app->on_bh_event(te_SOISDISCONNECTED);
+ }
+ 
++void CEmulApp::http_syn() {
++    // Program metadata exists before TCP connects and before the TLS flow is
++    // allocated. Retransmitted SYNs must retain the first timestamp (even zero).
++    if (!m_http_syn_started && m_program && (m_program->m_http.enabled || m_program->m_http2.enabled)) {
++        m_http_syn_ns=uint64_t(now_sec()*1000000000.0);
++        m_http_syn_started=true;
++    }
++}
++
++bool CEmulApp::http_event(void *owner, bool complete) {
++    auto app=static_cast<CEmulApp *>(owner);
++    auto &h=*app->m_http;
++    if (!h.transactions) return true;
++    if (!complete) return h.transactions->first(h.now_ns);
++    uint64_t first,last;
++    // For close-delimited bodies EOF can arrive later than the last data byte.
++    if (!h.transactions->complete(h.http_last_ns,first,last)) return false;
++    auto &tp=app->m_flow->m_tcp;
++    tcp_transaction_add(&tp.t_stat->tcps_http_req_ttfb,first);
++    tcp_transaction_add(&tp.t_stat->tcps_http_req_ttlb,last);
++    if (tp.t_stat_ex) {
++        tcp_transaction_add(&tp.t_stat_ex->tcps_http_req_ttfb,first);
++        tcp_transaction_add(&tp.t_stat_ex->tcps_http_req_ttlb,last);
++    }
++    return true;
++}
++
++bool CEmulApp::http_rx(const uint8_t *data, size_t len, bool eof) {
++    if (!m_http) return true;
++    auto &t=*m_http;
++    t.now_ns=m_rx_time.first;
++    if (len) {
++        t.http_last_ns=std::max(t.http_last_ns,m_rx_time.last);
++        if (!t.http_received) { t.http_first_ns=m_rx_time.first; t.http_received=true; }
++    }
++    uint32_t before=t.parser.completed();
++    bool ok=eof ? t.parser.eof() : t.parser.feed(data,len);
++    if (eof) t.http_eof=true;
++    INC_STAT_CNT(m_pctx, m_flow->m_tg_id, tcps_http_responses, t.parser.completed()-before);
++    if (!ok && !t.http_error) {
++        t.http_error=true;
++        INC_STAT(m_pctx, m_flow->m_tg_id, tcps_http_errors);
++        if (t.parser.failure()==astf_http::Error::STATUS) {
++            INC_STAT(m_pctx, m_flow->m_tg_id, tcps_http_bad_status);
++        } else if (t.parser.failure()==astf_http::Error::TRUNCATED) {
++            INC_STAT(m_pctx, m_flow->m_tg_id, tcps_http_truncated);
++        } else if (t.parser.failure()==astf_http::Error::CONTENT) {
++            INC_STAT(m_pctx, m_flow->m_tg_id, tcps_http_bad_content);
++        } else if (t.parser.failure()==astf_http::Error::TRANSACTION) {
++            INC_STAT(m_pctx, m_flow->m_tg_id, tcps_http_transaction_errors);
++        } else {
++            INC_STAT(m_pctx, m_flow->m_tg_id, tcps_http_framing);
++        }
++    }
++    return ok;
++}
++
++bool CEmulApp::needs_rx_timestamps() const {
++    return m_program && (m_program->m_http.enabled ||
++           (m_program->m_http2.enabled && !m_program->m_http2.server));
++}
++bool CEmulApp::needs_rx_payload() const {
++#ifdef TREX_TLS
++    if (m_tls || m_h2) return true;
++#endif
++    return m_http != nullptr;
++}
++
++void CEmulApp::payload_fail(bool resource) {
++#ifdef TREX_TLS
++    if (m_h2) {h2_fail();return;}
++    if (m_tls) { tls_fail(resource ? astf_tls::Failure::RESOURCE : astf_tls::Failure::TRANSPORT); return; }
++#endif
++    if (m_http) m_http->aborted=true;
++    force_stop_timer();
++    set_disconnect(true);
++}
++
++void CEmulApp::rx_reassembled(const uint8_t *data, size_t len) {
++#ifdef TREX_TLS
++    if (m_tls) { tls_rx_reassembled(data,len); return; }
++    if (m_h2) {
++        m_flow->m_tcp.m_socket.so_rcv.sb_cc+=len;
++        h2_rx(data,len);m_api->rx_drain(m_flow);h2_pump();return;
++    }
++#endif
++    // Feed contiguous plaintext directly; no additional mbuf allocation/copy.
++    if (m_http && !m_http->aborted && !http_rx(data,len)) { payload_fail(false); return; }
++    m_flow->m_tcp.m_socket.so_rcv.sb_cc += len;
++    if (get_rx_enabled() && !(m_http && (m_http->aborted || m_http->http_error))) {
++        m_cmd_rx_bytes += m_api->rx_drain(m_flow);
++        if (m_state==te_WAIT_RX) check_rx_condition();
++    }
++}
++
++void so_rx_timestamp(struct socket *so) {
++    auto app=reinterpret_cast<tcp_socket *>(so)->m_app;
++    if(app && app->needs_rx_timestamps()) {
++        uint64_t now=uint64_t(now_sec()*1000000000.0);
++        app->m_rx_time=astf_rx::Stamp(now,now);
++    }
++}
++
++void so_http_syn(struct socket *so) {
++    auto app=reinterpret_cast<tcp_socket *>(so)->m_app;
++    if (app) app->http_syn();
++}
++
++int so_requires_tls_ack_output(struct socket *so) {
++#ifdef TREX_TLS
++    auto app = reinterpret_cast<tcp_socket *>(so)->m_app;
++    return app && (app->is_tls() || app->m_h2);
++#else
++    return 0;
++#endif
++}
++
+ void sorwakeup(struct socket *so) {
+     sorwakeup((struct tcp_socket *)so);
+ }
+@@ -218,8 +522,8 @@
+ 
+ void CMbufBuffer::Delete(){
+     int i;
+-    for (i=0; i<m_vec.size(); i++) {
+-        m_vec[i].Free();
++    for (i=0; i<object_count(); i++) {
++        object(i).Free();
+     }
+     Reset();
+ }
+@@ -235,7 +539,7 @@
+     uint32_t mod=offset%m_blk_size;
+ 
+     res.m_offset = mod;
+-    CMbufObject *lp= &m_vec[index];
++    CMbufObject *lp= &object(index);
+     res.m_mbuf   = lp->m_mbuf;
+     res.m_type   = lp->m_type; 
+ }
+@@ -246,23 +550,27 @@
+             (ulong)m_blk_size,(ulong)m_num_pkt);
+ 
+     int i;
+-    for (i=0; i<m_vec.size(); i++) {
+-        m_vec[i].Dump(fd);
++    for (i=0; i<object_count(); i++) {
++        object(i).Dump(fd);
+     }
+ }
+ 
+ 
+ bool CMbufBuffer::Verify(){
+ 
++#ifdef TREX_TLS
++    assert(m_fixed ? m_num_pkt <= m_fixed_capacity : m_vec.size()==m_num_pkt);
++#else
+     assert(m_vec.size()==m_num_pkt);
++#endif
+     if (m_num_pkt==0) {
+         return(true);
+     }
+     int i=0;
+     for (i=0; i<m_num_pkt-1; i++) {
+-        assert(m_vec[i].m_mbuf->pkt_len==m_blk_size);
+-    }
+-    assert(m_vec[i].m_mbuf->pkt_len<=m_blk_size);
++        assert(object(i).m_mbuf->pkt_len==m_blk_size);
++    }
++    assert(object(i).m_mbuf->pkt_len<=m_blk_size);
+     return(true);
+ }
+ 
+@@ -272,9 +580,15 @@
+     assert(obj.m_mbuf);
+     assert(obj.m_mbuf->nb_segs==1);
+ 
++#ifdef TREX_TLS
++    if (m_fixed) {
++        assert(m_num_pkt < m_fixed_capacity); // TLS drain <= 16 KiB / 2 KiB.
++        m_fixed[m_num_pkt] = obj;
++    } else
++#endif
++        m_vec.push_back(obj);
+     m_num_pkt +=1;
+     m_t_bytes +=obj.m_mbuf->pkt_len;
+-    m_vec.push_back(obj);
+ }
+ 
+ 
+@@ -288,6 +602,13 @@
+ }
+ 
+ void CEmulApp::tcp_udp_close(){
++#ifdef TREX_TLS
++    if (m_tls && !m_tls->close_done) {
++        m_tls->closing = true;
++        tls_pump();
++        return;
++    }
++#endif
+     if (is_udp_flow()) {
+         m_api->disconnect(m_pctx,m_flow);
+     }else{
+@@ -316,8 +637,53 @@
+ }
+ 
+ 
++void CEmulApp::udps_rtt_timeout() {
++    m_udp_rtt_deadline_ns = 0;
++    force_stop_timer();
++    INC_UDP_STAT(m_pctx, m_flow->m_tg_id, udps_rtt_timeouts);
++    do_disconnect();
++}
++
+ /* on tick */
+ void CEmulApp::on_tick(){
++    if (m_udp_rtt_deadline_ns) {
++        const uint64_t now = uint64_t(now_sec()*1000000000.0);
++        if (now < m_udp_rtt_deadline_ns) {
++            run_cmd_delay(tw_time_usec_to_ticks((m_udp_rtt_deadline_ns-now+999)/1000));
++        } else {
++            udps_rtt_timeout();
++        }
++        return;
++    }
++#ifdef TREX_TLS
++    if((m_h2 || (m_tls && m_tls->http2 && !m_tls->closing)) &&
++       h2_clock_ns()<m_h2_deadline_ns) {
++        if(m_h2)h2_pump();else tls_pump();
++        run_dpc_callbacks();
++        return;
++    }
++    if(m_h2) {
++        if(!m_h2->terminal && !m_h2->closed) {
++            INC_STAT(m_pctx,m_flow->m_tg_id,tcps_http2_timeouts);
++            h2_fail();do_disconnect();
++        }
++        return;
++    }
++    if (m_tls && m_tls->http2 && !m_tls->closing) {
++        INC_STAT(m_pctx,m_flow->m_tg_id,tcps_http2_timeouts);
++        tls_fail(astf_tls::Failure::APPLICATION);
++        do_disconnect();
++        return;
++    }
++    if (m_tls && !m_tls->started) {
++        if (m_tls->terminal) return;
++        m_tls->terminal = true;
++        tls_stop_timers();
++        INC_STAT(m_pctx, m_flow->m_tg_id, tcps_tls_timeouts);
++        do_disconnect(); // handshake deadline, timer callback is outside TCP input
++        return;
++    }
++#endif
+     next();
+ }
+ 
+@@ -398,11 +764,70 @@
+     EMUL_LOG(cmd, "CMD [%d] state : %d ,cmd_index [%d] -",m_debug_id,m_state,m_cmd_index);
+ 
+     switch (cmd->m_cmd) {
++    case tcHTTP2:
++#ifdef TREX_TLS
++        if (!m_tls) {
++            try {
++                if(m_h2) {h2_fail();break;}
++                m_h2=new CEmulAppH2(m_program->m_http2,http2_event,this);
++                // Native HTTP/2 multiplexes short control frames with DATA.
++                // TSO leaves a fractional tail; Nagle can hold it until a
++                // delayed ACK, stalling END_STREAM/WINDOW_UPDATE progress.
++                m_flow->m_tcp.t_flags |= TF_NODELAY;
++                m_q.reserve(8);
++                m_h2->work_timer.m_userdata1=this;
++                m_h2->work_timer.m_cb=[](void *,void *owner,CAstfTimerObj *) {
++                    auto app=static_cast<CEmulApp *>(owner);
++                    app->h2_pump();app->run_dpc_callbacks();app->release_closed_tcp_flow();
++                };
++                m_h2_deadline_ns=h2_clock_ns()+uint64_t(m_program->m_http2.timeout_ms)*1000000;
++                h2_schedule_timer();
++                h2_pump();
++            } catch(const std::exception &) {h2_fail();}
++            break;
++        }
++        if (m_tls->http2) { tls_fail(astf_tls::Failure::APPLICATION); break; }
++        try {
++            m_tls->http2.reset(new astf_http2::Session(m_program->m_http2,http2_event,this));
++            m_h2_deadline_ns=h2_clock_ns()+uint64_t(m_program->m_http2.timeout_ms)*1000000;
++            h2_schedule_timer();
++        } catch (const std::exception &) { tls_fail(astf_tls::Failure::RESOURCE); }
++#endif
++        break;
++    case tcHTTP_REQUEST:
++        if (m_http && m_http->transactions && !(m_flags&taCONNECTED)) {
++            m_http->waiting_request=true;
++            m_state=te_NONE;
++            break;
++        }
++        if (!m_http || !m_http->transactions ||
++            !m_http->transactions->request(uint64_t(now_sec()*1000000000.0))) {
++            INC_STAT(m_pctx,m_flow->m_tg_id,tcps_http_transaction_errors);
++            if (m_http) m_http->aborted=true;
++            payload_fail(false);
++            break;
++        }
++        return next_cmd();
+     case  tcTX_BUFFER   :
+         {
+             CMbufBuffer *   b=cmd->u.m_tx_cmd.m_buf;
+             assert(b);
+             uint32_t len = b->len();
++#ifdef TREX_TLS
++            if (m_tls) {
++                m_state = te_SEND;
++                auto plain = m_program->m_tls_plaintext.find(b);
++                if (plain == m_program->m_tls_plaintext.end() || plain->second.size() != len) {
++                    tls_fail(astf_tls::Failure::APPLICATION);
++                    break;
++                }
++                m_tls->plain_data = plain->second.data();
++                m_tls->plain = b;
++                m_tls->offset = 0;
++                tls_pump();
++                break;
++            }
++#endif
+             m_q.add_buffer(b); /* add buffer */
+             uint32_t add_to_queue = bsd_umin(m_api->get_tx_sbspace(m_flow),len);
+             m_api->tx_sbappend(m_flow,add_to_queue);
+@@ -553,7 +978,18 @@
+         }
+         break;
+ 
+-    case tcTX_PKT : 
++    case tcUDP_REQUEST: {
++        // One response is consumed by this command, independently of recv_msg's
++        // cumulative watermarks. No payload header or timestamp is transmitted.
++        m_udp_rtt_start_ns = uint64_t(now_sec()*1000000000.0);
++        m_udp_rtt_deadline_ns = m_udp_rtt_start_ns +
++            uint64_t(cmd->u.m_udp_request.m_timeout_ms)*1000000;
++        INC_UDP_STAT(m_pctx, m_flow->m_tg_id, udps_rtt_started);
++        run_cmd_delay(tw_time_msec_to_ticks(cmd->u.m_udp_request.m_timeout_ms));
++        m_api->send_pkt((CUdpFlow *)m_flow, cmd->u.m_udp_request.m_buf);
++        break;
++    }
++    case tcTX_PKT :
+         {
+             m_state=te_NONE;
+             if (get_emul_addon()) {
+@@ -727,6 +1163,65 @@
+     if (m_program->is_stream()) {
+         m_q.set_window_size(m_api->get_tx_max_space(m_flow));
+     }
++    if (m_program->m_http.enabled) {
++        try { m_http = new CEmulAppHttp(m_program->m_http,this); }
++        catch (const std::bad_alloc &) {
++            INC_STAT(m_pctx, m_flow->m_tg_id, tcps_http_aborted);
++            set_disconnect(true);
++            set_interrupt(false);
++            return;
++        }
++    }
++#ifdef TREX_TLS
++    if (m_program->m_tls_context) {
++        INC_STAT(m_pctx, m_flow->m_tg_id, tcps_tls_attempts);
++        try {
++            if (m_program->m_tls_context->config.server == m_pctx->m_ctx->is_client_side()) {
++                set_disconnect(true);
++                set_interrupt(false);
++                return;
++            }
++#ifdef TREX_SIM
++            // Direct simulator programs do not go through load_tcp_profile.
++            m_pctx->m_tls_contexts.prepare_one(m_program->m_tls_context);
++#endif
++            {
++                astf_cost::Probe cost_probe(astf_cost::APP_CREATE);
++            m_tls = new CEmulAppTls(m_pctx->m_tls_contexts.get(m_program->m_tls_context.get()));
++            }
++            // TLS batches ciphertext before TCP output. Let TCP flush a short
++            // record tail even with unacknowledged data: the peer cannot
++            // authenticate/consume a partial record to drive further progress.
++            m_flow->m_tcp.t_flags |= TF_NODELAY;
++            if(needs_rx_timestamps()) {
++                m_tls->rx_times.reset(new astf_rx::Queue());
++                m_tls->session.enable_rx_timestamps();
++            }
++            if (m_tls->session.resume_attempted()) INC_STAT(m_pctx, m_flow->m_tg_id, tcps_tls_resume_attempts);
++            m_q.reserve(8);
++            m_tls->work_timer.m_userdata1 = this;
++            m_tls->work_timer.m_cb = [](void *, void *owner, CAstfTimerObj *) {
++                auto app = static_cast<CEmulApp *>(owner);
++                app->tls_pump();
++                app->run_dpc_callbacks();
++                app->release_closed_tcp_flow();
++            };
++            m_tls->close_timer.m_userdata1 = this;
++            m_tls->close_timer.m_cb = [](void *, void *owner, CAstfTimerObj *) {
++                auto app = static_cast<CEmulApp *>(owner);
++                if (app->m_tls->terminal || app->m_tls->close_done) return;
++                INC_STAT(app->m_pctx, app->m_flow->m_tg_id, tcps_tls_close_timeouts);
++                app->tls_fail(astf_tls::Failure::TRANSPORT);
++                app->run_dpc_callbacks();
++                app->release_closed_tcp_flow();
++            };
++            run_cmd_delay(tw_time_usec_to_ticks(uint64_t(m_program->m_tls_context->config.handshake_timeout_ms) * 1000));
++            tls_pump();
++        } catch (const std::exception &) { tls_fail(astf_tls::Failure::RESOURCE); }
++        set_interrupt(false);
++        return;
++    }
++#endif
+     CEmulAppCmd * lpcmd=m_program->get_index(m_cmd_index);
+     /* inject implicit TCP accept to avoid issue #604 */
+     CEmulAppCmd temp_cmd;
+@@ -740,19 +1235,124 @@
+ }
+ 
+ 
++#ifdef TREX_TLS
++// Timer callbacks do not pass through CFlowTable::process_tcp_packet. Reap a
++// closed flow here, after the application callback has unwound, rather than
++// leaving its buffers and TCP timers alive until another packet/slow tick.
++// This may delete this application; callers must not access it afterwards.
++void CEmulApp::release_closed_tcp_flow() {
++    if ((m_h2 || m_tls) && m_flow->is_can_close()) {
++        auto ctx=m_pctx->m_ctx;
++        ctx->m_ft.handle_close(ctx,m_flow,true);
++    }
++}
++#endif
++
+ void CEmulApp::do_disconnect(){
++#ifdef TREX_TLS
++    if ((m_h2 || m_tls) && m_flow->is_can_close()) {
++        set_disconnect(false);
++        return;
++    }
++#endif
++    if (m_http) m_http->aborted=true;
+     if (!m_flow->is_close_was_called()){
+         m_api->disconnect(m_pctx,m_flow);
+     }
+ }
+ 
+ void CEmulApp::do_close(){
++#ifdef TREX_TLS
++    if (m_tls && !m_tls->close_done) {
++        m_tls->closing = true;
++        tls_pump();
++        return;
++    }
++#endif
+     tcp_udp_close_dpc();
+ }
+ 
+ 
+ int CEmulApp::on_bh_tx_acked(uint32_t tx_bytes){
+     set_interrupt(true);
++#ifdef TREX_TLS
++    if (m_tls) {
++#ifdef TREX_SIM
++        if (tx_bytes && tls_invariant_fault >= 0 && tls_invariant_fault <= 4) {
++            switch (tls_invariant_fault) {
++            case 0: tx_bytes = m_tls->queued + 1; break;
++            case 1: m_tls->count = 0; break;
++            case 2: m_tls->remaining[m_tls->head] = 0; break;
++            case 3: m_tls->count = m_tls->buffers.size() + 1; break;
++            case 4: ++m_tls->queued; break;
++            }
++            tls_invariant_fault = -1;
++        }
++#endif
++        // Validate before touching either queue. At most eight descriptors:
++        // corrupt accounting must not underflow or spin on empty slots.
++        auto &t = *m_tls;
++        bool valid = t.head < t.buffers.size() && t.count <= t.buffers.size() &&
++                     tx_bytes <= t.queued;
++        uint64_t total = 0;
++        for (size_t i = 0; valid && i < t.count; ++i) {
++            auto n = t.remaining[(t.head + i) % t.buffers.size()];
++            valid = n != 0;
++            total += n;
++        }
++        if (!valid || total != t.queued) {
++            tls_fail(astf_tls::Failure::TRANSPORT);
++            set_interrupt(false);
++            return 0;
++        }
++        uint32_t add = 0;
++        m_q.on_bh_tx_acked(tx_bytes, add, true);
++        if (add) m_api->tx_sbappend(m_flow, add);
++        m_tls->queued -= tx_bytes;
++        while (tx_bytes) {
++            auto index = m_tls->head;
++            uint32_t n = std::min(tx_bytes, m_tls->remaining[index]);
++            if (t.http2) release_acked_blocks(t.buffers[index],t.remaining[index],t.remaining[index]-n);
++            m_tls->remaining[index] -= n;
++            tx_bytes -= n;
++            if (!m_tls->remaining[index]) {
++                m_tls->buffers[index].Delete();
++                m_tls->head = (index + 1) % m_tls->buffers.size();
++                --m_tls->count;
++            }
++        }
++        // A partial ACK cannot advance an idle established TLS receiver when
++        // there is no ciphertext, RX FIFO, pending command or close to service.
++        // Accounting and TCP sbappend above are still mandatory.
++        if (!t.started || t.plain || t.http2 || t.closing || t.rx_head || t.tcp_eof ||
++            t.session.pending() || t.session.read_can_progress() ||
++            t.work_timer.is_running() || t.session.failed() || t.session.peer_closed())
++            tls_pump();
++        set_interrupt(false);
++        return 0;
++    }
++#endif
++#ifdef TREX_TLS
++    if(m_h2) {
++        auto &t=*m_h2;
++        uint64_t total=0;
++        bool valid=t.head<t.buffers.size() && t.count<=t.buffers.size() && tx_bytes<=t.queued;
++        for(size_t i=0;valid && i<t.count;++i) {
++            auto n=t.remaining[(t.head+i)%t.buffers.size()];valid=n!=0;total+=n;
++        }
++        if(!valid || total!=t.queued) {h2_fail();set_interrupt(false);return 0;}
++        uint32_t add=0;m_q.on_bh_tx_acked(tx_bytes,add,true);
++        if(add)m_api->tx_sbappend(m_flow,add);
++        t.queued-=tx_bytes;
++        while(tx_bytes) {
++            auto i=t.head;auto n=std::min(tx_bytes,t.remaining[i]);
++            release_acked_blocks(t.buffers[i],t.remaining[i],t.remaining[i]-n);
++            t.remaining[i]-=n;tx_bytes-=n;
++            if(!t.remaining[i]) {t.buffers[i].Delete();t.head=(i+1)%t.buffers.size();--t.count;}
++        }
++        h2_pump();set_interrupt(false);return 0;
++    }
++#endif
+     uint32_t  add_to_queue;
+     
+     bool is_next=m_q.on_bh_tx_acked(tx_bytes,add_to_queue,get_tx_mode_none_blocking()?false:true);
+@@ -770,11 +1370,71 @@
+ 
+ 
+ void CEmulApp::on_bh_event(tcp_app_events_t event){
++#ifdef TREX_TLS
++    if(m_h2) {
++        bool interrupt=get_interrupt();set_interrupt(true);
++        if(event==te_SOABORT) h2_fail();
++        if(event==te_SOOTHERISDISCONNECTING || event==te_SOCANTRCVMORE) {
++            if(!m_h2->session.eof()) h2_fail();
++            else h2_pump();
++        }
++        if(event==te_SOISDISCONNECTED) {
++            if(!m_h2->closed)h2_fail();
++            // tcp_close has already counted this flow and set TCPS_CLOSED.
++            // Do not turn its notification into another deferred disconnect.
++            set_disconnect(false);
++            force_stop_timer();
++            if(m_h2->work_timer.is_running())m_pctx->m_ctx->m_timer_w.timer_stop(&m_h2->work_timer);
++        }
++        set_interrupt(interrupt);
++    }
++#endif
++    if (m_http) {
++        if (event==te_SOABORT || m_flow->m_tcp.m_socket.so_error) m_http->aborted=true;
++#ifdef TREX_TLS
++        if (!m_tls)
++#endif
++        if (event==te_SOOTHERISDISCONNECTING && !m_http->http_eof) {
++            if (!http_rx(nullptr,0,true)) payload_fail(false);
++        }
++    }
++#ifdef TREX_TLS
++    if (m_tls && (event == te_SOCANTRCVMORE || event == te_SOOTHERISDISCONNECTING)) {
++        bool interrupt = get_interrupt();
++        set_interrupt(true);
++        m_tls->tcp_eof = true; // Deliver BIO EOF only after all retained ciphertext.
++        tls_pump();
++        set_interrupt(interrupt);
++    }
++    if (m_tls && (event == te_SOABORT || event == te_SOISDISCONNECTED)) {
++        if (!m_tls->terminal && !m_tls->session.peer_closed() && !m_tls->error_reported) {
++            tls_report_error(astf_tls::Failure::TRANSPORT);
++        }
++        m_tls->terminal = true;
++        if(event==te_SOISDISCONNECTED)set_disconnect(false);
++        force_stop_timer();
++        tls_stop_timers();
++    }
++#endif
+     if ((m_flags&taDO_WAIT_FOR_CLOSE) && (event==te_SOOTHERISDISCONNECTING)){
+         set_do_close(true);
+     }
+     if (event==te_SOISCONNECTED){
+         m_flags|=taCONNECTED;
++#ifdef TREX_TLS
++        if(m_h2) {
++            bool interrupt=get_interrupt();set_interrupt(true);h2_pump();set_interrupt(interrupt);
++        }
++#endif
++        if (m_http && m_http->waiting_request) {
++            m_http->waiting_request=false;
++            if (!m_http->transactions->request(uint64_t(now_sec()*1000000000.0))) {
++                INC_STAT(m_pctx,m_flow->m_tg_id,tcps_http_transaction_errors);
++                payload_fail(false);
++                return;
++            }
++            m_flags|=taDO_DPC_NEXT;
++        }
+         if (m_flags&taDO_WAIT_CONNECTED) {
+             m_flags|=taDO_DPC_NEXT;
+             m_flags&=(~taDO_WAIT_CONNECTED);
+@@ -795,6 +1455,21 @@
+         rte_pktmbuf_free(m);
+     }
+ 
++    if (m_udp_rtt_deadline_ns) {
++        const uint64_t now = uint64_t(now_sec()*1000000000.0);
++        if (now >= m_udp_rtt_deadline_ns) {
++            udps_rtt_timeout();
++        } else {
++            const uint64_t elapsed = now-m_udp_rtt_start_ns;
++            m_udp_rtt_deadline_ns = 0;
++            force_stop_timer();
++            tcp_transaction_add(&m_pctx->m_udpstat.m_sts.udps_rtt, elapsed);
++            tcp_transaction_add(&m_pctx->m_udpstat.m_sts_tg_id[m_flow->m_tg_id].udps_rtt, elapsed);
++            next();
++        }
++        set_interrupt(false);
++        return 0;
++    }
+     if ( get_rx_enabled() ) {
+         m_cmd_rx_bytes+= 1;
+         if (m_state==te_WAIT_RX) {
+@@ -811,13 +1486,57 @@
+ int CEmulApp::on_bh_rx_bytes(uint32_t rx_bytes,
+                             struct rte_mbuf * m){
+     set_interrupt(true);
++#ifdef TREX_TLS
++    if (m_tls) {
++        if (m_tls->terminal || m_tls->draining_alert) {
++            if (m) rte_pktmbuf_free(m);
++        } else if (!m && rx_bytes) {
++            tls_fail();
++        } else if (m) {
++            if(m_tls->rx_times) {
++                try {m_tls->rx_times->append(rx_bytes,m_rx_time);}
++                catch(const std::bad_alloc &) {
++                    rte_pktmbuf_free(m);tls_fail(astf_tls::Failure::RESOURCE);
++                    set_interrupt(false);return 0;
++                }
++            }
++            if (m_tls->rx_tail) m_tls->rx_tail->next = m;
++            else m_tls->rx_head = m;
++            for (auto seg = m; seg; seg = seg->next) m_tls->rx_tail = seg;
++            m_tls->rx_bytes += rx_bytes;
++            // sbappend already charged so_rcv.sb_cc. Do not reopen the window
++            // merely because bytes were handed to the TLS adapter.
++            tls_pump();
++        }
++        set_interrupt(false);
++        return 0;
++    }
++#endif
++#ifdef TREX_TLS
++    if(m_h2) {
++        if(!m && rx_bytes)h2_fail();
++        for(auto seg=m;seg && !m_h2->terminal;seg=seg->next)
++            h2_rx(rte_pktmbuf_mtod(seg,const uint8_t *),seg->data_len);
++        if(m)rte_pktmbuf_free(m);
++        m_api->rx_drain(m_flow);h2_pump();set_interrupt(false);return 0;
++    }
++#endif
++    if (m_http && !m_http->aborted && !m_http->http_error) {
++        if (!m && rx_bytes) payload_fail(false);
++        else for (auto seg=m; seg; seg=seg->next) {
++            if (!http_rx(rte_pktmbuf_mtod(seg,const uint8_t *), seg->data_len)) {
++                payload_fail(false);
++                break;
++            }
++        }
++    }
+     if (m) {
+         check_l7_data(m);
+         /* for now do nothing with the mbuf */
+         rte_pktmbuf_free(m);
+     }
+ 
+-    if ( get_rx_enabled() ) {
++    if ( get_rx_enabled() && !(m_http && (m_http->aborted || m_http->http_error)) ) {
+ 
+         /* drain the bytes from the queue */
+         m_cmd_rx_bytes+= m_api->rx_drain(m_flow); 
+@@ -874,7 +1593,7 @@
+ }
+ 
+ bool CEmulAppProgram::is_udp_commands(tcp_app_cmd_t cmd_id){
+-    if ( (cmd_id==tcTX_PKT) || 
++    if ( (cmd_id==tcUDP_REQUEST) || (cmd_id==tcTX_PKT) ||
+          (cmd_id==tcRX_PKT) ||
+          (cmd_id==tcKEEPALIVE) ||
+          (cmd_id==tcCLOSE_PKT) 
+@@ -985,6 +1704,12 @@
+     case tcDONT_CLOSE :
+         fprintf(fd," tcDONT_CLOSE : dont close, wait for RST \n");
+         break;
++    case tcHTTP2:
++        fprintf(fd," http2 session\n");
++        break;
++    case tcHTTP_REQUEST:
++        fprintf(fd," http_request_start\n");
++        break;
+     case tcCONNECT_WAIT :
+         fprintf(fd," tcCONNECT_WAIT : wait for connection \n");
+         break;
+@@ -998,6 +1723,9 @@
+         fprintf(fd," tcJMPNZ id:%lu, offset:%d\n",(ulong)u.m_jmpnz.m_var_id,(int)u.m_jmpnz.m_offset);
+         break;
+ 
++    case tcUDP_REQUEST:
++         fprintf(fd," udp_request timeout_ms=%u\n",u.m_udp_request.m_timeout_ms);
++         break;
+     case tcTX_PKT :
+          fprintf(fd," tcTX_PKT %lu bytes\n",(ulong)u.m_tx_pkt.m_buf->m_t_bytes);
+          break;
+@@ -1365,3 +2093,471 @@
+ 
+ std::vector<CEmulAddon*> CEmulAddonList::m_addon_list;
+ 
++
++#ifdef TREX_TLS
++void CEmulApp::http2_event(void *owner,astf_http2::Event event,uint64_t first,uint64_t last) {
++    auto &app=*static_cast<CEmulApp *>(owner);
++    auto pctx=app.m_pctx;auto tg=app.m_flow->m_tg_id;
++    switch(event) {
++    case astf_http2::Event::REQUEST: INC_STAT(pctx,tg,tcps_http2_requests); break;
++    case astf_http2::Event::RESPONSE:
++        INC_STAT(pctx,tg,tcps_http2_responses);
++        break;
++    case astf_http2::Event::RESET: INC_STAT(pctx,tg,tcps_http2_resets); break;
++    case astf_http2::Event::GOAWAY: INC_STAT(pctx,tg,tcps_http2_goaway); break;
++    case astf_http2::Event::ERROR: INC_STAT(pctx,tg,tcps_http2_errors); break;
++    }
++}
++
++void CEmulApp::tls_report_error(astf_tls::Failure reason) {
++    if (!m_tls || !m_tls->error_reported) {
++        INC_STAT(m_pctx, m_flow->m_tg_id, tcps_tls_errors);
++        if (reason == astf_tls::Failure::NONE && m_tls) reason = m_tls->session.failure();
++        switch (reason) {
++        case astf_tls::Failure::VERIFY: INC_STAT(m_pctx, m_flow->m_tg_id, tcps_tls_err_verify); break;
++        case astf_tls::Failure::TRUNCATED: INC_STAT(m_pctx, m_flow->m_tg_id, tcps_tls_err_truncated); break;
++        case astf_tls::Failure::POLICY: INC_STAT(m_pctx, m_flow->m_tg_id, tcps_tls_err_policy); break;
++        case astf_tls::Failure::RESOURCE: INC_STAT(m_pctx, m_flow->m_tg_id, tcps_tls_err_resource); break;
++        case astf_tls::Failure::TRANSPORT: INC_STAT(m_pctx, m_flow->m_tg_id, tcps_tls_err_transport); break;
++        case astf_tls::Failure::APPLICATION: INC_STAT(m_pctx, m_flow->m_tg_id, tcps_tls_err_application); break;
++        default: INC_STAT(m_pctx, m_flow->m_tg_id, tcps_tls_err_protocol); break;
++        }
++        if (m_tls) m_tls->error_reported = true;
++    }
++}
++
++void CEmulApp::tls_stop_timers() {
++    if (!m_tls) return;
++    for (auto timer : {&m_tls->work_timer, &m_tls->close_timer}) {
++        if (timer->is_running()) m_pctx->m_ctx->m_timer_w.timer_stop(timer);
++    }
++}
++
++void CEmulApp::tls_fail(astf_tls::Failure reason) {
++    tls_report_error(reason);
++    if (m_tls) m_tls->terminal = true;
++    tls_stop_timers();
++    force_stop_timer();
++    set_disconnect(true);
++}
++
++void CEmulApp::tls_rx_reassembled(const uint8_t *data, size_t len) {
++    // Reassembly owns a vector, not mbufs. Transfer into the same bounded RX
++    // path; the vector is released by CTcpReass after this call.
++    while (len && !m_tls->terminal && !m_tls->draining_alert) {
++        uint16_t n = std::min<size_t>(len, 2048);
++        auto m = tls_alloc_wire(m_flow->m_tcp.mbuf_socket, n);
++        if (!m) {
++            INC_STAT(m_pctx, m_flow->m_tg_id, tcps_nombuf);
++            tls_fail(astf_tls::Failure::RESOURCE);
++            return;
++        }
++        auto dst = rte_pktmbuf_append(m, n);
++        if (!dst) { rte_pktmbuf_free(m); tls_fail(astf_tls::Failure::RESOURCE); return; }
++        memcpy(dst, data, n);
++        // Match in-order TCP accounting; on_bh_rx_bytes takes mbuf ownership.
++        m_flow->m_tcp.m_socket.so_rcv.sb_cc += n;
++        bool interrupt = get_interrupt();
++        on_bh_rx_bytes(n, m);
++        set_interrupt(interrupt);
++        data += n; len -= n;
++    }
++}
++
++/* Allocate only from the existing NUMA mbuf pool. TLS TX descriptor vectors
++ * are reserved once per flow. A depleted pool aborts this flow, not the DP core. */
++static size_t tls_copy_wire(uint8_t socket, CMbufBuffer &buffer, const uint8_t *data, size_t len,
++                            bool partial=false) {
++    astf_cost::Probe cost_probe(astf_cost::WIRE_COPY);
++    const size_t original_len = len;
++    const uint32_t block_size=partial ? 4096 : 2048;
++    buffer.Create(block_size);
++    while (len) {
++        uint16_t n = std::min<size_t>(block_size, len);
++        auto m = tls_alloc_wire(socket, n,partial);
++        if (!m) {
++            if (!partial) buffer.Delete();
++            cost_probe.bytes(partial ? original_len-len : 0);
++            return partial ? original_len-len : 0;
++        }
++        auto dst = rte_pktmbuf_append(m, n);
++        if (!dst) { rte_pktmbuf_free(m); buffer.Delete(); return 0; }
++        memcpy(dst, data, n);
++        CMbufObject object;
++        object.m_type = MO_CONST;
++        object.m_mbuf = m;
++        buffer.Add_mbuf(object);
++        data += n; len -= n;
++    }
++    cost_probe.bytes(original_len);
++    return original_len;
++}
++
++void CEmulApp::h2_fail() {
++    if(m_h2 && m_h2->terminal)return;
++    if(!m_h2 || !m_h2->session.failed()) INC_STAT(m_pctx,m_flow->m_tg_id,tcps_http2_errors);
++    if(m_h2) {
++        m_h2->terminal=true;
++        if(m_h2->work_timer.is_running())m_pctx->m_ctx->m_timer_w.timer_stop(&m_h2->work_timer);
++    }
++    force_stop_timer();set_disconnect(true);
++}
++void CEmulApp::h2_rx(const uint8_t *data,size_t len) {
++    m_h2->session.set_pacing_clock(h2_clock_ns());
++    if(!m_h2->terminal && !m_h2->session.input(data,len,m_rx_time.first,m_rx_time.last))h2_fail();
++}
++uint64_t CEmulApp::h2_clock_ns() const {
++#ifdef TREX_SIM
++    return uint64_t(m_pctx->m_ctx->m_tick)*TCP_TIMER_W_1_TICK_US*1000;
++#else
++    return uint64_t(now_sec()*1000000000.0);
++#endif
++}
++void CEmulApp::h2_schedule_timer() {
++    const astf_http2::Session *session=nullptr;
++    if(m_h2 && !m_h2->terminal && !m_h2->closed)session=&m_h2->session;
++    else if(m_tls && m_tls->http2 && !m_tls->terminal && !m_tls->closing && !m_tls->draining_alert)
++        session=m_tls->http2.get();
++    if(!session || !m_h2_deadline_ns)return;
++    const uint64_t now=h2_clock_ns();
++    uint64_t due=m_h2_deadline_ns;
++    const uint64_t wake=session->next_wakeup_ns();
++    // A due wake blocked on TCP output resumes on ACK/work timer, not a busy poll.
++    if(wake>now)due=std::min(due,wake);
++    if(get_timer_init_done() && m_timer.is_running() && due==m_h2_timer_ns)return;
++    m_h2_timer_ns=due;
++    force_stop_timer();
++    run_cmd_delay(std::max<htw_ticks_t>(1,tw_time_usec_to_ticks(due>now?(due-now+999)/1000:1)));
++}
++void CEmulApp::h2_pump() {
++    auto &t=*m_h2;
++    t.session.set_pacing_clock(h2_clock_ns());
++    if(t.terminal || t.closed || t.pumping || !(m_flags&taCONNECTED))return;
++    t.pumping=true;
++    if(t.work_timer.is_running())m_pctx->m_ctx->m_timer_w.timer_stop(&t.work_timer);
++    unsigned budget=16;
++    bool blocked=false;
++    const uint32_t tx_limit=h2_tx_limit(m_flow->m_tcp);
++    while(budget && t.queued<tx_limit && t.count<t.buffers.size()) {
++        --budget;
++        const uint8_t *wire=nullptr;
++        size_t n=std::min<size_t>(t.session.output(&wire,uint64_t(now_sec()*1000000000.0)),
++                                std::min<size_t>(16384,tx_limit-t.queued));
++        if(t.session.failed()) {h2_fail();break;}
++        if(!n)break;
++        auto index=(t.head+t.count)%t.buffers.size();auto &buffer=t.buffers[index];
++        // No TLS calls or TLS cost accounting on the cleartext transport.
++        buffer.Create(4096);
++        size_t copied=0;
++        while(copied<n) {
++            uint16_t bytes=std::min<size_t>(4096,n-copied);
++#ifdef TREX_SIM
++            if(tls_allocation_budget==0)break;
++            if(tls_allocation_budget>0)--tls_allocation_budget;
++#endif
++            auto m=astf_tls::alloc_h2_mbuf(m_flow->m_tcp.mbuf_socket,bytes);
++            if(!m)break;
++            auto dst=rte_pktmbuf_append(m,bytes);
++            if(!dst) {rte_pktmbuf_free(m);break;}
++            memcpy(dst,wire+copied,bytes);
++            CMbufObject obj;obj.m_type=MO_CONST;obj.m_mbuf=m;buffer.Add_mbuf(obj);copied+=bytes;
++        }
++        if(copied!=n) {
++            INC_STAT(m_pctx,m_flow->m_tg_id,tcps_nombuf);
++            // Commit any complete prefix. Requiring a whole frame's worth of
++            // free mbufs would starve flows in a small shared pool.
++            blocked=true;
++            if(!copied) {buffer.Delete();break;}
++            n=copied;
++        }
++        t.remaining[index]=n;++t.count;t.queued+=n;t.tx_retry_shift=0;
++        m_q.add_buffer(&buffer);
++        auto add=std::min<uint32_t>(m_api->get_tx_sbspace(m_flow),n);
++        m_api->tx_sbappend(m_flow,add);m_q.subtract_bytes(add);
++        t.session.consume(n);
++        if(blocked)break;
++    }
++    if(!t.terminal && t.session.finished() && !t.queued) {
++        t.closed=true;force_stop_timer();tcp_udp_close();
++    } else if(!t.terminal && (blocked || (!budget && t.queued<tx_limit && t.count<t.buffers.size()))) {
++        m_pctx->m_ctx->m_timer_w.timer_start(&t.work_timer,
++            blocked ? h2_retry_delay(t.tx_retry_shift) : 1);
++    }
++    t.pumping=false;
++    h2_schedule_timer();
++    if(!get_interrupt())m_api->tx_tcp_output(m_pctx,m_flow);
++}
++
++// Failed SSL objects may still own a fatal alert in their output BIO.
++// Drain only that existing ciphertext, then wait for TCP acknowledgement. No
++// SSL/application calls are permitted in this phase; a close deadline bounds
++// zero windows, lost ACKs and a peer that never reads the alert.
++bool CEmulApp::tls_begin_alert_drain() {
++    auto &t=*m_tls;
++    if(t.draining_alert) return true;
++    if(!t.session.pending()) {tls_fail();return false;}
++    tls_report_error(astf_tls::Failure::NONE);
++    force_stop_timer();
++    tls_stop_timers();
++    t.draining_alert=true;
++    if(t.rx_head) rte_pktmbuf_free(t.rx_head);
++    t.rx_head=t.rx_tail=nullptr;
++    t.rx_bytes=t.rx_offset=0;
++    t.rx_times.reset();
++    m_pctx->m_ctx->m_timer_w.timer_start(&t.close_timer,
++        std::max<htw_ticks_t>(1,tw_time_usec_to_ticks(uint64_t(t.close_timeout_ms)*1000)));
++    return true;
++}
++
++void CEmulApp::tls_pump() {
++    auto &t = *m_tls;
++    if (t.pumping || t.terminal) return;
++    astf_cost::Probe cost_probe(astf_cost::PUMP);
++    if (t.work_timer.is_running()) m_pctx->m_ctx->m_timer_w.timer_stop(&t.work_timer);
++    t.pumping = true;
++    // A small TCP window cannot hold an entire record: preserve partial-read
++    // window credit there. Framing has observed all input even before enable.
++    if(!t.draining_alert) t.session.coalesce_reads(m_flow->m_tcp.m_socket.so_rcv.sb_hiwat >= 18437);
++    unsigned budget = t.work_budget;
++    bool blocked = false;
++    bool progress;
++    do {
++        progress = false;
++        // Batch already available segments, but bound work independently of
++        // the outer SSL budget. A full BIO must be drained before more input.
++        const size_t before_read = t.session.input_pending();
++        if(!t.draining_alert) {
++            unsigned feed_budget = 16;
++            while (t.rx_head && feed_budget--) {
++                auto m = t.rx_head;
++                size_t left = m->data_len - t.rx_offset;
++                astf_rx::Stamp stamp;
++                if(t.rx_times) {
++                    if(!t.rx_times->size()) {tls_fail(astf_tls::Failure::RESOURCE);break;}
++                    left=std::min(left,t.rx_times->front().size);stamp=t.rx_times->front().time;
++                }
++                size_t n = t.session.feed(rte_pktmbuf_mtod(m, uint8_t *) + t.rx_offset, left,stamp);
++                if(n && t.rx_times)t.rx_times->consume(n,stamp);
++                t.rx_offset += n;
++                t.rx_bytes -= n;
++                progress |= n != 0;
++                if (t.rx_offset == m->data_len) {
++                    t.rx_head = m->next;
++                    if (!t.rx_head) t.rx_tail = nullptr;
++                    m->next = nullptr;
++                    rte_pktmbuf_free(m);
++                    t.rx_offset = 0;
++                    progress = true;
++                }
++                // n == 0 is backpressure. ACK/output progress will resume this FIFO.
++                if (!n) break;
++            }
++            if (t.tcp_eof && !t.rx_head && !t.eof_delivered) {
++                t.session.eof();
++                t.eof_delivered = true;
++            }
++            if(t.terminal) break;
++            if (t.session.handshake_can_progress()) t.session.handshake();
++            if (t.session.failed() && !tls_begin_alert_drain()) break;
++        }
++        if (!t.draining_alert && t.session.ready() && !t.started) {
++            force_stop_timer();
++            t.started = true;
++            INC_STAT(m_pctx, m_flow->m_tg_id, tcps_tls_handshakes);
++            if (t.session.resumed()) { INC_STAT(m_pctx, m_flow->m_tg_id, tcps_tls_resumed); }
++            else { INC_STAT(m_pctx, m_flow->m_tg_id, tcps_tls_full_handshakes); }
++            const auto version_index = astf_tls::parameter_index(astf_tls::versions,t.session.negotiated_version());
++            const auto cipher_index = astf_tls::parameter_index(astf_tls::ciphers,t.session.negotiated_cipher());
++            const auto group_index = astf_tls::parameter_index(astf_tls::groups,t.session.negotiated_group());
++            const auto peer_signature_index = astf_tls::parameter_index(astf_tls::signatures,t.session.peer_signature());
++            for (auto base_stats : {m_flow->m_tcp.t_stat,m_flow->m_tcp.t_stat_ex}) {
++                if (!base_stats) continue;
++                auto stats=static_cast<tcpstat_int_t *>(base_stats);
++                ++stats->tcps_tls_version_counts[version_index];
++                ++stats->tcps_tls_cipher_counts[cipher_index];
++                ++stats->tcps_tls_group_counts[group_index];
++                ++stats->tcps_tls_peer_signature_counts[peer_signature_index];
++            }
++            process_cmd(m_program->get_index(m_cmd_index));
++            progress = true;
++        }
++        // Bound shared TX storage while leaving room for a full 16-KiB
++        // plaintext record, its AEAD overhead and small control records.
++        // Further ciphertext stays in the BIO until ACKs release TX storage.
++        const uint32_t tx_limit=t.http2 ? std::min<uint32_t>(18432,h2_tx_limit(m_flow->m_tcp)) : 65536;
++        if (t.started && !t.draining_alert) {
++            size_t n = t.session.read_can_progress() ? t.session.read(t.scratch(), 16384) : 0;
++            if (n) {
++                const auto saved=m_rx_time;
++                if(t.rx_times)m_rx_time=t.session.plaintext_time();
++                if (t.http2)t.http2->set_pacing_clock(h2_clock_ns());
++                if (t.http2 && !t.http2->input(t.scratch(),n,m_rx_time.first,m_rx_time.last)) {
++                    m_rx_time=saved;
++                    tls_fail(astf_tls::Failure::APPLICATION); break;
++                }
++                if (m_http && !http_rx(t.scratch(), n)) { m_rx_time=saved;tls_fail(astf_tls::Failure::APPLICATION); break; }
++                m_rx_time=saved;
++                INC_STAT_CNT(m_pctx, m_flow->m_tg_id, tcps_tls_rcvbyte, n);
++                /* TCP counts ciphertext; ASTF receive watermarks count plaintext. */
++                if (get_rx_enabled()) {
++                    m_cmd_rx_bytes += n;
++                    if (m_state == te_WAIT_RX) check_rx_condition();
++                }
++                progress = true;
++            }
++            if (m_http && t.session.peer_closed() && !m_http->http_eof && !http_rx(nullptr,0,true)) {
++                tls_fail(astf_tls::Failure::APPLICATION); break;
++            }
++            if (t.http2) {
++                t.http2->set_pacing_clock(h2_clock_ns());
++                if(t.session.peer_closed() && !t.http2->eof()) {tls_fail(astf_tls::Failure::APPLICATION);break;}
++                if(t.queued<tx_limit && (t.session.write_retry_pending() || !t.session.pending())) {
++                    const uint8_t *data=nullptr;
++                    size_t nbytes=std::min(t.http2->output(&data,uint64_t(now_sec()*1000000000.0)),t.write_chunk);
++                    if(nbytes) {
++                        INC_STAT(m_pctx,m_flow->m_tg_id,tcps_tls_write_calls);
++                        size_t written=t.session.write(data,nbytes);
++                        if(written) INC_STAT(m_pctx,m_flow->m_tg_id,tcps_tls_write_success);
++                        t.http2->consume(written);
++                        INC_STAT_CNT(m_pctx,m_flow->m_tg_id,tcps_tls_sndbyte,written);
++                        progress|=written!=0;
++                    }
++                }
++                if(t.http2->failed()) {tls_fail(astf_tls::Failure::APPLICATION);break;}
++                if(t.http2->finished()) {force_stop_timer();t.closing=true;}
++            }
++            if (t.plain && t.offset < t.plain->len() && t.queued < 65536 &&
++                (t.session.write_retry_pending() || !t.session.pending())) {
++                size_t nbytes = std::min<size_t>(t.plain->len() - t.offset, t.write_chunk);
++                INC_STAT(m_pctx, m_flow->m_tg_id, tcps_tls_write_calls);
++                size_t written = t.session.write(t.plain_data + t.offset, nbytes);
++                if (written) INC_STAT(m_pctx, m_flow->m_tg_id, tcps_tls_write_success);
++                t.offset += written;
++                INC_STAT_CNT(m_pctx, m_flow->m_tg_id, tcps_tls_sndbyte, written);
++                progress |= written != 0;
++            }
++            if (t.session.peer_closed() &&
++                ((t.plain && t.offset < t.plain->len() && !t.session.can_write()) ||
++                 (m_state == te_WAIT_RX && m_cmd_index < m_program->get_size() &&
++                  m_cmd_rx_bytes < m_cmd_rx_bytes_wm))) {
++                tls_fail(astf_tls::Failure::APPLICATION);
++                break;
++            }
++            if (t.session.peer_closed() && (m_flags & taDO_WAIT_FOR_CLOSE)) t.closing = true;
++            if (t.closing && !t.close_done && !t.close_timer.is_running()) {
++                m_pctx->m_ctx->m_timer_w.timer_start(&t.close_timer,
++                    std::max<htw_ticks_t>(1, tw_time_usec_to_ticks(uint64_t(t.close_timeout_ms) * 1000)));
++            }
++            if (t.closing && !t.plain) t.session.shutdown();
++        }
++        if(t.session.failed() && !tls_begin_alert_drain()) break;
++        while (t.queued < tx_limit && t.count < t.buffers.size()) {
++            const uint8_t *wire = nullptr;
++            const size_t available=t.session.peek(&wire);
++            const size_t credit=std::min<size_t>(t.descriptors[0].size() * 2048, tx_limit - t.queued);
++            size_t n=t.http2 ? astf_http2::tx_copy_size(available,credit,t.queued)
++                             : std::min(available,credit);
++            if (!n) break;
++            auto index = (t.head + t.count) % t.buffers.size();
++            CMbufBuffer *b = &t.buffers[index];
++            size_t copied=tls_copy_wire(m_flow->m_tcp.mbuf_socket,*b,wire,n,bool(t.http2));
++            if(copied!=n) {
++                INC_STAT(m_pctx, m_flow->m_tg_id, tcps_nombuf);
++                if(!t.http2 || t.draining_alert) {
++                    tls_fail(astf_tls::Failure::RESOURCE);
++                    t.pumping = false;
++                    return;
++                }
++                blocked=true; // Uncopied ciphertext remains intact in the BIO.
++                if(!copied)break;
++                n=copied;
++            }
++            t.session.consume(n);
++            t.remaining[index] = n;
++            ++t.count;
++            m_q.add_buffer(b);
++            uint32_t add = std::min<uint32_t>(m_api->get_tx_sbspace(m_flow), n);
++            m_api->tx_sbappend(m_flow, add);
++            m_q.subtract_bytes(add);
++            t.queued += n;
++            t.tx_retry_shift=0;
++            progress = true;
++            if(blocked)break;
++        }
++        if(t.draining_alert) {
++            if(!t.session.pending() && !t.queued) tls_fail();
++            // ACK callbacks resume a drain blocked on the fixed TCP queue.
++            // The close timer also covers alerts whose ACK never arrives.
++            break;
++        }
++        progress |= before_read != t.session.input_pending();
++        auto &rx = m_flow->m_tcp.m_socket.so_rcv;
++        size_t retained = t.rx_bytes + t.session.input_pending();
++#ifdef TREX_SIM
++        if (tls_invariant_fault == 5) {
++            tls_invariant_fault = -1;
++            retained = size_t(rx.sb_cc) + 1;
++        }
++#endif
++        if (retained > rx.sb_cc) {
++            tls_fail(astf_tls::Failure::TRANSPORT);
++            break;
++        }
++        if (retained < rx.sb_cc) {
++            rx.sb_cc = retained;
++            // Includes ACK callbacks which release TLS output backpressure.
++            // Ensure TCP emits a window update even without new application TX.
++            m_flow->m_tcp.t_flags |= TF_ACKNOW;
++        }
++        // SSL has accepted this entire immutable profile buffer: no write
++        // retry can refer to it now. Nonblocking sends may advance while TCP
++        // retains ciphertext; its fixed slot/byte limits provide backpressure.
++        // Blocking sends also fence ciphertext from preceding nonblocking sends.
++        if (t.plain && t.offset == t.plain->len() &&
++            (get_tx_mode_none_blocking() || (!t.queued && !t.session.pending()))) {
++            t.plain = nullptr;
++            next();
++            progress = true;
++        }
++        if (t.closing && !t.close_done && t.session.sent_close() && !t.queued && !t.session.pending()) {
++            t.close_done = true;
++            if (t.close_timer.is_running()) m_pctx->m_ctx->m_timer_w.timer_stop(&t.close_timer);
++            tcp_udp_close();
++            break;
++        }
++    } while (progress && !blocked && !t.terminal && --budget);
++    if (!t.terminal && !t.close_done && (blocked || (progress && !budget))) {
++        INC_STAT(m_pctx, m_flow->m_tg_id, tcps_tls_yields);
++        m_pctx->m_ctx->m_timer_w.timer_start(&t.work_timer,
++            blocked ? h2_retry_delay(t.tx_retry_shift) : 1);
++    }
++    t.pumping = false;
++    h2_schedule_timer();
++    if (!get_interrupt() && (m_flags & taCONNECTED)) m_api->tx_tcp_output(m_pctx, m_flow);
++}
++#endif
++
++#ifdef TREX_TLS
++void CEmulAppProgram::prepare_tls_buffers() {
++    if (!m_tls_context) return;
++    // Build transactionally. Never mutate the published map from a DP flow.
++    std::map<CMbufBuffer *, std::vector<uint8_t>> prepared;
++    for (auto &cmd : m_cmds) {
++        if (cmd.m_cmd != tcTX_BUFFER) continue;
++        auto buffer = cmd.u.m_tx_cmd.m_buf;
++        if (prepared.count(buffer)) continue;
++        auto &bytes = prepared[buffer];
++        bytes.resize(buffer->len());
++        uint32_t offset = 0;
++        while (offset < buffer->len()) {
++            CBufMbufRef ref;
++            buffer->get_by_offset(offset, ref);
++            size_t n = std::min<size_t>(ref.get_mbuf_size(), buffer->len() - offset);
++            if (!n) throw std::runtime_error("Empty TLS profile mbuf");
++            memcpy(bytes.data() + offset, rte_pktmbuf_mtod(ref.m_mbuf, const uint8_t *) + ref.m_offset, n);
++            offset += n;
++        }
++    }
++    m_tls_plaintext.swap(prepared);
++}
++#endif
+diff --git a/src/44bsd/tcp_socket.h b/src/44bsd/tcp_socket.h
+--- a/src/44bsd/tcp_socket.h
++++ b/src/44bsd/tcp_socket.h
+@@ -1,5 +1,6 @@
+ #ifndef BSD44_BR_TCP_SOCKET
+ #define BSD44_BR_TCP_SOCKET
++#include "rx_timestamp.h"
+ 
+ /*
+  * Copyright (c) 1982, 1986, 1993
+@@ -36,6 +37,14 @@
+  *  @(#)tcp_socket.h    8.1 (Berkeley) 6/10/93
+  */
+ 
++#include <memory>
++#include <cstddef>
++#include "common/utl_gcc_diag.h"
++#include "tls/astf_tls.h"
++#include "http/astf_http.h"
++struct CEmulAppTls;
++struct CEmulAppHttp;
++struct CEmulAppH2;
+ #include <vector>
+ #include <map>
+ #include <stdint.h>
+@@ -43,6 +52,7 @@
+ #include <string.h>
+ #include "mbuf.h"
+ #include "h_timer.h"
++#include "http2/astf_http2.h"
+ #include <stdarg.h>
+ #include <stdlib.h>
+ #include "hot_section.h"
+@@ -182,6 +192,24 @@
+      * @param obj
+      */
+     void Add_mbuf(CMbufObject & obj);
++#ifdef TREX_TLS
++    // Used only by bounded TLS ciphertext queues. Storage outlives this buffer.
++    void use_fixed_storage(CMbufObject *storage, uint32_t capacity) {
++        m_fixed = storage; m_fixed_capacity = capacity;
++    }
++#endif
++    size_t object_count() const {
++#ifdef TREX_TLS
++        if (m_fixed) return m_num_pkt;
++#endif
++        return m_vec.size();
++    }
++    CMbufObject &object(uint32_t index) {
++#ifdef TREX_TLS
++        if (m_fixed) return m_fixed[index];
++#endif
++        return m_vec[index];
++    }
+     bool Verify();
+     void Dump(FILE *fd);
+ 
+@@ -199,6 +227,10 @@
+ private:
+     void Reset();
+ public:
++#ifdef TREX_TLS
++    CMbufObject *m_fixed = nullptr;
++    uint32_t m_fixed_capacity = 0;
++#endif
+     vec_mbuf_t   m_vec;
+     uint32_t     m_num_pkt;      // number of packet in the vector, for speed can be taken from vec.size()
+     uint32_t     m_blk_size;     // the size of each mbuf ( maximum , except the last block */
+@@ -237,6 +269,9 @@
+                tcADD_TICK_STATS        =21,  /* add tick value to statistics counter */
+                tcSET_TEMPLATE          =22,  /* set template to execute */
+                tcEXEC_TEMPLATE         =23,  /* generate a flow from given template */
++               tcHTTP2                =26,  /* native HTTP/2 session */
++               tcUDP_REQUEST          =25,  /* one UDP request and response */
++               tcHTTP_REQUEST         =24,  /* begin one measured HTTP request */
+                tcNO_CMD                =255  /* explicit reset */
+ } tcp_app_cmd_enum_t;
+ 
+@@ -330,6 +365,11 @@
+ };
+ 
+ /* CMD == tcRX_PKT */
++struct CEmulAppCmdUdpRequest {
++    CMbufBuffer *m_buf;
++    uint32_t m_timeout_ms;
++};
++
+ struct CEmulAppCmdRxPkt {
+     enum {
+             rxcmd_NONE      = 0,
+@@ -370,6 +410,7 @@
+         CEmulAppCmdJmpDP     m_jmpdp;
+         CEmulAppCmdJmpCMP    m_jmpcmp;
+         CEmulAppCmdTxPkt     m_tx_pkt;
++        CEmulAppCmdUdpRequest m_udp_request;
+         CEmulAppCmdRxPkt     m_rx_pkt;   
+         CEmulAppCmdKeepAlive m_keepalive;   
+         CEmulAppCmdTemplate  m_template;
+@@ -535,6 +576,14 @@
+ class  CEmulAppProgram {
+ 
+ public:
++    astf_http::Config m_http;
++    astf_http2::Config m_http2;
++#ifdef TREX_TLS
++    std::shared_ptr<astf_tls::Context> m_tls_context;
++    // Prepared before publication; shared read-only by all flows of this program.
++    std::map<CMbufBuffer *, std::vector<uint8_t>> m_tls_plaintext;
++    void prepare_tls_buffers();
++#endif
+     ~CEmulAppProgram(){ 
+         m_cmds.clear();
+         m_stream=true;
+@@ -615,6 +664,8 @@
+         m_v_cc=0;
+         m_wnd_div_2=0;
+     }
++
++    void reserve(size_t n) { m_q.reserve(n); }
+ 
+     void set_window_size(uint32_t wnd){
+         m_wnd_div_2 = wnd>>1;
+@@ -740,14 +791,47 @@
+         m_addon_sts = nullptr;
+     }
+ 
+-    virtual ~CEmulApp(){
+-        force_stop_timer();
+-        close_emul_addon();
+-    }
++    virtual ~CEmulApp();
++    // Nonzero deadline denotes one outstanding measured UDP request.
++    uint64_t m_udp_rtt_start_ns = 0, m_udp_rtt_deadline_ns = 0;
++    void udps_rtt_timeout();
++    CEmulAppHttp *m_http = nullptr;
++    astf_rx::Stamp m_rx_time;
++    uint64_t m_http_syn_ns = 0;
++    bool m_http_syn_started = false;
++    void http_syn();
++    static bool http_event(void *owner, bool complete);
++    bool http_rx(const uint8_t *data, size_t len, bool eof=false);
++    bool needs_rx_payload() const;
++    bool needs_rx_timestamps() const;
++    void rx_reassembled(const uint8_t *data, size_t len);
++    void payload_fail(bool resource);
++#ifdef TREX_TLS
++    uint64_t m_h2_deadline_ns=0, m_h2_timer_ns=0;
++    uint64_t h2_clock_ns() const;
++    void h2_schedule_timer();
++    CEmulAppH2 *m_h2 = nullptr;
++    void h2_pump();
++    void h2_fail();
++    void h2_rx(const uint8_t *,size_t);
++    CEmulAppTls *m_tls = nullptr;
++    bool is_tls() const { return m_tls != nullptr; }
++    void tls_pump();
++    bool tls_begin_alert_drain();
++    static void http2_event(void *, astf_http2::Event, uint64_t, uint64_t);
++    void tls_stop_timers();
++    void tls_fail(astf_tls::Failure reason = astf_tls::Failure::NONE);
++    void tls_report_error(astf_tls::Failure reason);
++    void tls_rx_reassembled(const uint8_t *data, size_t len);
++#endif
+ 
+     static uint32_t timer_offset(void){
+-        CEmulApp *lp=0;
+-        return ((uintptr_t)&lp->m_timer);
++        // Use the compiler layout intrinsic, not a member access through null.
++        // GCC/Clang support non-standard-layout container offsets in this ABI.
++        UNSAFE_CONTAINER_OF_PUSH;
++        uint32_t offset = offsetof(CEmulApp, m_timer);
++        UNSAFE_CONTAINER_OF_POP;
++        return offset;
+     }
+ 
+ public:
+@@ -904,6 +988,11 @@
+         m_pctx = pctx;
+         m_flow = flow;
+     }
++#if defined(TREX_SIM) && defined(TREX_TLS)
++    // Deterministic mbuf exhaustion for simulator tests; -1 disables it.
++    static void tls_test_allocations(int remaining);
++    static void tls_test_invariant(int site);
++#endif
+ #ifdef  TREX_SIM
+     void set_flow_ctx(CTcpPerThreadCtx *  ctx,
+                       CTcpFlow *          flow);
+@@ -987,6 +1076,9 @@
+     virtual void do_close();
+ 
+     void on_tick();
++#ifdef TREX_TLS
++    void release_closed_tcp_flow();
++#endif
+ 
+ private:
+     /* log support */
+diff --git a/src/44bsd/tcp_subr.cpp b/src/44bsd/tcp_subr.cpp
+--- a/src/44bsd/tcp_subr.cpp
++++ b/src/44bsd/tcp_subr.cpp
+@@ -157,6 +157,25 @@
+     MYC(tcps_reas_hist_16);
+     MYC(tcps_reas_hist_100);
+     MYC(tcps_reas_hist_other);
++#ifdef TREX_TLS
++    MYC(tcps_tls_attempts);
++    MYC(tcps_tls_yields);
++    MYC(tcps_tls_close_timeouts);
++    MYC(tcps_tls_resume_attempts);
++    MYC(tcps_tls_resumed);
++    MYC(tcps_tls_handshakes);
++    MYC(tcps_tls_errors);
++    MYC(tcps_tls_err_verify);
++    MYC(tcps_tls_err_truncated);
++    MYC(tcps_tls_err_policy);
++    MYC(tcps_tls_err_resource);
++    MYC(tcps_tls_err_transport);
++    MYC(tcps_tls_err_application);
++    MYC(tcps_tls_err_protocol);
++    MYC(tcps_tls_timeouts);
++    MYC(tcps_tls_sndbyte);
++    MYC(tcps_tls_rcvbyte);
++#endif
+     MYC(tcps_nombuf);
+     MYC(tcps_notunnel);
+ 
+@@ -605,6 +624,9 @@
+         app=my_unsafe_container_app(tmr,CEmulApp,timer_offset);
+         UNSAFE_CONTAINER_OF_POP;
+         app->on_tick();
++#ifdef TREX_TLS
++        app->release_closed_tcp_flow();
++#endif
+         break;
+     case ttUDP_FLOW:
+         {
+@@ -960,20 +982,16 @@
+     udp_stat_int_t *lpt_udp = &m_udpstat.m_sts;
+     app_stat_int_t *lpt_app = &m_appstat.m_sts;
+ 
+-    CGCountersUtl64 tcp((uint64_t *)lpt_tcp,sizeof(tcpstat_int_t)/sizeof(uint64_t));
+-    CGCountersUtl64 udp((uint64_t *)lpt_udp,sizeof(udp_stat_int_t)/sizeof(uint64_t));
+     CGCountersUtl64 app((uint64_t *)lpt_app,sizeof(app_stat_int_t)/sizeof(uint64_t));
+ 
+     uint64_t *base_tcp = (uint64_t *)&pctx->m_tcpstat.m_sts;
+     uint64_t *base_udp = (uint64_t *)&pctx->m_udpstat.m_sts;
+     uint64_t *base_app = (uint64_t *)&pctx->m_appstat.m_sts;
+ 
+-    CGCountersUtl64 tcp_ctx(base_tcp,sizeof(tcpstat_int_t)/sizeof(uint64_t));
+-    CGCountersUtl64 udp_ctx(base_udp,sizeof(udp_stat_int_t)/sizeof(uint64_t));
+     CGCountersUtl64 app_ctx(base_app,sizeof(app_stat_int_t)/sizeof(uint64_t));
+ 
+-    tcp += tcp_ctx;
+-    udp += udp_ctx;
++    lpt_tcp->add(*reinterpret_cast<tcpstat_int_t *>(base_tcp));
++    lpt_udp->add(*reinterpret_cast<udp_stat_int_t *>(base_udp));
+     app += app_ctx;
+ 
+     if (pctx->get_time_connects()) {
+@@ -986,20 +1004,16 @@
+     udp_stat_int_t *lpt_udp = &m_udpstat.m_sts_tg_id[tg_id];
+     app_stat_int_t *lpt_app = &m_appstat.m_sts_tg_id[tg_id];
+ 
+-    CGCountersUtl64 tcp((uint64_t *)lpt_tcp,sizeof(tcpstat_int_t)/sizeof(uint64_t));
+-    CGCountersUtl64 udp((uint64_t *)lpt_udp,sizeof(udp_stat_int_t)/sizeof(uint64_t));
+     CGCountersUtl64 app((uint64_t *)lpt_app,sizeof(app_stat_int_t)/sizeof(uint64_t));
+ 
+     uint64_t *base_tcp = (uint64_t *)&pctx->m_tcpstat.m_sts_tg_id[in_tg_id];
+     uint64_t *base_udp = (uint64_t *)&pctx->m_udpstat.m_sts_tg_id[in_tg_id];
+     uint64_t *base_app = (uint64_t *)&pctx->m_appstat.m_sts_tg_id[in_tg_id];
+ 
+-    CGCountersUtl64 tcp_ctx(base_tcp,sizeof(tcpstat_int_t)/sizeof(uint64_t));
+-    CGCountersUtl64 udp_ctx(base_udp,sizeof(udp_stat_int_t)/sizeof(uint64_t));
+     CGCountersUtl64 app_ctx(base_app,sizeof(app_stat_int_t)/sizeof(uint64_t));
+ 
+-    tcp += tcp_ctx;
+-    udp += udp_ctx;
++    lpt_tcp->add(*reinterpret_cast<tcpstat_int_t *>(base_tcp));
++    lpt_udp->add(*reinterpret_cast<udp_stat_int_t *>(base_udp));
+     app += app_ctx;
+ }
+ 
+diff --git a/src/44bsd/tcp_var.h b/src/44bsd/tcp_var.h
+--- a/src/44bsd/tcp_var.h
++++ b/src/44bsd/tcp_var.h
+@@ -177,6 +177,27 @@
+ 
+ 
+ struct  tcpstat_int_t: public tcpstat {
++    uint64_t tcps_http2_requests, tcps_http2_responses, tcps_http2_resets;
++    uint64_t tcps_http2_goaway, tcps_http2_errors, tcps_http2_timeouts;
++    tcp_transaction_latency tcps_http2_ttfb, tcps_http2_ttlb;
++    void add(const tcpstat_int_t &other) {
++        const auto h2_first=tcp_latency_merge(tcps_http2_ttfb.values,other.tcps_http2_ttfb.values);
++        const auto h2_last=tcp_latency_merge(tcps_http2_ttlb.values,other.tcps_http2_ttlb.values);
++        const auto txn_first=tcp_latency_merge(tcps_http_req_ttfb.values,other.tcps_http_req_ttfb.values);
++        const auto txn_last=tcp_latency_merge(tcps_http_req_ttlb.values,other.tcps_http_req_ttlb.values);
++        const auto first = tcp_latency_merge(tcps_ttfb, other.tcps_ttfb);
++        const auto last = tcp_latency_merge(tcps_ttlb, other.tcps_ttlb);
++        uint64_t *dst = reinterpret_cast<uint64_t *>(this);
++        const uint64_t *src = reinterpret_cast<const uint64_t *>(&other);
++        for (unsigned i = 0; i < sizeof(*this) / sizeof(uint64_t); ++i) dst[i] += src[i];
++        tcps_http2_ttfb.values=h2_first;
++        tcps_http2_ttlb.values=h2_last;
++        tcps_http_req_ttfb.values=txn_first;
++        tcps_http_req_ttlb.values=txn_last;
++        tcps_ttfb = first;
++        tcps_ttlb = last;
++    }
++
+     uint64_t    tcps_testdrops;     /* connections dropped at the end of the test due to --nc  */
+ 
+     uint64_t    tcps_rcvoffloads;       /* receive offload packets by software */
+@@ -191,6 +212,37 @@
+     uint64_t    tcps_reas_hist_100;     /* count of max queue <= 100 */
+     uint64_t    tcps_reas_hist_other;   /* count of max queue > 100 */
+ 
++#ifdef TREX_TLS
++    uint64_t    tcps_tls_version_counts[3], tcps_tls_cipher_counts[10], tcps_tls_group_counts[6], tcps_tls_peer_signature_counts[12];
++    uint64_t    tcps_tls_full_handshakes;
++    uint64_t    tcps_tls_attempts; /* TLS flows started */
++    uint64_t    tcps_tls_yields; /* bounded pump continuation */
++    uint64_t    tcps_tls_close_timeouts; /* close output deadline */
++    uint64_t    tcps_tls_resume_attempts; /* client offered a cached session */
++    uint64_t    tcps_tls_resumed; /* certificate session resumed */
++    uint64_t    tcps_tls_handshakes; /* TLS handshakes completed */
++    uint64_t    tcps_tls_errors; /* TLS protocol or allocation failures */
++    uint64_t    tcps_tls_err_verify; /* TLS certificate verification failures */
++    uint64_t    tcps_tls_err_truncated; /* TLS EOF without close_notify */
++    uint64_t    tcps_tls_err_policy; /* TLS post-handshake policy rejection */
++    uint64_t    tcps_tls_err_resource; /* TLS flow or mbuf allocation failures */
++    uint64_t    tcps_tls_err_transport; /* TCP terminated without authenticated TLS close */
++    uint64_t    tcps_tls_err_application; /* TLS peer closed before application completion */
++    uint64_t    tcps_tls_err_protocol; /* TLS protocol or other SSL failures */
++    uint64_t    tcps_tls_timeouts; /* TLS handshake deadlines exceeded */
++    uint64_t    tcps_tls_write_calls; /* SSL_write_ex attempts, including retries */
++    uint64_t    tcps_tls_write_success; /* successful application writes */
++    uint64_t    tcps_tls_sndbyte; /* TLS plaintext bytes sent */
++    uint64_t    tcps_tls_rcvbyte; /* TLS plaintext bytes received */
++#endif
++    uint64_t    tcps_http_responses; /* complete responses with expected status */
++    uint64_t    tcps_http_errors; /* HTTP parser/status/EOF errors */
++    uint64_t    tcps_http_bad_status;
++    uint64_t    tcps_http_truncated;
++    uint64_t    tcps_http_bad_content;
++    uint64_t    tcps_http_transaction_errors;
++    uint64_t    tcps_http_framing;
++    uint64_t    tcps_http_aborted; /* validated HTTP connection did not close cleanly */
+     uint64_t    tcps_nombuf;        /* no mbuf for tcp - drop the packets */
+     uint64_t    tcps_notunnel;       /* no GTP Tunnel for tcp - drop the packets */
+ };
+@@ -550,6 +602,16 @@
+     uint64_t    udps_pkt_toobig;    /* pkt too big */
+     
+     uint64_t    udps_notunnel;      /* No GTPU tunnel */
++    uint64_t udps_rtt_started, udps_rtt_timeouts, udps_rtt_aborted;
++    tcp_transaction_latency udps_rtt;
++
++    void add(const udp_stat_int_t &other) {
++        const auto merged = tcp_latency_merge(udps_rtt.values, other.udps_rtt.values);
++        uint64_t *dst = reinterpret_cast<uint64_t *>(this);
++        const uint64_t *src = reinterpret_cast<const uint64_t *>(&other);
++        for (unsigned i=0; i<sizeof(*this)/sizeof(uint64_t); ++i) dst[i] += src[i];
++        udps_rtt.values = merged;
++    }
+ 
+ };
+ 
+@@ -818,6 +880,9 @@
+ 
+ class CPerProfileCtx {
+ public:
++#ifdef TREX_TLS
++    astf_tls::WorkerContexts m_tls_contexts;
++#endif
+     profile_id_t        m_profile_id;
+ 
+     CTcpPerThreadCtx  * m_ctx;
+@@ -1437,12 +1502,23 @@
+   uint32_t m_seq;  
+   uint32_t m_len;  /* scale option require 32bit maximum adv window */
+   uint32_t m_flags; /* only 1 bit is needed, for align*/
++  std::shared_ptr<astf_rx::Payload> m_payload;
+ };
+ 
+ typedef std::vector<CTcpReassBlock> vec_tcp_reas_t;
+ 
+ 
+ #define MAX_TCP_REASS_BLOCKS (4)
++
++#ifdef TREX_SIM
++// One-shot allocation failure injection; absent from production builds.
++enum TlsReassAllocSite {
++    TLS_REASS_OBJECT, TLS_REASS_SHARED, TLS_REASS_RESERVE,
++    TLS_REASS_COPY, TLS_REASS_MAP, TLS_REASS_MERGE
++};
++void tls_test_reass_failure(int site, unsigned skip = 0);
++void tls_test_reass_bad_length(bool enabled);
++#endif
+ 
+ class CTcpReass {
+ 
+@@ -1540,14 +1616,13 @@
+ 
+ inline void tcp_reass_alloc(CPerProfileCtx * pctx,
+                             struct CTcpCb *tp){
+-    INC_STAT(pctx, tp->m_flow->m_tg_id, tcps_reasalloc);
+-
+     CTcpTunableCtx * tctx = &pctx->m_tunable_ctx;
+     int maxqlen = tctx->tcp_reass_maxqlen;
+     if (tp->t_maxseg) {
+         maxqlen = std::min(int(tp->m_socket.so_rcv.sb_hiwat/tp->t_maxseg) + 1, maxqlen);
+     }
+     tp->m_tpc_reass = new CTcpReass(maxqlen);
++    INC_STAT(pctx, tp->m_flow->m_tg_id, tcps_reasalloc);
+ }
+ 
+ inline void tcp_reass_free(CPerProfileCtx * pctx,
+diff --git a/src/44bsd/udp.cpp b/src/44bsd/udp.cpp
+--- a/src/44bsd/udp.cpp
++++ b/src/44bsd/udp.cpp
+@@ -252,7 +252,9 @@
+ 
+ 
+ void CUdpFlow::on_tick(){
+-    if (m_keepalive==0) {
++    // A measured request owns its deadline; generic idle expiry must not
++    // preempt it (or classify a response timeout as an aborted transaction).
++    if (m_app.m_udp_rtt_deadline_ns || m_keepalive==0) {
+         keepalive_timer_start(true);    // reset keepalive timer
+     }else if (m_remain_ticks > 0) {
+         keepalive_timer_start(false);   // continue keepalive timer
+diff --git a/src/pal/linux/mbuf.cpp b/src/pal/linux/mbuf.cpp
+--- a/src/pal/linux/mbuf.cpp
++++ b/src/pal/linux/mbuf.cpp
+@@ -421,28 +421,19 @@
+ static inline uint32_t
+ __rte_raw_cksum(const void *buf, size_t len, uint32_t sum)
+ {
+-	/* workaround gcc strict-aliasing warning */
+-	uintptr_t ptr = (uintptr_t)buf;
+-	typedef uint16_t __attribute__((__may_alias__)) u16_p;
+-	const u16_p *u16_buf = (const u16_p *)ptr;
+-
+-	while (len >= (sizeof(*u16_buf) * 4)) {
+-		sum += u16_buf[0];
+-		sum += u16_buf[1];
+-		sum += u16_buf[2];
+-		sum += u16_buf[3];
+-		len -= sizeof(*u16_buf) * 4;
+-		u16_buf += 4;
+-	}
+-	while (len >= sizeof(*u16_buf)) {
+-		sum += *u16_buf;
+-		len -= sizeof(*u16_buf);
+-		u16_buf += 1;
+-	}
+-
+-	/* if length is in odd bytes */
+-	if (len == 1)
+-		sum += *((const uint8_t *)u16_buf) & PAL_NTOHS(0xff00);
++    const uint8_t *bytes = static_cast<const uint8_t *>(buf);
++    while (len >= 8) {
++        uint16_t words[4];
++        memcpy(words, bytes, sizeof(words)); // no alignment or aliasing assumption
++        sum += words[0]; sum += words[1]; sum += words[2]; sum += words[3];
++        bytes += 8; len -= 8;
++    }
++    while (len >= 2) {
++        uint16_t word;
++        memcpy(&word, bytes, sizeof(word));
++        sum += word; bytes += 2; len -= 2;
++    }
++    if (len) sum += *bytes & PAL_NTOHS(0xff00);
+ 
+ 	return sum;
+ }
+diff --git a/src/stt_cp.cpp b/src/stt_cp.cpp
+--- a/src/stt_cp.cpp
++++ b/src/stt_cp.cpp
+@@ -1,3 +1,6 @@
++#ifdef TREX_TLS
++#include "44bsd/tls/astf_tls_metadata.h"
++#endif
+ /*
+  Hanoh Haim
+  Cisco Systems, Inc.
+@@ -53,8 +56,7 @@
+     CFlowTableIntStats *lpft = &m_ft.m_sts;
+ 
+     clear_aggregated_counters();
+-    CGCountersUtl64 tcp((uint64_t *)lpt,sizeof(tcpstat_int_t)/sizeof(uint64_t));
+-    CGCountersUtl64 udp((uint64_t *)lpt_udp,sizeof(udp_stat_int_t)/sizeof(uint64_t));
++
+     CGCountersUtl64 app((uint64_t *)lpt_app,sizeof(app_stat_int_t)/sizeof(uint64_t));
+     double lap_time = 0.0;
+     CGCountersUtl32 ft((uint32_t *)lpft,sizeof(CFlowTableIntStats)/sizeof(uint32_t));
+@@ -73,11 +75,10 @@
+             base_udp = (uint64_t *)&pctx->m_udpstat.m_sts_tg_id[tg_id];
+             base_app = (uint64_t *)&pctx->m_appstat.m_sts_tg_id[tg_id];
+         }
+-        CGCountersUtl64 tcp_ctx(base_tcp,sizeof(tcpstat_int_t)/sizeof(uint64_t));
+-        CGCountersUtl64 udp_ctx(base_udp,sizeof(udp_stat_int_t)/sizeof(uint64_t));
++
+         CGCountersUtl64 app_ctx(base_app,sizeof(app_stat_int_t)/sizeof(uint64_t));
+-        tcp += tcp_ctx;
+-        udp += udp_ctx;
++        lpt->add(*reinterpret_cast<tcpstat_int_t *>(base_tcp));
++        lpt_udp->add(*reinterpret_cast<udp_stat_int_t *>(base_udp));
+         app += app_ctx;
+ 
+         lap_time = std::max(lap_time, pctx->get_time_lap());
+@@ -134,6 +135,7 @@
+         m_avg_size = 0.0;
+     }
+ 
++    update_latency_counters();
+     m_tx_ratio = 0.0;
+     if (m_tx_bw_l7_total_r > 0.0) {
+         m_tx_ratio = m_tx_bw_l7_r*100.0/m_tx_bw_l7_total_r;
+@@ -151,16 +153,12 @@
+     udp_stat_int_t *lpstt_udp = &lpstt_sts->m_udp.m_sts;
+     app_stat_int_t *lpstt_app = &lpstt_sts->m_app.m_sts;
+ 
+-    CGCountersUtl64 tcp((uint64_t *)lpt,sizeof(tcpstat_int_t)/sizeof(uint64_t));
+-    CGCountersUtl64 udp((uint64_t *)lpt_udp,sizeof(udp_stat_int_t)/sizeof(uint64_t));
+     CGCountersUtl64 app((uint64_t *)lpt_app,sizeof(app_stat_int_t)/sizeof(uint64_t));
+ 
+-    CGCountersUtl64 tcp_add((uint64_t *)lpstt_tcp,sizeof(tcpstat_int_t)/sizeof(uint64_t));
+-    CGCountersUtl64 udp_add((uint64_t *)lpstt_udp,sizeof(udp_stat_int_t)/sizeof(uint64_t));
+     CGCountersUtl64 app_add((uint64_t *)lpstt_app,sizeof(app_stat_int_t)/sizeof(uint64_t));
+ 
+-    tcp += tcp_add;
+-    udp += udp_add;
++    lpt->add(*lpstt_tcp);
++    lpt_udp->add(*lpstt_udp);
+     app += app_add;
+ }
+ 
+@@ -230,6 +228,7 @@
+         m_avg_size = 0.0;
+     }
+ 
++    update_latency_counters();
+     m_tx_ratio = 0.0;
+     if (m_tx_bw_l7_total_r > 0.0) {
+         m_tx_ratio = m_tx_bw_l7_r*100.0/m_tx_bw_l7_total_r;
+@@ -239,6 +238,7 @@
+ void CSTTCpPerTGIDPerDir::clear_sum_counters(void) {
+     m_tcp.Clear();
+     m_udp.Clear();
++    update_latency_counters();
+     m_app.Clear();
+     m_traffic_duration = 0.0;
+     m_ft.Clear();
+@@ -250,6 +250,7 @@
+ void CSTTCpPerTGIDPerDir::clear_aggregated_counters(void) {
+     m_tcp.Clear();
+     m_udp.Clear();
++    update_latency_counters();
+     m_app.Clear();
+     m_traffic_duration = 0.0;
+     m_ft.Clear();
+@@ -277,6 +278,7 @@
+     m_rx_pps_r = 0.0;
+ 
+     m_avg_size = 0.0;
++    update_latency_counters();
+     m_tx_ratio = 0.0;
+ 
+ }
+@@ -441,6 +443,44 @@
+ #define CMN_S_ADD_CNT(f,help,z) { create_sc(&m_clm,#f,help,&f,z,false,true); }
+ #define CMN_S_ADD_CNT_d(f,help,z,u) { create_sc_d(&m_clm,#f,help,&f,z,u,false,true); }
+ 
++void CSTTCpPerTGIDPerDir::update_latency_counters() {
++    const tcp_transaction_latency *transactions[]={&m_tcp.m_sts.tcps_http_req_ttfb,&m_tcp.m_sts.tcps_http_req_ttlb};
++    for (unsigned i=0;i<2;++i) {
++        const auto &h=*transactions[i]; const auto &v=h.values;
++        auto &m=tcps_http_req_metrics[i];
++        m[0]=tcp_latency_average_ns(v)/1e6; m[1]=v.count ? double(v.min_ns)/1e6 : 0;
++        m[2]=double(v.max_ns)/1e6;
++        m[3]=tcp_transaction_percentile_ms(&h,50);
++        m[4]=tcp_transaction_percentile_ms(&h,95);
++        m[5]=tcp_transaction_percentile_ms(&h,99);
++    }
++    const tcp_transaction_latency *h2[]={&m_tcp.m_sts.tcps_http2_ttfb,&m_tcp.m_sts.tcps_http2_ttlb};
++    for(unsigned i=0;i<2;++i) {
++        const auto &h=*h2[i]; auto &m=http2_metrics[i];
++        m[0]=tcp_latency_average_ns(h.values)/1e6;
++        m[1]=h.values.count ? double(h.values.min_ns)/1e6 : 0;
++        m[2]=double(h.values.max_ns)/1e6;
++        m[3]=tcp_transaction_percentile_ms(&h,50);
++        m[4]=tcp_transaction_percentile_ms(&h,95);
++        m[5]=tcp_transaction_percentile_ms(&h,99);
++    }
++    const auto &h=m_udp.m_sts.udps_rtt;
++    udps_rtt_metrics[0]=tcp_latency_average_ns(h.values)/1e6;
++    udps_rtt_metrics[1]=h.values.count ? double(h.values.min_ns)/1e6 : 0;
++    udps_rtt_metrics[2]=double(h.values.max_ns)/1e6;
++    udps_rtt_metrics[3]=tcp_transaction_percentile_ms(&h,50);
++    udps_rtt_metrics[4]=tcp_transaction_percentile_ms(&h,95);
++    udps_rtt_metrics[5]=tcp_transaction_percentile_ms(&h,99);
++    const auto &f = m_tcp.m_sts.tcps_ttfb;
++    const auto &l = m_tcp.m_sts.tcps_ttlb;
++    tcps_ttfb_avg_ms = tcp_latency_average_ns(f) / 1e6;
++    tcps_ttlb_avg_ms = tcp_latency_average_ns(l) / 1e6;
++    tcps_ttfb_min_ms = f.count ? double(f.min_ns) / 1e6 : 0;
++    tcps_ttlb_min_ms = l.count ? double(l.min_ns) / 1e6 : 0;
++    tcps_ttfb_max_ms = double(f.max_ns) / 1e6;
++    tcps_ttlb_max_ms = double(l.max_ns) / 1e6;
++}
++
+ void CSTTCpPerTGIDPerDir::create_clm_counters(){
+ 
+     CMN_S_ADD_CNT(m_active_flows,"active open flows",true);
+@@ -459,6 +499,50 @@
+     create_bar(&m_clm,"-");
+ 
+ 
++    const char *prefixes[]={"tcps_http_req_ttfb","tcps_http_req_ttlb"};
++    const char *suffixes[]={"avg_ms","min_ms","max_ms","p50_ms","p95_ms","p99_ms"};
++    tcp_transaction_latency *transactions[]={&m_tcp.m_sts.tcps_http_req_ttfb,&m_tcp.m_sts.tcps_http_req_ttlb};
++    for (unsigned i=0;i<2;++i) {
++        for (unsigned j=0;j<6;++j) {
++            std::string name=std::string(prefixes[i])+"_"+suffixes[j];
++            create_sc_d(&m_clm,name.c_str(),"HTTP request/response latency",&tcps_http_req_metrics[i][j],true,"ms",false,true);
++        }
++        std::string count=std::string(prefixes[i])+"_count";
++        create_sc(&m_clm,count.c_str(),"validated HTTP transactions",&transactions[i]->values.count,true,false,true);
++        for (unsigned b=0;b<TCP_TXN_BUCKETS;++b) {
++            std::string name=std::string(prefixes[i])+"_bucket_"+std::to_string(b);
++            create_sc(&m_clm,name.c_str(),"HTTP latency histogram",&transactions[i]->buckets[b],true,false,true);
++        }
++    }
++    create_sc_d(&m_clm,"tcps_ttfb_avg_ms","SYN to first HTTP data, average",&tcps_ttfb_avg_ms,true,"ms",false,true);
++    create_sc_d(&m_clm,"tcps_ttlb_avg_ms","SYN to last HTTP data, average",&tcps_ttlb_avg_ms,true,"ms",false,true);
++    create_sc_d(&m_clm,"tcps_ttfb_min_ms","SYN to first HTTP data, minimum",&tcps_ttfb_min_ms,true,"ms",false,true);
++    create_sc_d(&m_clm,"tcps_ttlb_min_ms","SYN to last HTTP data, minimum",&tcps_ttlb_min_ms,true,"ms",false,true);
++    create_sc_d(&m_clm,"tcps_ttfb_max_ms","SYN to first HTTP data, maximum",&tcps_ttfb_max_ms,true,"ms",false,true);
++    create_sc_d(&m_clm,"tcps_ttlb_max_ms","SYN to last HTTP data, maximum",&tcps_ttlb_max_ms,true,"ms",false,true);
++    create_sc(&m_clm,"tcps_ttfb_count","HTTP connections measured",&m_tcp.m_sts.tcps_ttfb.count,true,false,true);
++    create_sc(&m_clm,"tcps_ttlb_count","HTTP connections measured",&m_tcp.m_sts.tcps_ttlb.count,true,false,true);
++
++    const char *h2_names[]={"tcps_http2_ttfb","tcps_http2_ttlb"};
++    tcp_transaction_latency *h2_stats[]={&m_tcp.m_sts.tcps_http2_ttfb,&m_tcp.m_sts.tcps_http2_ttlb};
++    for(unsigned i=0;i<2;++i) {
++        for(unsigned j=0;j<6;++j) {
++            std::string name=std::string(h2_names[i])+"_"+suffixes[j];
++            create_sc_d(&m_clm,name,"HTTP/2 connection latency from SYN",&http2_metrics[i][j],false,"ms",false,true);
++            m_clm.get_cnt(m_clm.get_size()-1)->set_table_visible(j==0 || j==5);
++        }
++        create_sc(&m_clm,std::string(h2_names[i])+"_count","HTTP/2 connections measured",&h2_stats[i]->values.count,true,false,true)->set_table_visible(false);
++        for(unsigned j=0;j<TCP_TXN_BUCKETS;++j) {
++            create_sc(&m_clm,std::string(h2_names[i])+"_bucket_"+std::to_string(j),"HTTP/2 latency histogram",
++                &h2_stats[i]->buckets[j],true,false,true)->set_table_visible(false);
++        }
++    }
++    TCP_S_ADD_CNT(tcps_http2_requests,"HTTP/2 requests");
++    TCP_S_ADD_CNT(tcps_http2_responses,"HTTP/2 responses completed");
++    TCP_S_ADD_CNT_E(tcps_http2_errors,"HTTP/2 protocol or response errors");
++    TCP_S_ADD_CNT_E(tcps_http2_timeouts,"HTTP/2 session timeouts");
++    TCP_S_ADD_CNT_E(tcps_http2_resets,"HTTP/2 streams reset by peer");
++    TCP_S_ADD_CNT(tcps_http2_goaway,"HTTP/2 GOAWAY frames received");
+     TCP_S_ADD_CNT(tcps_connattempt,"connections initiated");
+     TCP_S_ADD_CNT(tcps_accepts,"connections accepted");
+     TCP_S_ADD_CNT(tcps_connects,"connections established");
+@@ -531,6 +615,52 @@
+     TCP_S_ADD_CNT_E(tcps_reas_hist_16,"count of max queue <= 16");
+     TCP_S_ADD_CNT_E(tcps_reas_hist_100,"count of max queue <= 100");
+     TCP_S_ADD_CNT_E(tcps_reas_hist_other,"count of max queue > 100");
++#ifdef TREX_TLS
++    for (unsigned i=0;i<sizeof(astf_tls::versions)/sizeof(astf_tls::versions[0])+1;++i) {
++        std::string name=std::string("tcps_tls_version_")+(i<sizeof(astf_tls::versions)/sizeof(astf_tls::versions[0]) ? astf_tls::versions[i].name : "other");
++        create_sc(&m_clm,name.c_str(),"TLS versions negotiated",&m_tcp.m_sts.tcps_tls_version_counts[i],true,false);
++    }
++    for (unsigned i=0;i<sizeof(astf_tls::ciphers)/sizeof(astf_tls::ciphers[0])+1;++i) {
++        std::string name=std::string("tcps_tls_cipher_")+(i<sizeof(astf_tls::ciphers)/sizeof(astf_tls::ciphers[0]) ? astf_tls::ciphers[i].name : "other");
++        create_sc(&m_clm,name.c_str(),"TLS ciphers negotiated",&m_tcp.m_sts.tcps_tls_cipher_counts[i],true,false);
++    }
++    for (unsigned i=0;i<sizeof(astf_tls::groups)/sizeof(astf_tls::groups[0])+1;++i) {
++        std::string name=std::string("tcps_tls_group_")+(i<sizeof(astf_tls::groups)/sizeof(astf_tls::groups[0]) ? astf_tls::groups[i].name : "other");
++        create_sc(&m_clm,name.c_str(),"TLS key exchange groups",&m_tcp.m_sts.tcps_tls_group_counts[i],true,false);
++    }
++    for (unsigned i=0;i<sizeof(astf_tls::signatures)/sizeof(astf_tls::signatures[0])+1;++i) {
++        std::string name=std::string("tcps_tls_peer_signature_")+(i<sizeof(astf_tls::signatures)/sizeof(astf_tls::signatures[0]) ? astf_tls::signatures[i].name : "other");
++        create_sc(&m_clm,name.c_str(),"TLS peer signature algorithms",&m_tcp.m_sts.tcps_tls_peer_signature_counts[i],true,false);
++    }
++    TCP_S_ADD_CNT(tcps_tls_full_handshakes,"completed full TLS handshakes");
++    TCP_S_ADD_CNT(tcps_tls_attempts,"TLS flows started");
++    TCP_S_ADD_CNT(tcps_tls_yields,"TLS pump budget yields");
++    TCP_S_ADD_CNT(tcps_tls_close_timeouts,"TLS close output timeouts");
++    TCP_S_ADD_CNT(tcps_tls_resume_attempts,"TLS cached sessions offered by client");
++    TCP_S_ADD_CNT(tcps_tls_resumed,"TLS certificate sessions resumed");
++    TCP_S_ADD_CNT(tcps_tls_handshakes,"TLS handshakes completed");
++    TCP_S_ADD_CNT_E(tcps_tls_errors,"TLS protocol or allocation failures");
++    TCP_S_ADD_CNT_E(tcps_tls_err_verify,"TLS certificate verification failures");
++    TCP_S_ADD_CNT_E(tcps_tls_err_truncated,"TLS EOF without close_notify");
++    TCP_S_ADD_CNT_E(tcps_tls_err_policy,"TLS post-handshake policy rejection");
++    TCP_S_ADD_CNT_E(tcps_tls_err_resource,"TLS flow or mbuf allocation failures");
++    TCP_S_ADD_CNT_E(tcps_tls_err_transport,"TLS transport errors");
++    TCP_S_ADD_CNT_E(tcps_tls_err_application,"TLS application exchange errors");
++    TCP_S_ADD_CNT_E(tcps_tls_err_protocol,"TLS protocol or other SSL failures");
++    TCP_S_ADD_CNT_E(tcps_tls_timeouts,"TLS handshake timeouts");
++    TCP_S_ADD_CNT(tcps_tls_write_calls,"TLS write calls (includes retries)");
++    TCP_S_ADD_CNT(tcps_tls_write_success,"TLS successful application writes");
++    TCP_S_ADD_CNT(tcps_tls_sndbyte,"TLS plaintext bytes sent");
++    TCP_S_ADD_CNT(tcps_tls_rcvbyte,"TLS plaintext bytes received");
++#endif
++    TCP_S_ADD_CNT(tcps_http_responses,"complete HTTP responses with expected status");
++    TCP_S_ADD_CNT_E(tcps_http_errors,"HTTP validation failures");
++    TCP_S_ADD_CNT_E(tcps_http_bad_status,"unexpected HTTP response status");
++    TCP_S_ADD_CNT_E(tcps_http_truncated,"incomplete HTTP responses at stream EOF");
++    TCP_S_ADD_CNT_E(tcps_http_bad_content,"HTTP response content mismatches");
++    TCP_S_ADD_CNT_E(tcps_http_transaction_errors,"HTTP request tracking errors");
++    TCP_S_ADD_CNT_E(tcps_http_framing,"HTTP framing or response limit errors");
++    TCP_S_ADD_CNT_E(tcps_http_aborted,"HTTP flows aborted");
+     TCP_S_ADD_CNT_E(tcps_nombuf,"no mbuf for tcp - drop the packets");
+ 
+     /* TREX_FBSD: SACK counters */
+@@ -552,6 +682,21 @@
+     create_bar(&m_clm,"UDP");
+     create_bar(&m_clm,"-");
+ 
++    for (unsigned i=0;i<6;++i) {
++        const std::string name=std::string("udps_rtt_")+suffixes[i];
++        create_sc_d(&m_clm,name,"UDP request-response RTT",&udps_rtt_metrics[i],false,"ms",false,true);
++        m_clm.get_cnt(m_clm.get_size()-1)->set_table_visible(i==0 || i==5);
++    }
++    create_sc(&m_clm,"udps_rtt_count","completed UDP transactions",
++        &m_udp.m_sts.udps_rtt.values.count,true,false,true)->set_table_visible(false);
++    for (unsigned i=0;i<TCP_TXN_BUCKETS;++i) {
++        const std::string name=std::string("udps_rtt_bucket_")+std::to_string(i);
++        create_sc(&m_clm,name,"UDP RTT histogram",
++            &m_udp.m_sts.udps_rtt.buckets[i],true,false,true)->set_table_visible(false);
++    }
++    create_sc(&m_clm,"udps_rtt_started","UDP transactions started",&m_udp.m_sts.udps_rtt_started,false,false,true);
++    create_sc(&m_clm,"udps_rtt_timeouts","UDP response timeouts",&m_udp.m_sts.udps_rtt_timeouts,false,true,true);
++    create_sc(&m_clm,"udps_rtt_aborted","UDP transactions aborted",&m_udp.m_sts.udps_rtt_aborted,false,true,true);
+     UDP_S_ADD_CNT(udps_accepts,"connections accepted");
+     UDP_S_ADD_CNT(udps_connects,"connections established");
+     UDP_S_ADD_CNT(udps_closed,"conn. closed (includes drops)");
+@@ -607,6 +752,27 @@
+     FT_S_ADD_CNT_OK(defer_template,"tcp L7 template matching deferred (by l7_map)");
+     FT_S_ADD_CNT_E(err_defer_no_template,"server can't match L7 template (deferred by l7_map)");
+ 
++
++    // Keep bounded summaries on the server screen. Detailed diagnostics remain
++    // registered, including zero values, for get_stats() and template-group RPCs.
++    for (unsigned i = 0; i < m_clm.get_size(); ++i) {
++        CGSimpleBase *counter = m_clm.get_cnt(i);
++        const std::string name = counter->get_name();
++        const bool tls_parameters = name.compare(0, 17, "tcps_tls_version_") == 0 ||
++            name.compare(0, 16, "tcps_tls_cipher_") == 0 ||
++            name.compare(0, 15, "tcps_tls_group_") == 0 ||
++            name.compare(0, 24, "tcps_tls_peer_signature_") == 0;
++        const bool transaction_detail = name.compare(0, 14, "tcps_http_req_") == 0 &&
++            name != "tcps_http_req_ttfb_avg_ms" && name != "tcps_http_req_ttlb_avg_ms" &&
++            name != "tcps_http_req_ttfb_p99_ms" && name != "tcps_http_req_ttlb_p99_ms";
++        const bool connection_detail =
++            name == "tcps_ttfb_min_ms" || name == "tcps_ttlb_min_ms" ||
++            name == "tcps_ttfb_max_ms" || name == "tcps_ttlb_max_ms" ||
++            name == "tcps_ttfb_count" || name == "tcps_ttlb_count";
++        if (tls_parameters || transaction_detail || connection_detail) {
++            counter->set_table_visible(false);
++        }
++    }
+ 
+     m_clm_static_size = m_clm.get_size();
+ }
+diff --git a/src/stt_cp.h b/src/stt_cp.h
+--- a/src/stt_cp.h
++++ b/src/stt_cp.h
+@@ -65,6 +65,11 @@
+ 
+ private:
+     void clear_aggregated_counters();
++    void update_latency_counters();
++    double http2_metrics[2][6] = {};
++    double udps_rtt_metrics[6] = {};
++    double tcps_http_req_metrics[2][6] = {}; // avg/min/max/p50/p95/p99, ms
++    double tcps_ttfb_avg_ms, tcps_ttlb_avg_ms, tcps_ttfb_min_ms, tcps_ttlb_min_ms, tcps_ttfb_max_ms, tcps_ttlb_max_ms;
+ 
+ public:
+     CTcpStats           m_tcp;
+diff --git a/src/utils/utl_counter.cpp b/src/utils/utl_counter.cpp
+--- a/src/utils/utl_counter.cpp
++++ b/src/utils/utl_counter.cpp
+@@ -272,7 +272,8 @@
+     fprintf(fd," -----------------------------------------------------------------------------------------\n");
+     CGTblClmCounters* lp=m_counters[0];
+     for (i=0; i<lp->get_size(); i++) {
+-        if ((zeros==true) || (!can_skip_zero(i)) ){
++        if (lp->get_cnt(i)->is_table_visible() &&
++            ((zeros==true) || (!can_skip_zero(i)))) {
+             dump_line(fd,i,desc);
+         }
+     }
+diff --git a/src/utils/utl_counter.h b/src/utils/utl_counter.h
+--- a/src/utils/utl_counter.h
++++ b/src/utils/utl_counter.h
+@@ -86,6 +86,7 @@
+ public:
+     CGSimpleBase(){
+         m_dump_zero=false;
++        m_table_visible=true;
+         m_info=scINFO;
+         m_is_abs = false;
+     }
+@@ -179,6 +180,10 @@
+         return(false);
+     }
+ 
++    // Presentation only: JSON descriptors, values and counter IDs are unchanged.
++    void set_table_visible(bool visible) { m_table_visible = visible; }
++    bool is_table_visible() const { return m_table_visible; }
++
+     void set_dump_zero(bool zero){
+         m_dump_zero=zero;
+     }
+@@ -212,6 +217,7 @@
+     uint32_t       m_id;
+     counter_info_t m_info;
+     bool        m_dump_zero;
++    bool        m_table_visible;
+     std::string m_help;
+     std::string m_name;
+     std::string m_units;

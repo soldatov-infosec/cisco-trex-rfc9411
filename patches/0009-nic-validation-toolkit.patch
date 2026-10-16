@@ -1,0 +1,727 @@
+diff --git a/scripts/astf/nic_validation/collect.py b/scripts/astf/nic_validation/collect.py
+new file mode 100644
+--- /dev/null
++++ b/scripts/astf/nic_validation/collect.py
+@@ -0,0 +1,285 @@
++#!/usr/bin/env python3
++"""Run an ASTF profile and record every get_stats leaf, including zero counters."""
++import argparse
++import csv
++import datetime
++import hashlib
++import json
++from pathlib import Path
++import sys
++import time
++import uuid
++import zipfile
++
++
++def ensure_trex_api():
++    """Locate source-tree or packaged-client API without depending on cwd."""
++    import importlib.util
++    import os
++    try:
++        if importlib.util.find_spec('trex.astf.api') is not None:
++            return
++    except (ModuleNotFoundError, ValueError):
++        pass
++    roots = []
++    for origin in (Path(__file__).absolute().parent, Path(__file__).resolve().parent, Path.cwd()):
++        for root in (origin,) + tuple(origin.parents):
++            if root not in roots:
++                roots.append(root)
++    candidates = []
++    if os.environ.get('TREX_API_PATH'):
++        candidates.append(Path(os.environ['TREX_API_PATH']))
++    for root in roots:
++        for relative in ('automation/trex_control_plane/interactive',
++                         'scripts/automation/trex_control_plane/interactive',
++                         'trex_client/interactive', 'interactive', ''):
++            candidate = root / relative
++            if candidate not in candidates:
++                candidates.append(candidate)
++    for candidate in candidates:
++        if (candidate / 'trex/astf/api.py').is_file():
++            sys.path.insert(0, str(candidate))
++            # Discard an unrelated top-level package if discovery imported one.
++            for name in list(sys.modules):
++                if name == 'trex' or name.startswith('trex.'):
++                    del sys.modules[name]
++            importlib.invalidate_caches()
++            return
++    raise RuntimeError('TRex ASTF Python API not found. Expected trex/astf/api.py under '
++                       'automation/trex_control_plane/interactive or trex_client/interactive. '
++                       'Use the Python client from the SAME patched TRex build; '
++                       'do not pip-install an unrelated package named trex. '
++                       'Set TREX_API_PATH to the directory containing trex/ if installed elsewhere. '
++                       'Searched: ' + ', '.join(str(p) for p in candidates))
++
++
++def leaves(value, path=''):
++    if isinstance(value, dict) and value:
++        for key, child in value.items():
++            key = str(key).replace('~', '~0').replace('/', '~1')
++            yield from leaves(child, path + '/' + key)
++    elif isinstance(value, (list, tuple)) and value:
++        for i, child in enumerate(value):
++            yield from leaves(child, path + '/' + str(i))
++    else:
++        yield path, value
++
++
++def main():
++    p = argparse.ArgumentParser(description=__doc__)
++    p.add_argument('--server', default='localhost')
++    p.add_argument('--profile', default=str(Path(__file__).with_name('nic_profile.py')))
++    p.add_argument('--mult', type=float, default=10000)
++    p.add_argument('--duration', type=float, default=300)
++    p.add_argument('--interval', type=float, default=1)
++    p.add_argument('--sched-max-stretch-ms', type=float, default=None,
++                   help='Scheduler lateness tolerance in milliseconds; unchanged if omitted')
++    p.add_argument('--perf', action='store_true', help='Deprecated alias: text diagnostics only; perf is never executed')
++    p.add_argument('--no-server-diagnostics', action='store_true', help='RPC metrics only (for a remote TRex server)')
++    p.add_argument('--server-interval', type=float, default=5, help='Local Linux metrics sampling interval, seconds (minimum 1)')
++    p.add_argument('--trex-pid', type=int, help='Only needed if multiple local TRex processes exist')
++    p.add_argument('--perf-delay', type=float, default=30, help='Deprecated, ignored: perf is disabled')
++    p.add_argument('--perf-record-seconds', type=int, default=60, help='Deprecated, ignored: perf is disabled')
++    p.add_argument('--perf-stat-seconds', type=int, default=30, help='Deprecated, ignored: perf is disabled')
++    p.add_argument('--output', default='https-diagnostics-' + datetime.datetime.now().strftime('%Y%m%d-%H%M%S'), help='New directory; never overwrites existing logs')
++    p.add_argument('--tunables', nargs=argparse.REMAINDER, default=[])
++    a = p.parse_args()
++    import math
++    if any(not math.isfinite(v) or v <= 0 for v in (a.mult, a.duration, a.interval)):
++        p.error('mult, duration and interval must be finite and positive')
++    if a.sched_max_stretch_ms is not None and (not math.isfinite(a.sched_max_stretch_ms) or not 0.1 <= a.sched_max_stretch_ms <= 100):
++        p.error('sched-max-stretch-ms must be in 0.1..100')
++    if not math.isfinite(a.server_interval) or a.server_interval < 1:
++        p.error('server-interval must be finite and at least 1 second')
++    ensure_trex_api()
++    from trex.astf.api import ASTFClient
++    profile = Path(a.profile).resolve()
++    profile_bytes = profile.read_bytes()
++    out = Path(a.output)
++    archive = out.parent / (out.name + '.zip')
++    if archive.exists():
++        p.error('Archive already exists: ' + str(archive))
++    out.mkdir(parents=True, exist_ok=False)
++    pid = 'nic_csv_' + uuid.uuid4().hex[:12]
++    meta = dict(vars(a), profile_id=pid, profile_sha256=hashlib.sha256(profile_bytes).hexdigest(),
++                utc_created=datetime.datetime.now(datetime.timezone.utc).isoformat(),
++                status='initializing', elapsed_origin='before start RPC; includes start RPC latency')
++    meta['collector_version'] = 'nic-validation-v1'
++    meta['collector_sha256'] = {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
++                                for name in ('collect.py', 'server_capture.py', 'nic_profile.py', 'run.py')
++                                if Path(__file__).with_name(name).is_file()}
++    (out / 'profile.py').write_bytes(profile_bytes)
++    def save_meta():
++        (out / 'metadata.json').write_text(json.dumps(meta, indent=2) + '\n')
++    save_meta()
++    client = ASTFClient(server=a.server)
++    connected = False
++    start_requested = False
++    completed = False
++    previous_stretch = None
++    restore_stretch = False
++    origin = time.monotonic()
++    sample_id = 0
++    capture = None
++    last_stats = {}
++    traffic_elapsed = None
++    last_xstats_time = float('-inf')
++    ports = []
++    try:
++        with (out / 'stats.csv').open('w', newline='') as cf, (out / 'stats.jsonl').open('w') as jf:
++            writer = csv.writer(cf)
++            writer.writerow(['sample', 'utc', 'elapsed_s', 'rpc_s', 'phase', 'profile_state', 'metric', 'value_json'])
++            def sample(phase):
++                nonlocal sample_id, last_stats, last_xstats_time
++                begin = time.monotonic()
++                utc = datetime.datetime.now(datetime.timezone.utc).isoformat()
++                stats = client.get_stats(sync_now=True, skip_zero=False, pid_input=pid)
++                try:
++                    stats['utilization'] = client.get_util_stats()
++                except Exception as exc:
++                    stats['utilization'] = {'unavailable': str(exc)}
++                if phase in ('baseline', 'final') or begin-last_xstats_time >= a.server_interval:
++                    stats['template_groups'] = {}
++                    try:
++                        for name in client.get_tg_names(pid_input=pid):
++                            stats['template_groups'][name] = client.get_traffic_tg_stats(name, skip_zero=False, pid_input=pid)
++                    except Exception as exc:
++                        stats['template_groups']['unavailable'] = str(exc)
++                    stats['xstats'] = {}
++                    for port in ports:
++                        try:
++                            stats['xstats'][str(port)] = client.get_xstats(port)
++                        except Exception as exc:
++                            stats['xstats'][str(port)] = {'unavailable': str(exc)}
++                    last_xstats_time = begin
++                last_stats = stats
++                end = time.monotonic()
++                state = client.get_profiles_state().get(pid, 'MISSING')
++                header = [sample_id, utc, begin-origin, end-begin, phase, state]
++                for key, value in leaves(stats):
++                    writer.writerow(header + [key, json.dumps(value, ensure_ascii=False)])
++                jf.write(json.dumps(dict(sample=sample_id, utc=utc, elapsed_s=begin-origin,
++                                         rpc_s=end-begin, phase=phase, profile_state=state,
++                                         stats=stats), ensure_ascii=False) + '\n')
++                cf.flush()
++                jf.flush()
++                sample_id += 1
++                return state
++            client.connect()
++            connected = True
++            client.acquire(force=False)
++            states = client.get_profiles_state()
++            if any(s not in ('STATE_IDLE', 'STATE_ASTF_LOADED') for s in states.values()):
++                raise RuntimeError('Another profile is active; stop it before this measurement')
++            ports = client.get_all_ports()
++            try:
++                (out / 'trex-system.json').write_text(json.dumps(dict(
++                    version=client.get_server_version(), system=client.get_server_system_info(), ports=client.get_port_info()), indent=2) + '\n')
++            except Exception as exc:
++                meta['system_info_error'] = str(exc)
++            if not a.no_server_diagnostics:
++                from server_capture import Capture
++                capture = Capture(out, a.server, a.trex_pid, a.server_interval)
++                capture.prepare()
++                cert = '/tmp/trex-cert.pem'
++                for i, option in enumerate(a.tunables):
++                    if option == '--cert' and i+1 < len(a.tunables):
++                        cert = a.tunables[i+1]
++                    elif option.startswith('--cert='):
++                        cert = option.split('=', 1)[1]
++                if '--cert' in a.tunables or any(x.startswith('--cert=') for x in a.tunables):
++                    capture.command('certificate', ['openssl','x509','-in',cert,'-noout','-text'])
++                meta['diagnostics_pid'] = capture.pid
++            meta['global_cfg_before'] = client.get_global_cfg()
++            if a.sched_max_stretch_ms is not None:
++                previous_stretch = meta['global_cfg_before']['sched_max_stretch']
++                restore_stretch = True
++                # RPC stores this double directly; scheduler compares seconds.
++                # The 'usec' label in the upstream Python docstring is wrong.
++                client.set_global_cfg({'sched_max_stretch': a.sched_max_stretch_ms / 1000.0})
++            meta['global_cfg_effective'] = client.get_global_cfg()
++            save_meta()
++            client.load_profile(str(profile), tunables={'tunables': a.tunables}, pid_input=pid)
++            # Do not reset global/port counters. Use baseline deltas for those.
++            origin = time.monotonic()
++            sample('baseline')
++            origin = time.monotonic()
++            if capture:
++                capture.start(origin)
++            meta['status'] = 'running'
++            start_requested = True
++            save_meta()
++            client.start(mult=a.mult, duration=a.duration, nc=False, pid_input=pid)
++            meta['start_rpc_s'] = time.monotonic()-origin
++            save_meta()
++            while True:
++                tick = time.monotonic()
++                state = sample('scheduled' if tick-origin < a.duration else 'after_duration')
++                if state == 'STATE_ASTF_LOADED':
++                    sample('final')
++                    completed = True
++                    break
++                if state not in ('STATE_TX', 'STATE_ASTF_CLEANUP', 'STATE_ASTF_BUILD', 'STATE_ASTF_PARSE'):
++                    raise RuntimeError('Unexpected profile state: ' + state)
++                time.sleep(max(0, a.interval-(time.monotonic()-tick)))
++            traffic_elapsed = time.monotonic()-origin
++            meta['status'] = 'completed'
++    except BaseException as exc:
++        meta['status'] = 'interrupted' if isinstance(exc, KeyboardInterrupt) else 'error'
++        meta['error'] = repr(exc)
++        raise
++    finally:
++        if capture:
++            try:
++                meta['diagnostics_status'] = capture.finish()
++            except Exception as exc:
++                meta['diagnostics_error'] = repr(exc)
++        if connected:
++            if start_requested and not completed:
++                try:
++                    client.stop(block=False, pid_input=pid)
++                except Exception as exc:
++                    meta['stop_error'] = repr(exc)
++            if restore_stretch:
++                try:
++                    client.set_global_cfg({'sched_max_stretch': previous_stretch})
++                    meta['global_cfg_restored'] = client.get_global_cfg()
++                except Exception as exc:
++                    meta['restore_error'] = repr(exc)
++            if completed:
++                try:
++                    client.clear_profile(block=True, pid_input=pid)
++                except Exception as exc:
++                    meta['clear_profile_error'] = repr(exc)
++            try:
++                client.disconnect()
++            except Exception as exc:
++                meta['disconnect_error'] = repr(exc)
++        meta['elapsed_s'] = traffic_elapsed if traffic_elapsed is not None else time.monotonic()-origin
++        meta['including_cleanup_s'] = time.monotonic()-origin
++        meta['collector_mode'] = 'text-only-no-perf'
++        meta['samples'] = sample_id
++        save_meta()
++        (out / 'summary.txt').write_text(
++            'ASTF NIC diagnostics (text only; no perf)\n'
++            'elapsed_s includes start RPC and polling, excludes successful post-run collection.\n'
++            'Raw CPU counters include busy polling; use TRex CPU and scheduler deltas too.\n'
++            'All samples: stats.csv, stats.jsonl and server/samples.jsonl (UTF-8 text).\n'
++            'No function-level cycles, call stacks or negotiated cipher timing are measured.\n\n'
++            + json.dumps(meta, indent=2, ensure_ascii=False) + '\n\nFinal TRex metrics:\n'
++            + json.dumps(last_stats, indent=2, ensure_ascii=False) + '\n')
++        try:
++            with zipfile.ZipFile(archive, 'x', zipfile.ZIP_DEFLATED) as z:
++                for f in sorted(out.rglob('*')):
++                    if f.is_file() and not f.is_symlink():
++                        z.write(f, str(Path(out.name) / f.relative_to(out)))
++            print('Text logs archive: ' + str(archive.resolve()))
++        except Exception as exc:
++            meta['archive_error'] = repr(exc)
++            save_meta()
++            print('Archive failed; raw logs retained: ' + str(exc))
++        print('Logs: ' + str(out.resolve()))
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/scripts/astf/nic_validation/nic_profile.py b/scripts/astf/nic_validation/nic_profile.py
+new file mode 100644
+--- /dev/null
++++ b/scripts/astf/nic_validation/nic_profile.py
+@@ -0,0 +1,69 @@
++"""NIC validation: full TLS handshake, validated HTTP/1, native HTTP/2, UDP RTT."""
++import argparse
++from trex.astf.api import *
++
++CASES = ('tls12', 'tls13', 'h2', 'h2tls12', 'h2tls13', 'udp')
++
++class Profile:
++    def get_profile(self, tunables, **kwargs):
++        p = argparse.ArgumentParser(description=__doc__)
++        p.add_argument('--case', choices=CASES, required=True)
++        p.add_argument('--cert'); p.add_argument('--key'); p.add_argument('--ca')
++        p.add_argument('--sni', default='trex.local')
++        p.add_argument('--requests', type=int, default=10)
++        p.add_argument('--body-size', type=int, default=16384)
++        p.add_argument('--concurrency', type=int, default=4)
++        p.add_argument('--frame-size', type=int, choices=(64, 570, 1518), default=570)
++        a = p.parse_args(tunables)
++        if not 1 <= a.requests <= 1000 or not 0 <= a.body_size <= 1048576:
++            p.error('invalid requests/body-size')
++        if not 1 <= a.concurrency <= 128:
++            p.error('concurrency must be 1..128')
++        encrypted = a.case not in ('h2', 'udp')
++        if encrypted and not all((a.cert, a.key, a.ca)):
++            p.error('TLS requires --cert, --key and --ca')
++        ct = st = None
++        if encrypted:
++            version = '1.2' if a.case.endswith('12') else '1.3'
++            policy = dict(version=version, resumption=False, groups=['X25519','P-256'],
++                          signature_algorithms=['ecdsa_secp256r1_sha256'],
++                          cipher_suite='ECDHE-ECDSA-AES128-GCM-SHA256' if version=='1.2' else 'TLS_AES_128_GCM_SHA256',
++                          alpn='h2' if a.case.startswith('h2') else 'http/1.1')
++            ct = dict(policy, ca=a.ca, sni=a.sni, verify=True)
++            st = dict(policy, cert=a.cert, key=a.key)
++        if a.case == 'udp':
++            c = ASTFProgram(stream=False); s = ASTFProgram(stream=False)
++            # Frame size includes Ethernet FCS; no artificial server delay.
++            req = b'x' * (a.frame_size-46); resp = b'y' * (a.frame_size-46)
++            for _ in range(a.requests):
++                c.udp_request(req, timeout_ms=1000)
++                s.recv_msg(1); s.send_msg(resp)
++            port = 53
++        elif a.case.startswith('h2'):
++            c = ASTFProgram(tls=ct, http2=dict(authority=a.sni, requests=a.requests,
++                concurrency=a.concurrency, timeout_ms=30000))
++            s = ASTFProgram(side='s', tls=st, http2=dict(body_size=a.body_size,
++                concurrency=a.concurrency, timeout_ms=30000))
++            port = 443 if encrypted else 80
++        else:
++            c = ASTFProgram(tls=ct, http=dict(responses=a.requests, expected_status=200, transactions=True))
++            s = ASTFProgram(side='s', tls=st)
++            req = ('GET / HTTP/1.1\r\nHost: '+a.sni+'\r\n\r\n').encode('ascii')
++            resp = ('HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n' % a.body_size).encode('ascii')+b'x'*a.body_size
++            c.set_var('n', a.requests); c.set_label('request')
++            c.http_request_start(); c.send(req); c.recv(len(resp)); c.jmp_nz('n','request')
++            s.set_var('n', a.requests); s.set_label('response')
++            s.recv(len(req)); s.send(resp); s.jmp_nz('n','response'); s.wait_for_peer_close()
++            port = 443
++        ip = ASTFIPGen(glob=ASTFIPGenGlobal(ip_offset='1.0.0.0'),
++            dist_client=ASTFIPGenDist(ip_range=['16.0.0.1','16.0.255.199'] if a.case=='udp' else ['16.0.0.1','16.0.255.199'], distribution='rand'),
++            dist_server=ASTFIPGenDist(ip_range=['48.0.0.1','48.1.255.199'], distribution='rand'))
++        g = ASTFGlobalInfo()
++        if a.case != 'udp':
++            g.tcp.mss = 1440; g.tcp.rxbufsize = 1048576; g.tcp.txbufsize = 1048576
++        template = ASTFTemplate(client_template=ASTFTCPClientTemplate(program=c, ip_gen=ip, port=port, cps=1),
++            server_template=ASTFTCPServerTemplate(program=s, assoc=ASTFAssociationRule(port=port)), tg_name=a.case)
++        return ASTFProfile(default_ip_gen=ip, default_c_glob_info=g, default_s_glob_info=g, templates=template)
++
++def register():
++    return Profile()
+diff --git a/scripts/astf/nic_validation/run.py b/scripts/astf/nic_validation/run.py
+new file mode 100644
+--- /dev/null
++++ b/scripts/astf/nic_validation/run.py
+@@ -0,0 +1,144 @@
++#!/usr/bin/env python3
++"""Run NIC validation sequentially; collect text logs until natural completion."""
++import argparse
++import datetime
++import hashlib
++import json
++import math
++import os
++from pathlib import Path
++import signal
++import statistics
++import subprocess
++import sys
++import zipfile
++
++HERE = Path(__file__).resolve().parent
++CASES = ('tls12', 'tls13', 'h2', 'h2tls12', 'h2tls13', 'udp')
++
++def certificates():
++    directory = HERE / 'certs'
++    directory.mkdir(mode=0o700, exist_ok=True)
++    cert, key = directory/'server.pem', directory/'server.key'
++    if cert.exists() or key.exists():
++        if not (cert.is_file() and key.is_file()):
++            raise RuntimeError('Incomplete certs directory; preserve/move it before retrying')
++        subprocess.run(['openssl','x509','-in',str(cert),'-noout','-checkend','3600'], check=True)
++    else:
++        old = os.umask(0o077)
++        try:
++            subprocess.run(['openssl','req','-x509','-newkey','ec','-pkeyopt','ec_paramgen_curve:P-256',
++                '-nodes','-keyout',str(key),'-out',str(cert),'-days','30','-subj','/CN=trex.local',
++                '-addext','subjectAltName=DNS:trex.local'], check=True)
++        finally:
++            os.umask(old)
++    return cert, key
++
++def summarize(path):
++    meta = json.loads((path/'metadata.json').read_text())
++    cpus, rpc, final = [], [], {}
++    with (path/'stats.jsonl').open() as f:
++        for line in f:
++            row = json.loads(line); final = row['stats']
++            rpc.append(row['rpc_s'])
++            if 0.1*meta['duration'] <= row['elapsed_s'] <= meta['duration']:
++                value = final.get('global',{}).get('cpu_util')
++                if isinstance(value,(float,int)): cpus.append(value)
++    result = dict(status=meta['status'], mult=meta['mult'], requested_duration_s=meta['duration'],
++        elapsed_s=meta['elapsed_s'], after_requested_duration_s=max(0,meta['elapsed_s']-meta['duration']),
++        cpu_mean=statistics.mean(cpus) if cpus else None, cpu_max=max(cpus) if cpus else None,
++        max_sample_rpc_s=max(rpc) if rpc else None, final_traffic=final.get('traffic',{}))
++    result['notes'] = []
++    result['nonzero_error_counters'] = {
++        side: {k:v for k,v in values.items() if isinstance(v,(int,float)) and v and
++               (k.endswith(('_errors','_timeouts','_aborted')) or k.startswith('tcps_tls_err_'))}
++        for side,values in result['final_traffic'].items() if isinstance(values,dict)}
++    if any(result['nonzero_error_counters'].values()):
++        result['notes'].append('Nonzero protocol/error counters; inspect final_traffic and time series.')
++    if result['cpu_max'] is not None and result['cpu_max']>=80:
++        result['notes'].append('CPU reached 80%; do not increase this workload before analysis.')
++    if result['after_requested_duration_s']>10:
++        result['notes'].append('Completion exceeded requested duration by >10s; inspect scheduling and flow cleanup.')
++    if result['max_sample_rpc_s'] is not None and result['max_sample_rpc_s']>meta['interval']:
++        result['notes'].append('Stats RPC exceeded sampling interval; timestamps record the actual cadence.')
++    (path/'result.json').write_text(json.dumps(result,indent=2)+'\n')
++    return result
++
++def main():
++    p=argparse.ArgumentParser(description=__doc__)
++    p.add_argument('--cases', nargs='+', choices=CASES, default=list(CASES))
++    p.add_argument('--smoke', action='store_true', help='10s per case at 100 CPS / UDP 1000 flows/s')
++    p.add_argument('--duration', type=float, help='Override 300s, or 10s for --smoke')
++    p.add_argument('--mult', type=float, help='Override offered flows/s; valid for one selected case only')
++    p.add_argument('--frame-size', type=int, choices=(64,570,1518), default=570)
++    p.add_argument('--trex-pid', type=int)
++    p.add_argument('--output', default='nic-validation-'+datetime.datetime.now().strftime('%Y%m%d-%H%M%S'))
++    p.add_argument('--plan', action='store_true', help='Print plan only; no RPC, cert generation or files')
++    a=p.parse_args()
++    if len(set(a.cases))!=len(a.cases): p.error('duplicate cases')
++    if a.mult is not None and (len(a.cases)!=1 or not math.isfinite(a.mult) or a.mult<=0):
++        p.error('--mult requires one case and a finite positive value')
++    duration=a.duration if a.duration is not None else (10 if a.smoke else 300)
++    if not math.isfinite(duration) or duration<=0: p.error('duration must be positive and finite')
++    plan=[dict(case=c, mult=a.mult if a.mult is not None else ((1000 if a.smoke else 100000) if c=='udp' else (100 if a.smoke else 30000)), duration_s=duration, requests=10,
++               **({'frame_size_with_fcs':a.frame_size} if c=='udp' else {'body_size':16384,'concurrency':4 if c.startswith('h2') else 1})) for c in a.cases]
++    print(json.dumps(plan,indent=2),flush=True)
++    if a.plan:return
++    # API discovery fails before traffic or output creation; no pip dependency.
++    from collect import ensure_trex_api
++    ensure_trex_api()
++    out=Path(a.output).resolve(); archive=out.with_name(out.name+'.zip')
++    if out.exists() or archive.exists():p.error('output or ZIP already exists; choose a new --output')
++    cert=key=None
++    if any(c not in ('h2','udp') for c in a.cases):cert,key=certificates()
++    out.mkdir(parents=True)
++    (out/'plan.json').write_text(json.dumps(plan,indent=2)+'\n')
++    source=out/'collector_source';source.mkdir()
++    for name in ('run.py','collect.py','server_capture.py','nic_profile.py'):
++        (source/name).write_bytes((HERE/name).read_bytes())
++    results={}
++    try:
++        for case in plan:
++            name=case['case']; target=out/name
++            cmd=[sys.executable,str(HERE/'collect.py'),'--profile',str(HERE/'nic_profile.py'),
++                 '--mult',str(case['mult']),'--duration',str(duration),'--interval','1','--server-interval','5','--output',str(target)]
++            if a.trex_pid is not None:cmd+=['--trex-pid',str(a.trex_pid)]
++            cmd+=['--tunables','--case',name,'--frame-size',str(a.frame_size)]
++            if name not in ('h2','udp'):cmd+=['--cert',str(cert),'--key',str(key),'--ca',str(cert)]
++            print('Starting %s: mult=%s duration=%ss; log: %s' % (name,case['mult'],duration,out/(name+'-console.txt')),flush=True)
++            with (out/(name+'-console.txt')).open('w') as log:
++                child=subprocess.Popen(cmd,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
++                try: rc=child.wait()
++                except KeyboardInterrupt:
++                    if child.poll() is None: child.send_signal(signal.SIGINT)
++                    child.wait()
++                    raise
++            if (target/'metadata.json').exists():
++                try: results[name]=summarize(target)
++                except Exception as exc: results[name]={'summary_error':str(exc)}
++            if rc: raise RuntimeError('%s failed (exit %s); see %s' % (name,rc,out/(name+'-console.txt')))
++            if 'summary_error' in results.get(name,{}): raise RuntimeError(results[name]['summary_error'])
++            c=results[name]['final_traffic'].get('client',{})
++            checks={'no_protocol_errors':not any(results[name]['nonzero_error_counters'].values())}
++            if name=='udp':
++                checks.update(rtt_samples=c.get('udps_rtt_count',0)>0, tcp_latency_unused=c.get('tcps_ttfb_count',0)==0 and c.get('tcps_ttlb_count',0)==0)
++            else:
++                checks.update(latency_samples=c.get('tcps_ttfb_count',0)>0 and c.get('tcps_ttlb_count',0)>0)
++                if name!='h2': checks.update(full_handshakes=c.get('tcps_tls_handshakes',0)>0 and c.get('tcps_tls_resumed',0)==0)
++            results[name]['checks']=checks
++            (target/'result.json').write_text(json.dumps(results[name],indent=2)+'\n')
++            if a.smoke and not all(checks.values()):
++                raise RuntimeError('Smoke validation failed for '+name+': '+str(checks))
++            print('Finished %s: elapsed %.2fs; CPU mean=%s max=%s' %
++                  (name,results[name]['elapsed_s'],results[name]['cpu_mean'],results[name]['cpu_max']),flush=True)
++    finally:
++        (out/'results.json').write_text(json.dumps(results,indent=2)+'\n')
++        # Only generated text logs/source; certificates/private keys stay in HERE/certs.
++        with zipfile.ZipFile(archive,'x',zipfile.ZIP_DEFLATED) as z:
++            for file in sorted(out.rglob('*')):
++                if file.is_file() and not file.is_symlink() and file.suffix!='.zip':
++                    z.write(file,str(Path(out.name)/file.relative_to(out)))
++        print('Send this archive: '+str(archive),flush=True)
++
++if __name__=='__main__':
++    main()
+diff --git a/scripts/astf/nic_validation/server_capture.py b/scripts/astf/nic_validation/server_capture.py
+new file mode 100644
+--- /dev/null
++++ b/scripts/astf/nic_validation/server_capture.py
+@@ -0,0 +1,209 @@
++"""Read-only Linux diagnostics, standard library only. Never invokes perf.
++
++Raw /proc counters are cumulative: use timestamped deltas. Scheduler counters
++come separately from the TRex RPC collector. No keys, environment or packet
++payloads are read. Missing permissions/tools are recorded, not fatal.
++"""
++import datetime
++import json
++import os
++from pathlib import Path
++import re
++import signal
++import subprocess
++import threading
++import time
++
++
++def read(path):
++    try:
++        return Path(path).read_text(errors='replace').replace('\0', ' ')
++    except OSError as exc:
++        return {'unavailable': str(exc)}
++
++
++def identity(proc):
++    try:
++        return (proc / 'stat').read_text().rsplit(')', 1)[1].split()[19]
++    except (OSError, IndexError):
++        return None
++
++
++class Capture:
++    def __init__(self, output, server, requested_pid=None, interval=5):
++        if server not in ('localhost', '127.0.0.1', '::1'):
++            raise ValueError('Run this script on the TRex server for local diagnostics; '
++                             'or use --no-server-diagnostics for RPC metrics only')
++        candidates = []
++        for proc in Path('/proc').glob('[0-9]*'):
++            try:
++                exe = Path(os.readlink(str(proc / 'exe'))).name
++                names = [exe]
++                if exe == 'rosetta' or exe.startswith('qemu-'):
++                    names += [Path(v).name for v in (proc / 'cmdline').read_text().split('\0')[:3]]
++                if any(re.fullmatch(r'_?t-rex-64(?:-debug)?(?:-o)?', n) for n in names):
++                    candidates.append(int(proc.name))
++            except OSError:
++                pass
++        if requested_pid is not None:
++            if requested_pid not in candidates:
++                raise ValueError('--trex-pid does not identify a local TRex executable')
++            candidates = [requested_pid]
++        if len(candidates) != 1:
++            raise ValueError('Expected one local TRex process, found %s; use --trex-pid' % candidates)
++        self.pid = candidates[0]
++        self.proc = Path('/proc') / str(self.pid)
++        self.identity = identity(self.proc)
++        if self.identity is None:
++            raise ValueError('TRex process disappeared')
++        self.out = Path(output) / 'server'
++        self.out.mkdir()
++        self.interval = interval
++        self.stop = threading.Event()
++        self.thread = None
++        self.origin = time.monotonic()
++        self.events = []
++        self.samples = 0
++        self.devices = []
++        self.interfaces = []
++        self.cpus = list(Path('/sys/devices/system/cpu').glob('cpu[0-9]*'))
++        self.save()
++
++    def save(self):
++        (self.out / 'capture.json').write_text(json.dumps(dict(
++            pid=self.pid, interval_s=self.interval, samples=self.samples,
++            events=self.events, clock_ticks=os.sysconf('SC_CLK_TCK'),
++            page_size=os.sysconf('SC_PAGE_SIZE')), indent=2) + '\n')
++
++    def command(self, name, argv, timeout=3):
++        event = dict(name=name, argv=argv)
++        self.events.append(event)
++        try:
++            with (self.out / (name + '.txt')).open('w') as log:
++                p = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT,
++                                     start_new_session=True, env=dict(os.environ, LC_ALL='C'))
++                try:
++                    p.wait(timeout=timeout)
++                except subprocess.TimeoutExpired:
++                    event['timeout'] = True
++                    try:
++                        os.killpg(p.pid, signal.SIGKILL)
++                    except ProcessLookupError:
++                        pass
++                    p.wait()
++                event['returncode'] = p.returncode
++        except OSError as exc:
++            event['unavailable'] = str(exc)
++        self.save()
++
++    def prepare(self):
++        (self.out / 'executable.txt').write_text(os.readlink(str(self.proc / 'exe')) + '\n')
++        self.command('executable-sha256', ['sha256sum', str(self.proc / 'exe')], timeout=10)
++        for name in ('cmdline', 'status', 'limits', 'maps', 'numa_maps', 'cgroup'):
++            (self.out / (name + '.txt')).write_text(json.dumps(read(self.proc / name), ensure_ascii=False) + '\n')
++        raw = (self.proc / 'cmdline').read_bytes().decode(errors='replace').split('\0')
++        cfg = '/etc/trex_cfg.yaml'
++        for i, arg in enumerate(raw):
++            if arg == '--cfg' and i + 1 < len(raw):
++                cfg = raw[i + 1]
++            elif arg.startswith('--cfg='):
++                cfg = arg.split('=', 1)[1]
++        path = Path(cfg)
++        if not path.is_absolute():
++            path = self.proc / 'cwd' / path
++        config = read(path)
++        (self.out / 'trex_cfg.txt').write_text(config if isinstance(config, str) else json.dumps(config))
++        for name, argv in [('kernel', ['uname', '-a']), ('lscpu', ['lscpu']),
++                           ('topology', ['lscpu', '-e']), ('numa', ['numactl', '--hardware']),
++                           ('openssl', ['openssl', 'version', '-a']),
++                           ('pci', ['lspci', '-Dnnk'])]:
++            self.command(name, argv)
++        # Only devices named in this TRex configuration, not every host NIC.
++        if isinstance(config, str):
++            for match in re.findall(r'(?<![\w:])(?:[0-9a-fA-F]{4}:)?[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7](?![\w:])', config):
++                bdf = match.lower() if match.count(':') == 2 else '0000:' + match.lower()
++                if bdf not in self.devices:
++                    self.devices.append(bdf)
++        for bdf in self.devices:
++            dev = Path('/sys/bus/pci/devices') / bdf
++            info = {n: read(dev / n) for n in ('numa_node', 'local_cpulist', 'current_link_speed',
++                    'current_link_width', 'max_link_speed', 'max_link_width')}
++            info['driver'] = os.path.realpath(str(dev / 'driver'))
++            for irq in (dev / 'msi_irqs').glob('*'):
++                info['irq_' + irq.name] = read(Path('/proc/irq') / irq.name / 'smp_affinity_list')
++            (self.out / ('pci-' + bdf + '.json')).write_text(json.dumps(info, indent=2) + '\n')
++            self.interfaces.extend(p.name for p in (dev / 'net').glob('*'))
++        self.interfaces = sorted(set(self.interfaces))
++        for nic in self.interfaces:
++            for suffix, opts in [('driver', ['-i']), ('channels', ['-l']), ('rss', ['-x']),
++                                 ('offloads', ['-k']), ('rings', ['-g'])]:
++                self.command('nic-' + nic + '-' + suffix, ['ethtool'] + opts + [nic])
++        self.nic_snapshot('before')
++        self.snapshot('baseline')
++
++    def nic_snapshot(self, phase):
++        for nic in self.interfaces:
++            self.command('nic-' + nic + '-stats-' + phase, ['ethtool', '-S', nic])
++        if not self.interfaces:
++            self.events.append({'note': 'No kernel netdev for configured PCI devices; use TRex port metrics. VFIO-bound NICs may have no ethtool interface.'})
++
++    def snapshot(self, phase):
++        if identity(self.proc) != self.identity:
++            raise RuntimeError('TRex exited or PID was reused; refusing to sample another process')
++        begin = time.monotonic()
++        record = dict(phase=phase, utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),
++                      monotonic_s=begin, elapsed_s=begin-self.origin,
++                      host={}, process={}, threads={}, cpus={}, numa={}, nic={})
++        for name in ('stat', 'meminfo', 'vmstat', 'loadavg', 'interrupts', 'softirqs',
++                     'net/softnet_stat', 'net/dev', 'pressure/cpu', 'pressure/memory', 'pressure/io'):
++            record['host'][name] = read(Path('/proc') / name)
++        # Page-table walks can disturb a poll-mode dataplane. Capture them
++        # only before traffic starts and after it has drained. Periodic polls
++        # retain cheap process/status RSS and fault/scheduler counters.
++        if phase != 'poll':
++            record['process']['numa_maps'] = read(self.proc / 'numa_maps')
++            record['process']['smaps_rollup'] = read(self.proc / 'smaps_rollup')
++        for name in ('stat', 'status', 'io', 'schedstat'):
++            record['process'][name] = read(self.proc / name)
++        for task in (self.proc / 'task').glob('[0-9]*'):
++            record['threads'][task.name] = {n: read(task / n) for n in ('comm', 'stat', 'status', 'schedstat')}
++        for cpu in self.cpus:
++            values = {n: read(cpu / 'cpufreq' / n) for n in ('scaling_cur_freq', 'scaling_governor')}
++            values['core_throttle_count'] = read(cpu / 'thermal_throttle/core_throttle_count')
++            record['cpus'][cpu.name] = values
++        for node in Path('/sys/devices/system/node').glob('node[0-9]*'):
++            record['numa'][node.name] = {n: read(node / n) for n in ('numastat', 'meminfo')}
++        for nic in self.interfaces:
++            record['nic'][nic] = {p.name: read(p) for p in (Path('/sys/class/net') / nic / 'statistics').glob('*')}
++        record['collection_s'] = time.monotonic()-begin
++        with (self.out / 'samples.jsonl').open('a') as f:
++            f.write(json.dumps(record, ensure_ascii=False) + '\n')
++        self.samples += 1
++
++    def start(self, origin):
++        self.origin = origin
++        self.thread = threading.Thread(target=self.worker, name='https-server-metrics', daemon=True)
++        self.thread.start()
++
++    def worker(self):
++        try:
++            while not self.stop.is_set():
++                begin = time.monotonic()
++                self.snapshot('poll')
++                self.stop.wait(max(0, self.interval-(time.monotonic()-begin)))
++        except Exception as exc:
++            self.events.append({'error': repr(exc)})
++
++    def finish(self):
++        self.stop.set()
++        if self.thread:
++            self.thread.join()
++        try:
++            self.snapshot('final')
++            if identity(self.proc) == self.identity:
++                (self.out / 'numa_maps-after.txt').write_text(str(read(self.proc / 'numa_maps')))
++                self.nic_snapshot('after')
++        except Exception as exc:
++            self.events.append({'error': repr(exc)})
++        self.save()
++        return 'collected; see server/capture.json for unavailable metrics/errors'

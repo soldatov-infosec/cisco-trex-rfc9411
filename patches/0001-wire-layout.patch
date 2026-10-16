@@ -1,0 +1,136 @@
+diff --git a/src/44bsd/netinet/tcp.h b/src/44bsd/netinet/tcp.h
+--- a/src/44bsd/netinet/tcp.h
++++ b/src/44bsd/netinet/tcp.h
+@@ -51,6 +51,8 @@
+  * TCP header.
+  * Per RFC 793, September, 1981.
+  */
++// Wire headers can start at any byte offset in an mbuf.
++#pragma pack(push, 1)
+ struct tcphdr {
+     u_short	th_sport;		/* source port */
+     u_short	th_dport;		/* destination port */
+@@ -81,6 +83,8 @@
+     u_short	th_sum;			/* checksum */
+     u_short	th_urp;			/* urgent pointer */
+ };
++
++#pragma pack(pop)
+ 
+ #define	PADTCPOLEN(len)		((((len) / 4) + !!((len) % 4)) * 4)
+ 
+diff --git a/src/common/Network/Packet/GTPUHeader.h b/src/common/Network/Packet/GTPUHeader.h
+--- a/src/common/Network/Packet/GTPUHeader.h
++++ b/src/common/Network/Packet/GTPUHeader.h
+@@ -35,6 +35,8 @@
+ #define GTPU_TYPE_GTPU  255
+ 
+ 
++// Wire headers can start at any byte offset in an mbuf.
++#pragma pack(push, 1)
+ class GTPUHeader {
+     uint8_t ver_flags;
+     uint8_t type;
+@@ -82,5 +84,6 @@
+         this->teid = PKT_HTONL(teid);
+     }
+ };
++#pragma pack(pop)
+ 
+ #endif
+\ No newline at end of file
+diff --git a/src/common/Network/Packet/IPHeader.h b/src/common/Network/Packet/IPHeader.h
+--- a/src/common/Network/Packet/IPHeader.h
++++ b/src/common/Network/Packet/IPHeader.h
+@@ -28,6 +28,8 @@
+ 
+ typedef uint32_t ipv4_addr_t;
+ 
++// Wire headers can start at any byte offset in an mbuf.
++#pragma pack(push, 1)
+ class IPHeader
+ {
+ 
+@@ -256,6 +258,8 @@
+ };
+ 
+ 
++#pragma pack(pop)
++
+ class IPPseudoHeader
+ {
+ public:
+diff --git a/src/common/Network/Packet/IPv6Header.h b/src/common/Network/Packet/IPv6Header.h
+--- a/src/common/Network/Packet/IPv6Header.h
++++ b/src/common/Network/Packet/IPv6Header.h
+@@ -52,6 +52,8 @@
+     uint8_t  myHeaderLen;
+ };
+ 
++// IPv6 is a wire layout, including at odd offsets after encapsulation.
++#pragma pack(push, 1)
+ class IPv6Header
+ {
+ /*
+@@ -150,6 +152,7 @@
+     uint32_t myOption[1];
+ };
+ 
++#pragma pack(pop)
+ 
+ class IPv6PseudoHeader
+ {
+@@ -216,11 +219,11 @@
+ }
+ 
+ inline uint32_t IPv6Header::getSourceIpv6LSB(){
+-    return (PKT_NTOHL(*((uint32_t*)&mySource[6])));
++    return (uint32_t(PKT_NTOHS(mySource[6])) << 16) | PKT_NTOHS(mySource[7]);
+ }
+ 
+ inline uint32_t IPv6Header::getDestIpv6LSB(){
+-    return (PKT_NTOHL(*((uint32_t*)&myDestination[6])));
++    return (uint32_t(PKT_NTOHS(myDestination[6])) << 16) | PKT_NTOHS(myDestination[7]);
+ }
+ 
+ 
+@@ -328,14 +331,14 @@
+ //--------------------------------
+ inline void IPv6Header::updateLSBIpv6Src(uint32_t ipsrc)
+ {
+-     uint32_t *lsb = (uint32_t *)&mySource[6];
+-     *lsb = PKT_HTONL(ipsrc);
++     mySource[6] = PKT_HTONS(uint16_t(ipsrc >> 16));
++     mySource[7] = PKT_HTONS(uint16_t(ipsrc));
+ }
+ 
+ inline void IPv6Header::updateLSBIpv6Dst(uint32_t ipdst)
+ {
+-     uint32_t *lsb = (uint32_t *)&myDestination[6];
+-     *lsb = PKT_HTONL(ipdst);
++     myDestination[6] = PKT_HTONS(uint16_t(ipdst >> 16));
++     myDestination[7] = PKT_HTONS(uint16_t(ipdst));
+ }
+ 
+ //--------------------------------
+diff --git a/src/common/Network/Packet/TcpHeader.h b/src/common/Network/Packet/TcpHeader.h
+--- a/src/common/Network/Packet/TcpHeader.h
++++ b/src/common/Network/Packet/TcpHeader.h
+@@ -23,6 +23,8 @@
+ #define DHCPv4_PORT     67
+ #define DHCPv6_PORT     546
+ #define MDNS_PORT       5353
++// Wire headers can start at any byte offset in an mbuf.
++#pragma pack(push, 1)
+ class TCPUDPHeaderBase
+ {
+ public:
+@@ -146,6 +148,8 @@
+     uint32_t myOption[1];
+ };
+ 
++#pragma pack(pop)
++
+ #include "TcpHeader.inl"
+ 
+ #endif //_TCP_HEADER_H_

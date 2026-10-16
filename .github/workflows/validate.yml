@@ -1,0 +1,32 @@
+name: Patch and repository validation
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Repository and tooling tests
+        run: |
+          python3 tools/check_repo.py
+          python3 -m unittest discover -s tests -v
+      - name: Download the pinned upstream archive
+        shell: bash
+        run: |
+          url=$(python3 -c 'import json; print(json.load(open("patches/manifest.json"))["upstream"]["archive_url"])')
+          digest=$(python3 -c 'import json; print(json.load(open("patches/manifest.json"))["upstream"]["archive_sha256"])')
+          curl --fail --location --retry 3 "$url" -o "$RUNNER_TEMP/trex.tar.gz"
+          printf '%s  %s\n' "$digest" "$RUNNER_TEMP/trex.tar.gz" | sha256sum --check -
+          mkdir "$RUNNER_TEMP/trex"
+          tar -xzf "$RUNNER_TEMP/trex.tar.gz" -C "$RUNNER_TEMP/trex" --strip-components=1
+      - name: Verify patch and Git application against exact result hashes
+        run: python3 tools/test_application.py --base "$RUNNER_TEMP/trex"
+      - name: Load workload profiles with the patched ASTF API
+        run: |
+          python3 tools/apply.py "$RUNNER_TEMP/trex"
+          TREX_ROOT="$RUNNER_TEMP/trex" python3 -m unittest discover -s tests -p test_profiles.py -v

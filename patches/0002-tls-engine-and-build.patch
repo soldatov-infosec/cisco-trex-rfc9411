@@ -1,0 +1,1276 @@
+diff --git a/linux/ws_main.py b/linux/ws_main.py
+--- a/linux/ws_main.py
++++ b/linux/ws_main.py
+@@ -80,6 +80,10 @@
+           
+ 
+ def options(opt):
++    opt.add_option("--with-tls-fuzz", action="store_true", default=False, help="Build TLS/TCP coverage-guided tests with Clang (Linux x86-64)")
++    opt.add_option("--rfc9411", action="store_true", default=False, help="Enable RFC 9411 ASTF extensions (TLS, HTTP/2 and latency metrics)")
++    opt.add_option("--tls-backend", default="aws-lc", choices=["aws-lc"], help="Native ASTF TLS library (requires --rfc9411)")
++    opt.add_option("--aws-lc-prefix", default=None, help="Explicit shared AWS-LC installation (requires --rfc9411)")
+     
+     opt.load('compiler_cxx')
+     opt.load('compiler_c')
+@@ -135,6 +139,12 @@
+ 
+     
+ def configure(conf):
++    conf.env.TREX_TLS = bool(conf.options.rfc9411)
++    if conf.options.aws_lc_prefix and not conf.env.TREX_TLS:
++        conf.fatal("TLS backend/prefix options require --rfc9411")
++    conf.env.TREX_TLS_FUZZ = bool(conf.options.with_tls_fuzz)
++    if conf.options.with_tls_fuzz and (not conf.options.rfc9411 or conf.options.sanitized):
++        conf.fatal('--with-tls-fuzz requires --rfc9411 and supplies its own sanitizers')
+     conf.find_program('strings')
+     so = ['/usr/lib/x86_64-linux-gnu/libstdc++.so.6','/usr/lib64/libstdc++.so.6']
+     our_so =  '../scripts/so/x86_64/libstdc++.so.6'
+@@ -156,7 +166,23 @@
+     else:
+         conf.env.RPATH = []
+ 
+-    if conf.options.gcc6:
++    if conf.options.with_tls_fuzz:
++        if march != 'x86_64' or os.uname()[0] != 'Linux':
++            conf.fatal('--with-tls-fuzz currently supports Linux x86-64')
++        conf.load('clangxx')
++        conf.load('clang')
++        resource = subprocess.check_output(conf.env.CXX + ['-print-resource-dir']).decode().strip()
++        runtime = os.path.join(resource, 'lib', 'linux', 'libclang_rt.fuzzer_no_main-x86_64.a')
++        if not os.path.isfile(runtime):
++            conf.fatal('Install the Clang libFuzzer runtime: ' + runtime)
++        flags = ['-fsanitize=fuzzer-no-link,address,undefined', '-fno-omit-frame-pointer']
++        conf.env.append_value('CFLAGS', flags)
++        conf.env.append_value('CXXFLAGS', flags + ['-DTREX_TLS_FUZZ',
++            '-Wno-mismatched-tags', '-Wno-inconsistent-missing-override',
++            '-Wno-overloaded-virtual', '-Wno-unused-private-field', '-Wno-unused-const-variable', '-Wno-unknown-pragmas', '-Wno-error'])
++        conf.env.append_value('LINKFLAGS', ['-fsanitize=address,undefined',
++            '-Wl,--whole-archive', runtime, '-Wl,--no-whole-archive'])
++    elif conf.options.gcc6:
+         configure_gcc(conf, GCC6_DIRS)
+     elif conf.options.gcc7:
+         conf.environ['AR']="x86_64-pc-linux-gnu-gcc-ar"
+@@ -166,6 +192,9 @@
+         configure_gcc(conf, GCC8_DIRS)
+     else:
+         configure_gcc(conf)
++
++    if conf.env.TREX_TLS:
++        conf.load('astf_tls_build', tooldir=[os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'linux_dpdk')])
+ 
+     
+     # first verify CC version
+@@ -262,6 +291,8 @@
+             '44bsd/tcp_input.cpp',
+             #'44bsd/tcp_usrreq.cpp',
+             '44bsd/tcp_socket.cpp',
++             '44bsd/tls/astf_tls.cpp',
++             '44bsd/http2/astf_http2.cpp',
+             '44bsd/tcp_dpdk.cpp',
+             '44bsd/sim_cs_tcp.cpp',
+             '44bsd/sch_rampup.cpp',
+@@ -761,21 +792,27 @@
+     cxxflags  = build_obj.get_flags(is_sanitized)+['-std=gnu++11',]
+     cflags    = build_obj.get_c_flags(is_sanitized)
+     linkflags = build_obj.get_link_flags(is_sanitized)
++    if bld.env.TREX_TLS_FUZZ:
++        # Keep Clang-specific diagnostics after the legacy target's -Wall.
++        cxxflags += bld.env.CXXFLAGS
++        cflags += bld.env.CFLAGS
+ 
+     bld.objects(
+         features = 'c',
+         includes = tcp_includes_path,
+         cflags   = cflags,
++        defines = ['TREX_TLS'] if bld.env.TREX_TLS else [],
+         source   = tcp_src.file_list(top),
+         target   = build_obj.get_tcp_target()
+         )
+ 
+     bld.program(features='cxx cxxprogram', 
+                 includes =  includes_path + tcp_includes_path,
+-                cxxflags =  cxxflags,
++                cxxflags = cxxflags,
++                defines = ['TREX_TLS'] if bld.env.TREX_TLS else [],
+                 linkflags = linkflags,
+                 source = build_obj.get_src(),
+-                use = build_obj.get_use_libs() + [build_obj.get_tcp_target()],
++                use = build_obj.get_use_libs() + [build_obj.get_tcp_target()] + (['ASTF_TLS', 'ASTF_HTTP2'] if bld.env.TREX_TLS else []),
+                 lib = ['pthread', 'z', 'dl'],
+                 rpath  = bld.env.RPATH + build_obj.get_rpath(),
+                 target = build_obj.get_target())
+diff --git a/linux_dpdk/astf_tls_build.py b/linux_dpdk/astf_tls_build.py
+new file mode 100644
+--- /dev/null
++++ b/linux_dpdk/astf_tls_build.py
+@@ -0,0 +1,55 @@
++# SPDX-License-Identifier: Apache-2.0
++"""AWS-LC validation for simulator and DPDK Waf builds."""
++import os
++
++
++def configure(conf):
++    for name in ('INCLUDES', 'LIBPATH', 'RPATH', 'LIB', 'LINKFLAGS'):
++        conf.env[name + '_ASTF_TLS'] = []
++    backend = getattr(conf.options, 'tls_backend', 'aws-lc')
++    if backend != 'aws-lc':
++        conf.fatal('Native ASTF TLS supports only AWS-LC')
++    prefix = getattr(conf.options, 'aws_lc_prefix', None)
++    if not prefix:
++        conf.fatal('Native ASTF TLS needs --aws-lc-prefix')
++    settings = {}
++    if prefix:
++        prefix = os.path.realpath(os.path.abspath(os.path.expanduser(prefix)))
++        include = os.path.join(prefix, 'include')
++        if not os.path.isfile(os.path.join(include, 'openssl', 'ssl.h')):
++            conf.fatal('AWS-LC prefix has no include/openssl/ssl.h: ' + prefix)
++        # Require both libraries in the same directory; never silently mix a
++        # partial custom installation with a system libssl or libcrypto.
++        candidates = [os.path.join(prefix, name) for name in ('lib64', 'lib')]
++        libraries = next((path for path in candidates if all(
++            os.path.isfile(os.path.join(path, 'lib' + name + '.so'))
++            for name in ('ssl', 'crypto'))), None)
++        if libraries is None:
++            conf.fatal('AWS-LC prefix needs shared libssl.so and libcrypto.so in lib64 or lib')
++        settings = dict(includes=[include], libpath=[libraries], rpath=[libraries])
++        conf.msg('ASTF TLS prefix', prefix)
++    # uselib_store carries headers, libraries, search path and RUNPATH together.
++    # In particular, the program tasks must actually use ASTF_TLS afterwards.
++    fragment = '''
++#include <openssl/ssl.h>
++#include <openssl/crypto.h>
++#include <cstring>
++#include <openssl/service_indicator.h>
++#ifndef OPENSSL_IS_AWSLC
++#error AWS-LC headers required
++#endif
++int main() {
++    if (std::strcmp(awslc_version_string(), "AWS-LC " AWSLC_VERSION_NUMBER_STRING)) return 1;
++    SSL_CTX *ctx = SSL_CTX_new(TLS_method());
++    if (!ctx) return 2;
++    SSL_CTX_free(ctx);
++    return 0;
++}
++'''
++    conf.check_cxx(fragment=fragment, lib=['ssl', 'crypto'],
++                   uselib_store='ASTF_TLS', mandatory=True, execute=True,
++                   msg='Checking ' + backend + ' headers, linkage and runtime version', **settings)
++
++    conf.check_cxx(fragment='#include <nghttp2/nghttp2.h>\nint main(){nghttp2_option *o=0;nghttp2_option_new(&o);nghttp2_option_set_max_continuations(o,8);nghttp2_option_del(o);}',
++                   lib=['nghttp2'], uselib_store='ASTF_HTTP2', mandatory=True,
++                   msg='Checking libnghttp2 with HTTP/2 continuation limits')
+diff --git a/linux_dpdk/ws_main.py b/linux_dpdk/ws_main.py
+--- a/linux_dpdk/ws_main.py
++++ b/linux_dpdk/ws_main.py
+@@ -140,6 +140,9 @@
+ 
+ 
+ def options(opt):
++    opt.add_option("--rfc9411", action="store_true", default=False, help="Enable RFC 9411 ASTF extensions (TLS, HTTP/2 and latency metrics)")
++    opt.add_option("--tls-backend", default="aws-lc", choices=["aws-lc"], help="Native ASTF TLS library (requires --rfc9411)")
++    opt.add_option("--aws-lc-prefix", default=None, help="Explicit shared AWS-LC installation (requires --rfc9411)")
+     opt.load('compiler_cxx')
+     opt.load('compiler_c')
+     opt.add_option('--pkg-dir', '--pkg_dir', dest='pkg_dir', default=False, action='store', help="Destination folder for 'pkg' option.")
+@@ -787,6 +790,9 @@
+ 
+ def configure(conf):
+ 
++    conf.env.TREX_TLS = bool(conf.options.rfc9411)
++    if conf.options.aws_lc_prefix and not conf.env.TREX_TLS:
++        conf.fatal("TLS backend/prefix options require --rfc9411")
+     conf.find_program('strings')
+     so = ['/usr/lib/x86_64-linux-gnu/libstdc++.so.6','/usr/lib64/libstdc++.so.6']
+     our_so =  '../scripts/so/x86_64/libstdc++.so.6'
+@@ -819,6 +825,9 @@
+     else:
+         configure_gcc(conf)
+ 
++    if conf.env.TREX_TLS:
++        conf.load('astf_tls_build', tooldir=[os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'linux_dpdk')])
++
+ 
+     conf.find_program('ldd')
+     conf.check_cxx(lib = 'z', errmsg = missing_pkg_msg(fedora = 'zlib-devel', ubuntu = 'zlib1g-dev'))
+@@ -973,6 +982,8 @@
+              '44bsd/tcp_input.cpp',
+              #'44bsd/tcp_usrreq.cpp',
+              '44bsd/tcp_socket.cpp',
++             '44bsd/tls/astf_tls.cpp',
++             '44bsd/http2/astf_http2.cpp',
+              '44bsd/tcp_dpdk.cpp',
+              '44bsd/sch_rampup.cpp',
+              '44bsd/tick_cmd_clock.cpp',
+@@ -2690,6 +2701,7 @@
+         features = 'c',
+         includes = tcp_includes_path,
+         cflags   = cflags,
++        defines = ['TREX_TLS'] if bld.env.TREX_TLS else [],
+         source   = tcp_src.file_list(top),
+         target   = build_obj.get_tcp_target()
+         )
+@@ -2699,10 +2711,11 @@
+ 
+     bld.program(features='cxx cxxprogram',
+                 includes =inc_path + tcp_includes_path,
+-                cxxflags = ( cxxflags + ['-std=gnu++11']),
++                cxxflags = cxxflags + ['-std=gnu++11'],
++                defines = ['TREX_TLS'] if bld.env.TREX_TLS else [],
+                 linkflags = linkflags ,
+                 lib=['pthread','dl', 'z'] + lib_ext,
+-                use =[build_obj.get_dpdk_target(), build_obj.get_bpf_target(), 'zmq', build_obj.get_tcp_target()],
++                use =[build_obj.get_dpdk_target(), build_obj.get_bpf_target(), 'zmq', build_obj.get_tcp_target()] + (['ASTF_TLS', 'ASTF_HTTP2'] if bld.env.TREX_TLS else []),
+                 source = bp.file_list(top) + debug_file_list,
+                 rpath = rpath_linkage,
+                 target = build_obj.get_target())
+diff --git a/src/44bsd/tls/astf_h2_tx.h b/src/44bsd/tls/astf_h2_tx.h
+new file mode 100644
+--- /dev/null
++++ b/src/44bsd/tls/astf_h2_tx.h
+@@ -0,0 +1,17 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++#ifndef TREX_ASTF_H2_TX_H
++#define TREX_ASTF_H2_TX_H
++#include <algorithm>
++#include <cstddef>
++namespace astf_http2 {
++// ACKs often release only one MSS. Do not occupy another 4K TX object for
++// each such credit while data is already in flight. Wait for cumulative ACK
++// credit, without a timer or waiting for application data not yet available.
++// Empty queues always progress, including small/zero advertised windows.
++inline size_t tx_copy_size(size_t available, size_t credit, size_t queued) {
++    size_t n=std::min(available,credit);
++    if (queued && n<available) n-=n%4096;
++    return n;
++}
++}
++#endif
+diff --git a/src/44bsd/tls/astf_tls.cpp b/src/44bsd/tls/astf_tls.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/44bsd/tls/astf_tls.cpp
+@@ -0,0 +1,648 @@
++#include "../../astf/astf_cost_metrics.h"
++/* SPDX-License-Identifier: Apache-2.0 */
++#include "astf_tls.h"
++#ifdef TREX_TLS
++#include <openssl/err.h>
++#include <openssl/crypto.h>
++#include <openssl/rand.h>
++#include <openssl/hmac.h>
++#include "astf_tls_bio.h"
++#include <ctime>
++#include <algorithm>
++#include <cstring>
++#include <stdexcept>
++
++namespace astf_tls {
++static int new_transport(BIO **a, size_t n, BIO **b, size_t m) {
++    return transport::create(a,n,b,m);
++}
++static void require(bool ok, const char *message) {
++    if (!ok) throw std::runtime_error(message);
++}
++// RFC 9411 section 4.3.3.1: validate the client's SNI on the server,
++// independently of client-side certificate verification. Use the actual leaf
++// certificate: DNS SANs take precedence, with AWS-LC's legacy CN fallback only
++// when no DNS SAN is present. Wildcards match one complete leftmost label.
++static int check_server_name(SSL *ssl, int *alert, void *) {
++    const char *name = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
++    if (!name) return SSL_TLSEXT_ERR_NOACK; // SNI remains optional.
++    X509 *cert = SSL_get_certificate(ssl); // Borrowed; owned by SSL.
++    if (cert && X509_check_host(cert, name, std::strlen(name),
++                               X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS, nullptr) == 1)
++        return SSL_TLSEXT_ERR_OK;
++    *alert = SSL_AD_UNRECOGNIZED_NAME;
++    return SSL_TLSEXT_ERR_ALERT_FATAL;
++}
++const char *backend_name() {
++    return "aws-lc";
++}
++const char *backend_version() { return OpenSSL_version(OPENSSL_VERSION); }
++Library::Library(): owner(std::this_thread::get_id()) {
++}
++Library::~Library() {
++    // A runtime must never outlive its worker or be released by the CP thread.
++    if (owner != std::this_thread::get_id()) std::terminate();
++    for (auto &entry : transports) {
++        BIO_free(entry.internal);
++        BIO_free(entry.wire);
++    }
++}
++bool Library::take_transport(size_t capacity, BIO **internal, BIO **wire) {
++    for (auto &entry : transports) {
++        if (entry.internal && entry.capacity == capacity) {
++            *internal = entry.internal; *wire = entry.wire;
++            entry = Transport{};
++            return true;
++        }
++    }
++    return new_transport(internal, capacity, wire, capacity) == 1;
++}
++void Library::keep_transport(size_t capacity, BIO *internal, BIO *wire) {
++    // Reopen both directions and discard bytes from the previous connection.
++    transport::reset(internal,wire);
++    {
++        for (auto &entry : transports) {
++            if (!entry.internal) {
++                entry.capacity = capacity; entry.internal = internal; entry.wire = wire;
++                return;
++            }
++        }
++    }
++    BIO_free(internal); BIO_free(wire);
++}
++std::shared_ptr<Library> Library::local() {
++    static thread_local std::weak_ptr<Library> current;
++    auto runtime = current.lock();
++    if (!runtime) { runtime = std::make_shared<Library>(); current = runtime; }
++    return runtime;
++}
++static SSL_SESSION *copy_session(SSL_SESSION *session) {
++    // AWS-LC sessions are immutable after publication; take our own reference.
++    if (!session || !SSL_SESSION_up_ref(session)) return nullptr;
++    return session;
++}
++
++struct TicketKeys {
++    unsigned char name[16], aes[32], mac[32], namespace_id[32];
++    TicketKeys() {
++        int ok = RAND_bytes(reinterpret_cast<unsigned char *>(this), sizeof(*this));
++        if (ok != 1) {
++            OPENSSL_cleanse(this, sizeof(*this));
++            throw std::runtime_error("Cannot initialize TLS ticket keys");
++        }
++    }
++    ~TicketKeys() { OPENSSL_cleanse(this, sizeof(*this)); }
++};
++void WorkerContexts::prepare(const std::vector<std::shared_ptr<Context>> &programs) {
++    WorkerContexts next;
++    for (const auto &program : programs) next.prepare_one(program);
++    contexts.swap(next.contexts);
++}
++void WorkerContexts::prepare_one(const std::shared_ptr<Context> &program) {
++    if (!program || contexts.count(program.get())) return;
++    auto context = program->clone_for_worker(Library::local());
++    contexts.emplace(program.get(), std::move(context));
++}
++std::shared_ptr<Context> Context::clone_for_worker(const std::shared_ptr<Library> &runtime) const {
++    require(bool(runtime), "Missing TLS worker runtime");
++    return std::shared_ptr<Context>(new Context(config, runtime, ticket_keys));
++}
++static Context *owner(SSL *ssl) {
++    return static_cast<Context *>(SSL_CTX_get_app_data(SSL_get_SSL_CTX(ssl)));
++}
++
++// AWS-LC security-level setters are no-ops. Explicitly reject weak certificate
++// keys/digests instead of silently inheriting a weaker policy on migration.
++static bool strong_digest(int nid) {
++    return nid==NID_sha224 || nid==NID_sha256 || nid==NID_sha384 || nid==NID_sha512;
++}
++static bool strong_pss_parameters(X509 *cert) {
++    const X509_ALGOR *alg=nullptr; X509_get0_signature(nullptr,&alg,cert);
++    const ASN1_OBJECT *oid=nullptr; const void *value=nullptr; int type=0;
++    X509_ALGOR_get0(&oid,&type,&value,alg);
++    if (type!=V_ASN1_SEQUENCE || !value) return false; // Absent hash defaults to SHA-1.
++    auto encoded=static_cast<const ASN1_STRING *>(value);
++    if (ASN1_STRING_length(encoded)<=0) return false;
++    const unsigned char *cursor=ASN1_STRING_get0_data(encoded);
++    const unsigned char *end=cursor+ASN1_STRING_length(encoded);
++    std::unique_ptr<RSA_PSS_PARAMS,decltype(&RSA_PSS_PARAMS_free)> params(
++        d2i_RSA_PSS_PARAMS(nullptr,&cursor,ASN1_STRING_length(encoded)),RSA_PSS_PARAMS_free);
++    if (!params || cursor!=end || !params->hashAlgorithm || !params->maskGenAlgorithm) return false;
++    X509_ALGOR_get0(&oid,nullptr,nullptr,params->hashAlgorithm);
++    if (!strong_digest(OBJ_obj2nid(oid))) return false;
++    X509_ALGOR_get0(&oid,&type,&value,params->maskGenAlgorithm);
++    if (OBJ_obj2nid(oid)!=NID_mgf1 || type!=V_ASN1_SEQUENCE || !value) return false;
++    encoded=static_cast<const ASN1_STRING *>(value);
++    if (ASN1_STRING_length(encoded)<=0) return false;
++    cursor=ASN1_STRING_get0_data(encoded); end=cursor+ASN1_STRING_length(encoded);
++    std::unique_ptr<X509_ALGOR,decltype(&X509_ALGOR_free)> mgf(
++        d2i_X509_ALGOR(nullptr,&cursor,ASN1_STRING_length(encoded)),X509_ALGOR_free);
++    if (!mgf || cursor!=end) return false;
++    X509_ALGOR_get0(&oid,nullptr,nullptr,mgf.get());
++    return strong_digest(OBJ_obj2nid(oid));
++}
++static int certificate_policy(X509 *cert) {
++    EVP_PKEY *key=cert ? X509_get0_pubkey(cert) : nullptr;
++    if (!key) return X509_V_ERR_UNSPECIFIED;
++    int type=EVP_PKEY_id(key), bits=EVP_PKEY_bits(key);
++    if ((type==EVP_PKEY_RSA || type==EVP_PKEY_RSA_PSS) ? bits<2048 :
++        type==EVP_PKEY_EC ? bits<224 : type!=EVP_PKEY_ED25519)
++        return X509_V_ERR_CA_KEY_TOO_SMALL;
++    int digest=NID_undef, pk=NID_undef;
++    int signature=X509_get_signature_nid(cert);
++    if (signature==NID_rsassaPss ? !strong_pss_parameters(cert) :
++        (signature!=NID_ED25519 &&
++         (!OBJ_find_sigid_algs(signature,&digest,&pk) || !strong_digest(digest))))
++        return X509_V_ERR_CA_MD_TOO_WEAK;
++    return X509_V_OK;
++}
++static int verify_certificate(int preverified, X509_STORE_CTX *store) {
++    if (!preverified) return 0; // Never override chain, time or hostname errors.
++    int error=certificate_policy(X509_STORE_CTX_get_current_cert(store));
++    if (error==X509_V_OK) return 1;
++    X509_STORE_CTX_set_error(store,error); return 0;
++}
++static void check_local_chain(SSL_CTX *ctx) {
++    require(certificate_policy(SSL_CTX_get0_certificate(ctx))==X509_V_OK,
++            "AWS-LC certificate violates ASTF key/digest policy");
++    STACK_OF(X509) *chain=nullptr;
++    SSL_CTX_get0_chain_certs(ctx,&chain);
++    for (size_t i=0; chain && i<sk_X509_num(chain); ++i)
++        require(certificate_policy(sk_X509_value(chain,i))==X509_V_OK,
++                "AWS-LC chain violates ASTF key/digest policy");
++}
++static int select_alpn(SSL *, const unsigned char **out, unsigned char *outlen,
++                        const unsigned char *in, unsigned inlen, void *arg) {
++    auto c = static_cast<Context *>(arg);
++    for (unsigned i=0; i<inlen;) {
++        unsigned n=in[i++];
++        if (!n || n > inlen-i) return SSL_TLSEXT_ERR_ALERT_FATAL;
++        if (n == c->config.alpn.size() && !std::memcmp(in+i, c->config.alpn.data(), n)) {
++            *out=in+i; *outlen=n;
++            return SSL_TLSEXT_ERR_OK;
++        }
++        i+=n;
++    }
++    return SSL_TLSEXT_ERR_ALERT_FATAL;
++}
++static std::string policy_list(const std::vector<std::string> &values,
++                               std::initializer_list<const char *> allowed,
++                               const char *message) {
++    require(values.size() <= allowed.size(), message);
++    std::string result;
++    for (size_t i=0; i<values.size(); ++i) {
++        require(std::find(allowed.begin(), allowed.end(), values[i]) != allowed.end(), message);
++        require(std::find(values.begin(), values.begin()+i, values[i]) == values.begin()+i, message);
++        if (i) result += ':';
++        result += values[i];
++    }
++    return result;
++}
++Context::Context(const Config &cfg): Context(cfg, nullptr, nullptr) {}
++Context::Context(const Config &cfg, std::shared_ptr<Library> runtime,
++                 std::shared_ptr<const TicketKeys> tickets):
++    config(cfg), library(std::move(runtime)), ticket_keys(std::move(tickets)) {
++    static_assert(ATOMIC_POINTER_LOCK_FREE == 2, "TLS session cache needs lock-free pointers");
++    for (auto &slot : sessions) slot.store(nullptr, std::memory_order_relaxed);
++    const auto groups = policy_list(cfg.groups, {"X25519", "P-256", "P-384", "P-521"},
++                                    "Unsupported or duplicate TLS group");
++    const auto signatures = policy_list(cfg.signature_algorithms, {
++        "rsa_pss_rsae_sha256", "rsa_pss_rsae_sha384", "rsa_pss_rsae_sha512",
++        "ecdsa_secp256r1_sha256", "ecdsa_secp384r1_sha384", "ecdsa_secp521r1_sha512",
++        "ed25519", "rsa_pkcs1_sha256", "rsa_pkcs1_sha384", "rsa_pkcs1_sha512"},
++        "Unsupported or duplicate TLS signature algorithm");
++    if (!cfg.cipher_suite.empty()) {
++        policy_list({cfg.cipher_suite}, cfg.version == "1.2" ?
++            std::initializer_list<const char *>{"ECDHE-ECDSA-AES128-GCM-SHA256", "ECDHE-RSA-AES128-GCM-SHA256",
++                "ECDHE-ECDSA-AES256-GCM-SHA384", "ECDHE-RSA-AES256-GCM-SHA384",
++                "ECDHE-ECDSA-CHACHA20-POLY1305", "ECDHE-RSA-CHACHA20-POLY1305"} :
++            std::initializer_list<const char *>{"TLS_AES_128_GCM_SHA256", "TLS_AES_256_GCM_SHA384",
++                "TLS_CHACHA20_POLY1305_SHA256"}, "Unsupported cipher_suite for TLS version");
++    }
++    require(!cfg.require_client_cert || (cfg.server && cfg.verify && !cfg.ca.empty()),
++            "require_client_cert needs a verified server and explicit client CA");
++    require(cfg.pump_budget >= 1 && cfg.pump_budget <= 256, "TLS pump budget outside 1..256");
++    require(cfg.handshake_timeout_ms >= 1 && cfg.handshake_timeout_ms <= 600000 &&
++            cfg.close_timeout_ms >= 1 && cfg.close_timeout_ms <= 600000, "TLS timeout outside 1..600000 ms");
++    require(cfg.session_timeout >= 1 && cfg.session_timeout <= 86400, "TLS session_timeout outside 1..86400");
++    require(!cfg.resumption || cfg.psk_hex.empty(), "TLS resumption currently requires certificate authentication");
++    require(cfg.bio_capacity >= 128 && cfg.bio_capacity <= 65536, "TLS BIO capacity outside 128..65536");
++    for (const auto *value : {&cfg.sni, &cfg.cert, &cfg.key, &cfg.ca})
++        require(value->find('\0') == std::string::npos, "TLS option contains NUL");
++    require(cfg.sni.size() <= 253, "TLS SNI is too long");
++    require(cfg.version == "1.2" || cfg.version == "1.3", "TLS version must be 1.2 or 1.3");
++    require(cfg.alpn == "http/1.1" || cfg.alpn == "h2", "TLS ALPN must be http/1.1 or h2");
++    require(cfg.psk_hex.empty() && cfg.psk_identity.empty(),
++            "AWS-LC does not support external PSK profiles; use certificate authentication");
++    require(!cfg.server || (!cfg.cert.empty() && !cfg.key.empty()),
++            "TLS server requires certificate/key");
++    require(cfg.cert.empty() == cfg.key.empty(), "TLS certificate and key must be paired");
++    require(cfg.server || !cfg.verify || !cfg.sni.empty(),
++            "Verified TLS client requires sni for hostname validation");
++    ctx=SSL_CTX_new(TLS_method());
++    require(ctx != nullptr, "SSL_CTX_new failed");
++    try {
++        int version=cfg.version == "1.2" ? TLS1_2_VERSION : TLS1_3_VERSION;
++        require(SSL_CTX_set_min_proto_version(ctx, version) && SSL_CTX_set_max_proto_version(ctx, version),
++                "Cannot set TLS version");
++        SSL_CTX_set_app_data(ctx, this);
++        SSL_CTX_set_default_passwd_cb(ctx, [](char *, int, int, void *) { return 0; });
++        SSL_CTX_set_options(ctx, SSL_OP_NO_COMPRESSION | SSL_OP_NO_RENEGOTIATION | SSL_OP_NO_TICKET);
++        SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_OFF);
++        SSL_CTX_set_num_tickets(ctx, 0);
++        if (cfg.resumption) {
++            SSL_CTX_clear_options(ctx, SSL_OP_NO_TICKET);
++            SSL_CTX_set_timeout(ctx, cfg.session_timeout);
++            // Stateless server tickets; no unbounded OpenSSL session-ID cache.
++            SSL_CTX_set_session_cache_mode(ctx, (cfg.server ? SSL_SESS_CACHE_SERVER : SSL_SESS_CACHE_CLIENT) |
++                                               SSL_SESS_CACHE_NO_INTERNAL | SSL_SESS_CACHE_NO_AUTO_CLEAR);
++            if (cfg.server) {
++                if (!ticket_keys) ticket_keys = std::make_shared<TicketKeys>();
++                require(SSL_CTX_set_session_id_context(ctx, ticket_keys->namespace_id,
++                        sizeof(ticket_keys->namespace_id)) == 1, "Cannot initialize TLS session namespace");
++                ticket_cipher = EVP_aes_256_cbc();
++                require(SSL_CTX_set_tlsext_ticket_key_cb(ctx, ticket) == 1,
++                        "Cannot initialize TLS ticket cipher");
++                SSL_CTX_set_num_tickets(ctx, 1);
++            } else SSL_CTX_sess_set_new_cb(ctx, Flow::new_session);
++        }
++        SSL_CTX_set_early_data_enabled(ctx, 0);
++        require(SSL_CTX_set_ciphersuites(ctx,
++            "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256") == 1,
++            "Cannot set TLS 1.3 cipher policy");
++        require(SSL_CTX_set1_sigalgs_list(ctx,
++            "rsa_pss_rsae_sha256:rsa_pss_rsae_sha384:rsa_pss_rsae_sha512:"
++            "ecdsa_secp256r1_sha256:ecdsa_secp384r1_sha384:ecdsa_secp521r1_sha512:"
++            "ed25519:rsa_pkcs1_sha256:rsa_pkcs1_sha384:rsa_pkcs1_sha512") == 1,
++            "Cannot set TLS signature policy");
++        if (!signatures.empty())
++            require(SSL_CTX_set1_sigalgs_list(ctx, signatures.c_str()) == 1, "Cannot set requested TLS signatures");
++        require(SSL_CTX_set1_groups_list(ctx, groups.empty() ? "X25519:P-256:P-384" : groups.c_str()) == 1,
++                "Cannot set classical TLS groups");
++        SSL_CTX_set_max_cert_list(ctx, 65536);
++        require(SSL_CTX_set_cipher_list(ctx,
++            "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:"
++            "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:"
++            "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305") == 1,
++            "Cannot set TLS cipher list");
++        if (!cfg.cipher_suite.empty())
++            require((cfg.version == "1.2" ? SSL_CTX_set_cipher_list(ctx, cfg.cipher_suite.c_str()) :
++                     SSL_CTX_set_ciphersuites(ctx, cfg.cipher_suite.c_str())) == 1,
++                    "Cannot set requested TLS cipher suite");
++        if (!cfg.cert.empty()) {
++            require(SSL_CTX_use_certificate_chain_file(ctx, cfg.cert.c_str()) == 1, "Cannot load TLS certificate");
++            require(SSL_CTX_use_PrivateKey_file(ctx, cfg.key.c_str(), SSL_FILETYPE_PEM) == 1 &&
++                    SSL_CTX_check_private_key(ctx) == 1, "Cannot load TLS private key or key mismatch");
++            check_local_chain(ctx);
++        }
++        if ((!cfg.server && cfg.verify) || cfg.require_client_cert) {
++            SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER |
++                (cfg.require_client_cert ? SSL_VERIFY_FAIL_IF_NO_PEER_CERT : 0), verify_certificate);
++            require(cfg.ca.empty() ? SSL_CTX_set_default_verify_paths(ctx) == 1 :
++                    SSL_CTX_load_verify_locations(ctx, cfg.ca.c_str(), nullptr) == 1, "Cannot load TLS CA");
++        }
++        if (cfg.require_client_cert) {
++            auto names = SSL_load_client_CA_file(cfg.ca.c_str());
++            require(names != nullptr, "Cannot load advertised client CA names");
++            SSL_CTX_set_client_CA_list(ctx, names); // SSL_CTX takes ownership.
++        }
++        if (cfg.server) {
++            require(SSL_CTX_set_tlsext_servername_callback(ctx, check_server_name) == 1,
++                    "Cannot set TLS server name validation");
++            SSL_CTX_set_alpn_select_cb(ctx, select_alpn, this);
++        }
++    } catch (...) { SSL_CTX_free(ctx); ctx=nullptr; ticket_cipher=nullptr; throw; }
++}
++Context::~Context() {
++    for (auto &slot : sessions) SSL_SESSION_free(slot.load(std::memory_order_relaxed));
++    SSL_CTX_free(ctx);
++}
++int Context::ticket(SSL *ssl, unsigned char *name, unsigned char *iv,
++                    EVP_CIPHER_CTX *cipher, TicketMac *mac, int encrypt) {
++    auto c = owner(ssl);
++    const auto &key = *c->ticket_keys;
++    if (!encrypt && CRYPTO_memcmp(name, key.name, sizeof(key.name))) return 0;
++    if (encrypt) {
++        std::memcpy(name, key.name, sizeof(key.name));
++        if (RAND_bytes(iv, EVP_CIPHER_iv_length(c->ticket_cipher)) != 1) return -1;
++    }
++    if (HMAC_Init_ex(mac, key.mac, sizeof(key.mac), EVP_sha256(), nullptr) != 1) return -1;
++    if (EVP_CipherInit_ex(cipher, c->ticket_cipher, nullptr, key.aes, iv, encrypt) != 1) return -1;
++    // Renew accepted tickets: the client cache consumes TLS 1.3 tickets once.
++    return encrypt ? 1 : 2;
++}
++void Context::cache_session(SSL_SESSION *session) {
++    if (!session) return;
++    auto &slot = sessions[next_slot.fetch_add(1, std::memory_order_relaxed) % sessions.size()];
++    SSL_SESSION_free(slot.exchange(session, std::memory_order_acq_rel));
++}
++SSL_SESSION *Context::take_session() {
++    const auto now = std::time(nullptr);
++    for (auto &slot : sessions) {
++        // Avoid an exclusive cache-line transfer for empty slots. A concurrent
++        // publication missed here simply means an optional full handshake.
++        if (!slot.load(std::memory_order_relaxed)) continue;
++        SSL_SESSION *session = slot.exchange(nullptr, std::memory_order_acq_rel);
++        if (!session) continue;
++        const auto created = SSL_SESSION_get_time(session);
++        const auto lifetime = std::min<long>(SSL_SESSION_get_timeout(session), config.session_timeout);
++        if (SSL_SESSION_is_resumable(session) && now >= 0 && uint64_t(now) >= uint64_t(created) &&
++            uint64_t(now) - uint64_t(created) < uint64_t(lifetime))
++            return session;
++        SSL_SESSION_free(session);
++    }
++    return nullptr;
++}
++int Flow::new_session(SSL *ssl, SSL_SESSION *session) {
++    auto flow = static_cast<Flow *>(SSL_get_app_data(ssl));
++    // Duplicate before returning 0: OpenSSL may invalidate its original on
++    // cache removal or unclean shutdown. Keep at most one candidate per flow.
++    auto copy = copy_session(session);
++    if (copy) {
++        SSL_SESSION_free(flow->candidate);
++        flow->candidate = copy;
++    }
++    return 0;
++}
++Flow::Flow(std::shared_ptr<Context> c): context(std::move(c)) {
++    astf_cost::Probe cost_probe(context->config.server ? astf_cost::FLOW_CREATE_S : astf_cost::FLOW_CREATE_C);
++    ssl=SSL_new(context->ctx);
++    BIO *internal=nullptr;
++    if (!ssl || !(context->library ?
++            context->library->take_transport(context->config.bio_capacity, &internal, &wire) :
++            new_transport(&internal, context->config.bio_capacity, &wire, context->config.bio_capacity) == 1)) {
++        SSL_free(ssl); BIO_free(internal); BIO_free(wire);
++        throw std::runtime_error("TLS flow allocation failed");
++    }
++    SSL_set_bio(ssl, internal, internal);
++    SSL_set_app_data(ssl, this);
++    if (context->config.server) SSL_set_accept_state(ssl);
++    else {
++        SSL_set_connect_state(ssl);
++        auto &cfg=context->config;
++        unsigned char protocols[9]; // validated ALPN is http/1.1 or h2
++        protocols[0] = static_cast<unsigned char>(cfg.alpn.size());
++        std::memcpy(protocols + 1, cfg.alpn.data(), cfg.alpn.size());
++        if (SSL_set_alpn_protos(ssl, protocols, cfg.alpn.size() + 1) ||
++            (!cfg.sni.empty() && (!SSL_set_tlsext_host_name(ssl, cfg.sni.c_str()) ||
++                                 (cfg.verify && !SSL_set1_host(ssl, cfg.sni.c_str()))))) {
++            SSL_free(ssl); BIO_free(wire);
++            throw std::runtime_error("TLS client configuration failed");
++        }
++        if (cfg.resumption) {
++            auto session = context->take_session();
++            if (session) {
++                offered_session = SSL_set_session(ssl, session) == 1;
++                SSL_SESSION_free(session);
++                if (!offered_session) ERR_clear_error(); // Full handshake fallback.
++            }
++        }
++    }
++}
++Flow::~Flow() {
++    astf_cost::Probe cost_probe(context->config.server ? astf_cost::FLOW_FREE_S : astf_cost::FLOW_FREE_C);
++    // Only successful, cleanly closed connections seed future handshakes.
++    // An incomplete/failed connection never publishes its tentative ticket.
++    if (candidate && validated && !bad && closed && close_sent) {
++        context->cache_session(candidate);
++        candidate = nullptr;
++    }
++    SSL_SESSION_free(candidate);
++    // SSL owns its BIO reference. Keep a separate reference across SSL_free;
++    // the fresh SSL on the next connection owns no previous TLS state.
++    BIO *internal = SSL_get_rbio(ssl);
++    bool retain = context->library && BIO_up_ref(internal) == 1;
++    SSL_free(ssl);
++    if (retain) context->library->keep_transport(context->config.bio_capacity, internal, wire);
++    else BIO_free(wire);
++}
++int Flow::result(int rc) {
++    if (rc > 0) return SSL_ERROR_NONE;
++    int e=SSL_get_error(ssl, rc);
++    if (e == SSL_ERROR_ZERO_RETURN) closed=true;
++    else if (e != SSL_ERROR_WANT_READ && e != SSL_ERROR_WANT_WRITE && !bad) {
++        // Capture the first failure before another flow clears the thread-local
++        // error queue. Fixed-size numeric fields only; no hot-path formatting.
++        bad = true;
++        last_ssl_error = e;
++        last_openssl_error = ERR_peek_last_error();
++        last_verify_error = SSL_get_verify_result(ssl);
++        failure_kind = Failure::PROTOCOL;
++        // Before a session exists AWS-LC returns X509_V_ERR_INVALID_CALL,
++        // even for unrelated protocol failures. Classify local verification
++        // by its SSL reason, not by an unavailable X509 result.
++        const bool ssl_error = ERR_GET_LIB(last_openssl_error) == ERR_LIB_SSL;
++        const int reason = ERR_GET_REASON(last_openssl_error);
++        if (ssl_error && reason == SSL_R_CERTIFICATE_VERIFY_FAILED)
++            failure_kind = Failure::VERIFY;
++        else if ((ssl_error && reason == SSL_R_UNEXPECTED_EOF_WHILE_READING) ||
++                 (e == SSL_ERROR_SYSCALL && rc == 0 && !last_openssl_error))
++            // Our memory BIO has no OS syscall errors. An empty error queue
++            // with rc==0 is EOF without authenticated close_notify.
++            failure_kind = Failure::TRUNCATED;
++        ERR_clear_error();
++    }
++    return e;
++}
++bool Flow::handshake() {
++    astf_cost::Probe cost_probe(context->config.server ? astf_cost::HANDSHAKE_S : astf_cost::HANDSHAKE_C);
++    if (bad || closed || write_retry_pending()) return false;
++    if (validated) return true;
++    if (!handshake_can_progress()) return false;
++    ERR_clear_error();
++    int rc;
++    {
++        astf_cost::Probe ssl_probe(context->config.server ? astf_cost::HS_SSL_S : astf_cost::HS_SSL_C);
++        // Numeric OpenSSL state at entry. Slot 63 also collects future/unknown states.
++        unsigned slot=0; // Ignored by Probe when diagnostics are disabled.
++        if (auto metrics=astf_cost::current()) {
++            unsigned state=static_cast<unsigned>(SSL_get_state(ssl));
++            slot=(context->config.server ? 64 : 0) + std::min(state, 63u);
++            metrics->state_label(slot, state>=63 ? "other (state >= 63)" : SSL_state_string_long(ssl));
++        }
++        astf_cost::Probe state_probe(static_cast<astf_cost::Metric>(astf_cost::HS_STATE_BASE + slot));
++        rc=SSL_do_handshake(ssl);
++        // AWS-LC buffers TLS 1.3 tickets until a write. Flush before exposing
++        // readiness so receive-only profiles retain resumption semantics.
++        // SSL_write_ex(...,0) short-circuits and does NOT flush in AWS-LC.
++        if (rc==1 && context->config.server && context->config.resumption &&
++            SSL_version(ssl)==TLS1_3_VERSION) {
++            int flushed=SSL_write(ssl,nullptr,0);
++            rc=flushed>=0 ? 1 : flushed;
++        }
++        read_wait = SSL_ERROR_NONE;
++    }
++    {
++        astf_cost::Probe result_probe(context->config.server ? astf_cost::HS_RESULT_S : astf_cost::HS_RESULT_C);
++        int error = result(rc);
++        handshake_wait = (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE) ? error : SSL_ERROR_NONE;
++        if (handshake_wait == SSL_ERROR_WANT_READ && (input_pending() || SSL_has_pending(ssl)))
++            handshake_wait = SSL_ERROR_NONE;
++    }
++    astf_cost::Probe post_probe(context->config.server ? astf_cost::HS_POST_S : astf_cost::HS_POST_C);
++    if (rc == 1 && context->config.alpn == "h2" && negotiated_alpn() != "h2") { bad=true; failure_kind=Failure::POLICY; }
++    if (rc == 1 && !bad && !validated) {
++        validated = true;
++        if (auto metrics=astf_cost::current()) {
++            astf_cost::Negotiation n;
++            n.version=SSL_version(ssl);
++            n.cipher=SSL_CIPHER_get_protocol_id(SSL_get_current_cipher(ssl));
++            n.group=SSL_get_negotiated_group(ssl);
++            const char *group_name=OBJ_nid2sn(n.group);
++            if (group_name) std::strncpy(n.group_name, group_name, sizeof(n.group_name)-1);
++            int signature=0, signature_type=0;
++            // Client observes server signature; server observes its own signature.
++            // AWS-LC exposes the peer signature only. Zero means unavailable
++            // for the server's own signature; never infer it from its key.
++            if (!context->config.server) {
++                SSL_get_peer_signature_nid(ssl, &signature);
++                SSL_get_peer_signature_type_nid(ssl, &signature_type);
++                if (SSL_is_signature_algorithm_rsa_pss(SSL_get_peer_signature_algorithm(ssl)))
++                    signature_type=NID_rsassaPss;
++            }
++            n.signature=signature;
++            n.signature_type=signature_type;
++            metrics->observe(context->config.server, n);
++        }
++        // TLS 1.2 may resume without issuing a replacement ticket. TLS 1.3
++        // candidates come only from new_session, never reuse an offered ticket.
++        if (!context->config.server && context->config.resumption &&
++            SSL_version(ssl) == TLS1_2_VERSION && !candidate)
++            candidate = copy_session(SSL_get_session(ssl));
++    }
++    return rc == 1 && !bad;
++}
++// Framing is a scheduling hint only. AWS-LC still authenticates and
++// validates every record. Malformed headers immediately restore eager reads.
++void Flow::note_input(const uint8_t *data, size_t len) {
++    if (!framing_valid) { fed_bytes += len; return; }
++    while (len) {
++        if (header_used < 5) {
++            size_t n = std::min<size_t>(5-header_used, len);
++            std::memcpy(record_header+header_used, data, n);
++            header_used += n; fed_bytes += n; data += n; len -= n;
++            if (header_used < 5) return;
++            record_left = (uint32_t(record_header[3]) << 8) | record_header[4];
++            if (record_header[0] < 20 || record_header[0] > 24 ||
++                record_header[1] != 3 || record_left >
++                    (context->config.version == "1.3" ? 16640u : 18432u)) {
++                framing_valid = false; fed_bytes += len; return;
++            }
++        }
++        size_t n = std::min<size_t>(record_left, len);
++        record_left -= n; fed_bytes += n; data += n; len -= n;
++        if (!record_left) { complete_end = fed_bytes; header_used = 0; }
++    }
++}
++void Flow::enable_rx_timestamps() {
++    rx_times.reset(new astf_rx::Queue());
++    SSL_set_msg_callback(ssl,record_message);
++    SSL_set_msg_callback_arg(ssl,this);
++}
++void Flow::record_message(int writing,int,int type,const void *data,size_t len,SSL *,void *owner) {
++    if(writing || type!=SSL3_RT_HEADER || len!=5)return;
++    auto &f=*static_cast<Flow *>(owner);
++    auto h=static_cast<const uint8_t *>(data);
++    // AWS-LC emits this only once a complete record is available, before
++    // authentication. Its time is published only when SSL_read succeeds.
++    if(!f.rx_times->consume(5+((size_t(h[3])<<8)|h[4]),f.record_time)) {
++        f.bad=true;f.failure_kind=Failure::RESOURCE;
++    }
++}
++size_t Flow::feed(const void *data, size_t len, astf_rx::Stamp time) {
++    astf_cost::Probe cost_probe(context->config.server ? astf_cost::FEED_S : astf_cost::FEED_C);
++    size_t n=0;
++    if (!bad && len) BIO_write_ex(wire, data, len, &n);
++    if (n) {
++        if(rx_times) {
++            try {rx_times->append(n,time);}
++            catch(const std::bad_alloc &) {bad=true;failure_kind=Failure::RESOURCE;}
++        }
++        note_input(static_cast<const uint8_t *>(data), n);
++    }
++    if (n && read_wait == SSL_ERROR_WANT_READ &&
++        (!coalesce_rx || !validated || complete_input() ||
++         input_pending() >= context->config.bio_capacity)) read_wait = SSL_ERROR_NONE;
++    if (n && handshake_wait == SSL_ERROR_WANT_READ) handshake_wait = SSL_ERROR_NONE;
++    cost_probe.bytes(n);
++    return n;
++}
++size_t Flow::drain(void *data, size_t len) {
++    size_t n=0; BIO_read_ex(wire,data,len,&n);
++    if (n && read_wait == SSL_ERROR_WANT_WRITE) read_wait = SSL_ERROR_NONE;
++    if (n && handshake_wait == SSL_ERROR_WANT_WRITE) handshake_wait = SSL_ERROR_NONE;
++    return n;
++}
++size_t Flow::peek(const uint8_t **data) {
++    return transport::peek(wire,data);
++}
++void Flow::consume(size_t len) {
++    size_t n=transport::consume(wire,len);
++    if (n > 0 && read_wait == SSL_ERROR_WANT_WRITE) read_wait = SSL_ERROR_NONE;
++    if (n > 0 && handshake_wait == SSL_ERROR_WANT_WRITE) handshake_wait = SSL_ERROR_NONE;
++}
++size_t Flow::read(void *data, size_t len) {
++    astf_cost::Probe cost_probe(context->config.server ? astf_cost::READ_S : astf_cost::READ_C);
++    // WANT_WRITE from a pending write still fences reads. WANT_READ from a
++    // write permits reads, including TLS 1.3 post-handshake processing.
++    if (!read_can_progress()) return 0;
++    size_t n=0;
++    ERR_clear_error();
++    int rc=SSL_read_ex(ssl,data,len,&n);
++    if(bad)return 0;
++    handshake_wait = SSL_ERROR_NONE;
++    int error=result(rc);
++    read_wait = (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE) ? error : SSL_ERROR_NONE;
++    // WANT_READ may follow a control record while read-ahead/BIO data remains
++    // (notably when AUTO_RETRY is disabled). Never gate such buffered work.
++    if (read_wait == SSL_ERROR_WANT_READ &&
++        (coalesce_rx && validated ? (complete_input() || SSL_pending(ssl)) :
++                                   (input_pending() || SSL_has_pending(ssl))))
++        read_wait = SSL_ERROR_NONE;
++    cost_probe.bytes(n);
++    return n;
++}
++size_t Flow::write(const void *data, size_t len) {
++    astf_cost::Probe cost_probe(context->config.server ? astf_cost::WRITE_S : astf_cost::WRITE_C);
++    if (!can_write()) return 0;
++    if (write_retry_pending() && (data != write_data || len != write_len)) {
++        bad = true;
++        failure_kind = Failure::APPLICATION;
++        return 0;
++    }
++    size_t n = 0;
++    ERR_clear_error();
++    int rc = SSL_write_ex(ssl, data, len, &n);
++    handshake_wait = SSL_ERROR_NONE;
++    read_wait = SSL_ERROR_NONE;
++    int error = result(rc);
++    if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE) {
++        write_data = data;
++        write_len = len;
++        write_retry = error;
++    } else {
++        write_data = nullptr;
++        write_len = 0;
++        write_retry = SSL_ERROR_NONE;
++    }
++    cost_probe.bytes(rc == 1 ? n : 0);
++    return rc == 1 ? n : 0;
++}
++void Flow::shutdown() {
++    astf_cost::Probe cost_probe(context->config.server ? astf_cost::SHUTDOWN_S : astf_cost::SHUTDOWN_C);
++    if (bad || sent_close() || write_retry_pending()) return;
++    ERR_clear_error();
++    int rc=SSL_shutdown(ssl);
++    handshake_wait = SSL_ERROR_NONE;
++    read_wait = SSL_ERROR_NONE;
++    if (rc<0) result(rc);
++    else close_sent=true; // SSL_SENT_SHUTDOWN alone is set even on WANT_WRITE.
++}
++void Flow::eof() { (void)BIO_shutdown_wr(wire); read_wait = handshake_wait = SSL_ERROR_NONE; }
++std::string Flow::negotiated_alpn() const {
++    const unsigned char *p=nullptr; unsigned n=0;
++    SSL_get0_alpn_selected(ssl,&p,&n);
++    return n ? std::string(reinterpret_cast<const char *>(p),n) : std::string();
++}
++}
++#endif
+diff --git a/src/44bsd/tls/astf_tls.h b/src/44bsd/tls/astf_tls.h
+new file mode 100644
+--- /dev/null
++++ b/src/44bsd/tls/astf_tls.h
+@@ -0,0 +1,192 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++#ifndef TREX_ASTF_TLS_H
++#define TREX_ASTF_TLS_H
++#include "../rx_timestamp.h"
++#ifdef TREX_TLS
++#include <openssl/ssl.h>
++#ifndef OPENSSL_IS_AWSLC
++#error Native ASTF TLS requires AWS-LC
++#endif
++#include <memory>
++#include <string>
++#include <vector>
++#include <cstdint>
++#include <array>
++#include <atomic>
++#include <map>
++#include <thread>
++
++namespace astf_tls {
++using TicketMac = HMAC_CTX;
++const char *backend_name();
++const char *backend_version();
++enum class Failure : uint8_t { NONE, PROTOCOL, VERIFY, TRUNCATED, POLICY, RESOURCE, TRANSPORT, APPLICATION };
++
++struct Config {
++    size_t bio_capacity = 65536; // C++ transport/test tuning; not a profile option
++    uint16_t pump_budget = 64; // C++ adapter/test knob; bounded work per poll callback
++    uint32_t handshake_timeout_ms = 10000, close_timeout_ms = 10000;
++    bool resumption = false;
++    uint32_t session_timeout = 300; // seconds; also bounds the client cache
++    bool server = false;
++    bool verify = true;
++    bool require_client_cert = false; // Server-side mandatory mTLS authentication.
++    std::vector<std::string> groups, signature_algorithms;
++    std::string cipher_suite; // Optional single certificate cipher for the selected TLS version.
++    std::string version = "1.3", sni, cert, key, ca, alpn = "http/1.1";
++    std::string psk_identity, psk_hex;
++};
++// Created, used and destroyed on a single DP thread. Multiple profiles and
++// client/server contexts on that thread can share this runtime.
++class Library {
++public:
++    static std::shared_ptr<Library> local();
++    Library();
++    ~Library();
++    Library(const Library &) = delete;
++    Library &operator=(const Library &) = delete;
++private:
++    friend class Flow;
++    bool take_transport(size_t capacity, BIO **internal, BIO **wire);
++    void keep_transport(size_t capacity, BIO *internal, BIO *wire);
++    struct Transport { size_t capacity = 0; BIO *internal = nullptr, *wire = nullptr; };
++    // One bounded cache per worker, shared by its programs, never across threads.
++    std::array<Transport, 8> transports;
++    std::thread::id owner;
++};
++struct TicketKeys;
++class Context {
++public:
++    explicit Context(const Config &config);
++    ~Context();
++    Context(const Context &) = delete;
++    Context &operator=(const Context &) = delete;
++    SSL_CTX *ctx = nullptr;
++    const Config config;
++    const std::shared_ptr<Library> library;
++    std::shared_ptr<Context> clone_for_worker(const std::shared_ptr<Library> &runtime) const;
++    // Ownership transfers on put/take. SSL_SESSION objects are never mutated
++    // while cached. One context can be shared by several DP threads.
++    void cache_session(SSL_SESSION *session);
++    SSL_SESSION *take_session();
++private:
++    Context(const Config &config, std::shared_ptr<Library> runtime,
++            std::shared_ptr<const TicketKeys> tickets);
++    static int ticket(SSL *, unsigned char *, unsigned char *, EVP_CIPHER_CTX *, TicketMac *, int);
++    std::shared_ptr<const TicketKeys> ticket_keys;
++    const EVP_CIPHER *ticket_cipher = nullptr;
++    std::array<std::atomic<SSL_SESSION *>, 32> sessions;
++    std::atomic<unsigned> next_slot{0};
++};
++// Profile-owned lookup, prepared before the first flow. No lazy construction
++// in production packet processing. Keys refer to immutable program contexts.
++class WorkerContexts {
++public:
++    void prepare(const std::vector<std::shared_ptr<Context>> &programs);
++    void prepare_one(const std::shared_ptr<Context> &program);
++    std::shared_ptr<Context> get(const Context *program) const { return contexts.at(program); }
++    void clear() { contexts.clear(); }
++private:
++    std::map<const Context *, std::shared_ptr<Context>> contexts;
++};
++/* A flow is owned and driven exclusively by its ASTF DP thread. No socket BIO,
++ * worker thread, blocking I/O, or user callbacks inside OpenSSL. */
++class Flow {
++public:
++    explicit Flow(std::shared_ptr<Context> context);
++    ~Flow();
++    Flow(const Flow &) = delete;
++    Flow &operator=(const Flow &) = delete;
++    bool handshake();
++    bool handshake_can_progress() const {
++        return !validated && !bad && !closed && !write_retry_pending() && handshake_wait == SSL_ERROR_NONE;
++    }
++    // Disable for TCP windows smaller than a
++    // maximum ciphertext record; those must drain partial records for credit.
++    void coalesce_reads(bool enabled) {
++        if (coalesce_rx && !enabled && read_wait == SSL_ERROR_WANT_READ)
++            read_wait = SSL_ERROR_NONE;
++        coalesce_rx = enabled;
++    }
++    size_t feed(const void *data, size_t len, astf_rx::Stamp time=astf_rx::Stamp());
++    void enable_rx_timestamps();
++    astf_rx::Stamp plaintext_time() const {return record_time;}
++    size_t drain(void *data, size_t len);
++    size_t peek(const uint8_t **data);
++    void consume(size_t len);
++    size_t read(void *data, size_t len);
++    // A WANT result is a dependency, not a request to poll SSL repeatedly.
++    // feed/eof, output release and other SSL operations invalidate this latch.
++    bool read_can_progress() const {
++        return !bad && !closed && !write_blocks_read() && read_wait == SSL_ERROR_NONE;
++    }
++    size_t write(const void *data, size_t len);
++    bool write_retry_pending() const { return write_retry != SSL_ERROR_NONE; }
++    bool write_blocks_read() const { return write_retry == SSL_ERROR_WANT_WRITE; }
++    void shutdown();
++    void eof();
++    void discard_session() { SSL_SESSION_free(candidate); candidate = nullptr; }
++    bool resume_attempted() const { return offered_session; }
++    bool resumed() const { return validated && SSL_session_reused(ssl); }
++    uint16_t negotiated_version() const { return ready() ? SSL_version(ssl) : 0; }
++    uint16_t negotiated_cipher() const {
++        return ready() ? SSL_CIPHER_get_protocol_id(SSL_get_current_cipher(ssl)) : 0;
++    }
++    uint16_t negotiated_group() const {
++        // TLS 1.2 resumption has no fresh key exchange.
++        return ready() && !(resumed() && SSL_version(ssl)==TLS1_2_VERSION) ? SSL_get_group_id(ssl) : 0;
++    }
++    uint16_t peer_signature() const {
++        // Resumption does not authenticate via a new CertificateVerify signature.
++        return ready() && !resumed() ? SSL_get_peer_signature_algorithm(ssl) : 0;
++    }
++    // Include final handshake output and our authentication/ALPN policy checks.
++    bool ready() const { return validated; }
++    bool failed() const { return bad; }
++    Failure failure() const { return failure_kind; }
++    int ssl_error() const { return last_ssl_error; }
++    unsigned long openssl_error() const { return last_openssl_error; }
++    long verify_error() const { return last_verify_error; }
++    bool peer_closed() const { return closed; }
++    bool sent_close() const { return close_sent; }
++    bool can_write() const {
++        return !bad && !(SSL_get_shutdown(ssl) & SSL_SENT_SHUTDOWN) &&
++               (!closed || SSL_version(ssl) == TLS1_3_VERSION);
++    }
++    size_t input_pending() const { return BIO_ctrl_pending(SSL_get_rbio(ssl)); }
++    size_t pending() const { return BIO_ctrl_pending(wire); }
++    std::string negotiated_alpn() const;
++private:
++    friend class Context;
++    std::unique_ptr<astf_rx::Queue> rx_times;
++    astf_rx::Stamp record_time;
++    static void record_message(int,int,int,const void *,size_t,SSL *,void *);
++    void note_input(const uint8_t *data, size_t len);
++    bool complete_input() const {
++        return !framing_valid || complete_end > fed_bytes - input_pending();
++    }
++    bool coalesce_rx = false, framing_valid = true;
++    uint64_t fed_bytes = 0, complete_end = 0;
++    uint32_t record_left = 0;
++    uint8_t record_header[5] = {}, header_used = 0;
++    static int new_session(SSL *ssl, SSL_SESSION *session);
++    int result(int rc);
++    std::shared_ptr<Context> context;
++    SSL *ssl = nullptr;
++    BIO *wire = nullptr;
++    SSL_SESSION *candidate = nullptr;
++    bool offered_session = false, validated = false;
++    bool bad = false, closed = false, close_sent = false;
++    Failure failure_kind = Failure::NONE;
++    const void *write_data = nullptr;
++    size_t write_len = 0;
++    int write_retry = SSL_ERROR_NONE;
++    int read_wait = SSL_ERROR_NONE;
++    int handshake_wait = SSL_ERROR_NONE;
++    int last_ssl_error = SSL_ERROR_NONE;
++    unsigned long last_openssl_error = 0;
++    long last_verify_error = X509_V_OK;
++};
++}
++#endif
++#endif
+diff --git a/src/44bsd/tls/astf_tls_bio.h b/src/44bsd/tls/astf_tls_bio.h
+new file mode 100644
+--- /dev/null
++++ b/src/44bsd/tls/astf_tls_bio.h
+@@ -0,0 +1,115 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++#ifndef TREX_ASTF_TLS_BIO_H
++#define TREX_ASTF_TLS_BIO_H
++// AWS-LC does not expose OpenSSL's BIO_nread or BIO_make_bio_pair. This
++// worker-owned bounded transport preserves peek/consume without another copy.
++#include <openssl/bio.h>
++#include <algorithm>
++#include <cstring>
++#include <memory>
++#include <vector>
++namespace astf_tls { namespace transport {
++struct Ring {
++    std::vector<unsigned char> bytes;
++    size_t head=0, size=0;
++    bool eof=false;
++    explicit Ring(size_t capacity): bytes(capacity) {}
++    void reset() { head=size=0; eof=false; }
++};
++struct Pair {
++    Ring rings[2];
++    explicit Pair(size_t capacity): rings{Ring(capacity),Ring(capacity)} {}
++};
++struct End {
++    std::shared_ptr<Pair> pair;
++    unsigned index;
++    Ring &input() { return pair->rings[index]; }
++    Ring &output() { return pair->rings[1-index]; }
++};
++inline End *end(BIO *b) { return static_cast<End *>(BIO_get_data(b)); }
++// head < capacity and count <= capacity: at most one wrap, including
++// non-power-of-two capacities. Avoid a variable integer division per BIO call.
++inline size_t advance(size_t head, size_t count, size_t capacity) {
++    size_t next = head + count;
++    return next >= capacity ? next - capacity : next;
++}
++inline int read(BIO *b, char *data, int len) {
++    BIO_clear_retry_flags(b);
++    if (!data || len<=0) return 0;
++    auto &r=end(b)->input();
++    size_t n=std::min(size_t(len),r.size);
++    if (!n) { if (r.eof) return 0; BIO_set_retry_read(b); return -1; }
++    size_t first=std::min(n,r.bytes.size()-r.head);
++    std::memcpy(data,r.bytes.data()+r.head,first);
++    if (n>first) std::memcpy(data+first,r.bytes.data(),n-first);
++    r.head=advance(r.head,n,r.bytes.size()); r.size-=n;
++    return int(n);
++}
++inline int write(BIO *b, const char *data, int len) {
++    BIO_clear_retry_flags(b);
++    if (!data || len<=0) return 0;
++    auto &r=end(b)->output();
++    if (r.eof) return -1;
++    size_t n=std::min(size_t(len),r.bytes.size()-r.size);
++    if (!n) { BIO_set_retry_write(b); return -1; }
++    size_t tail=advance(r.head,r.size,r.bytes.size());
++    size_t first=std::min(n,r.bytes.size()-tail);
++    std::memcpy(r.bytes.data()+tail,data,first);
++    if (n>first) std::memcpy(r.bytes.data(),data+first,n-first);
++    r.size+=n; return int(n);
++}
++inline long ctrl(BIO *b, int cmd, long, void *) {
++    auto e=end(b);
++    switch (cmd) {
++    case BIO_CTRL_PENDING: return e->input().size;
++    case BIO_CTRL_WPENDING: return e->output().size;
++    case BIO_CTRL_EOF: return e->input().eof && !e->input().size;
++    case BIO_CTRL_FLUSH: return 1;
++    case BIO_C_SHUTDOWN_WR: e->output().eof=true; return 1;
++    default: return 0;
++    }
++}
++inline int destroy(BIO *b) {
++    delete end(b); BIO_set_data(b,nullptr); return 1;
++}
++inline const BIO_METHOD *method() {
++    struct Method {
++        BIO_METHOD *value;
++        Method(): value(BIO_meth_new(BIO_TYPE_SOURCE_SINK,"ASTF bounded TLS transport")) {
++            if (value && !(BIO_meth_set_read(value,read) && BIO_meth_set_write(value,write) &&
++                           BIO_meth_set_ctrl(value,ctrl) && BIO_meth_set_destroy(value,destroy))) {
++                BIO_meth_free(value); value=nullptr;
++            }
++        }
++        ~Method() { BIO_meth_free(value); }
++    };
++    static const Method m;
++    return m.value;
++}
++inline int create(BIO **a, size_t capacity, BIO **b, size_t other) noexcept {
++    *a=*b=nullptr;
++    if (!capacity || capacity!=other || !method()) return 0;
++    try {
++        auto pair=std::make_shared<Pair>(capacity);
++        std::unique_ptr<End> x(new End{pair,0}), y(new End{pair,1});
++        *a=BIO_new(method()); *b=BIO_new(method());
++        if (!*a || !*b) { BIO_free(*a); BIO_free(*b); *a=*b=nullptr; return 0; }
++        BIO_set_data(*a,x.release()); BIO_set_init(*a,1);
++        BIO_set_data(*b,y.release()); BIO_set_init(*b,1);
++        return 1;
++    } catch (...) { return 0; }
++}
++inline void reset(BIO *a, BIO *b) {
++    end(a)->pair->rings[0].reset(); end(a)->pair->rings[1].reset();
++    BIO_clear_retry_flags(a); BIO_clear_retry_flags(b);
++}
++inline size_t peek(BIO *b, const uint8_t **data) {
++    auto &r=end(b)->input(); *data=r.bytes.data()+r.head;
++    return std::min(r.size,r.bytes.size()-r.head);
++}
++inline size_t consume(BIO *b, size_t len) {
++    auto &r=end(b)->input(); size_t n=std::min(len,r.size);
++    r.head=advance(r.head,n,r.bytes.size()); r.size-=n; return n;
++}
++}}
++#endif
+diff --git a/src/44bsd/tls/astf_tls_mbuf.h b/src/44bsd/tls/astf_tls_mbuf.h
+new file mode 100644
+--- /dev/null
++++ b/src/44bsd/tls/astf_tls_mbuf.h
+@@ -0,0 +1,25 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++#ifndef TREX_ASTF_TLS_MBUF_H
++#define TREX_ASTF_TLS_MBUF_H
++#include "trex_global.h"
++namespace astf_tls {
++// Keep allocation failure local to the TLS flow, including the small pool.
++// The ordinary TCP allocator is fatal on exhaustion and must not be used here.
++inline rte_mbuf_t *alloc_mbuf(uint8_t socket, uint16_t size) {
++    return CGlobalInfo::pktmbuf_alloc_no_assert(socket, size);
++}
++// RX rings use the 2K or 9K pool. Dynamic HTTP/2 TX must not drain either
++// through the generic allocator's fallback chain: TCP ACK/RX needs to keep
++// running to release queued output. The 4K pool is shared with other TX users;
++// exhaustion is backpressure, never a fallback into the RX reserve.
++inline rte_mbuf_t *alloc_h2_mbuf(uint8_t socket, uint16_t size=4096) {
++#ifdef TREX_SIM
++    return CGlobalInfo::pktmbuf_alloc_no_assert(socket,size);
++#else
++    // Small control frames use their exact small pool, never the 64B TCP
++    // header pool. Large payloads skip 2K and use 4K without RX fallback.
++    return rte_pktmbuf_alloc(CGlobalInfo::pktmbuf_get_pool(socket,size<=1024 ? size : 4096));
++#endif
++}
++}
++#endif
+diff --git a/src/44bsd/tls/astf_tls_metadata.h b/src/44bsd/tls/astf_tls_metadata.h
+new file mode 100644
+--- /dev/null
++++ b/src/44bsd/tls/astf_tls_metadata.h
+@@ -0,0 +1,24 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++#ifndef TREX_TLS_METADATA_H
++#define TREX_TLS_METADATA_H
++#include <cstdint>
++#include <cstddef>
++namespace astf_tls {
++struct Parameter { uint16_t id; const char *name; };
++static const Parameter versions[]={{0x0303,"tls12"},{0x0304,"tls13"}};
++static const Parameter ciphers[]={
++    {0x1301,"tls_aes_128_gcm_sha256"},{0x1302,"tls_aes_256_gcm_sha384"},{0x1303,"tls_chacha20_poly1305_sha256"},
++    {0xc02b,"ecdhe_ecdsa_aes128_gcm_sha256"},{0xc02c,"ecdhe_ecdsa_aes256_gcm_sha384"},
++    {0xc02f,"ecdhe_rsa_aes128_gcm_sha256"},{0xc030,"ecdhe_rsa_aes256_gcm_sha384"},
++    {0xcca8,"ecdhe_rsa_chacha20_poly1305"},{0xcca9,"ecdhe_ecdsa_chacha20_poly1305"}};
++static const Parameter groups[]={{0,"none"},{29,"x25519"},{23,"p256"},{24,"p384"},{25,"p521"}};
++static const Parameter signatures[]={
++    {0,"none"},{0x0403,"ecdsa_secp256r1_sha256"},{0x0503,"ecdsa_secp384r1_sha384"},{0x0603,"ecdsa_secp521r1_sha512"},
++    {0x0804,"rsa_pss_rsae_sha256"},{0x0805,"rsa_pss_rsae_sha384"},{0x0806,"rsa_pss_rsae_sha512"},
++    {0x0807,"ed25519"},{0x0401,"rsa_pkcs1_sha256"},{0x0501,"rsa_pkcs1_sha384"},{0x0601,"rsa_pkcs1_sha512"}};
++template<size_t N> inline unsigned parameter_index(const Parameter (&p)[N], uint16_t id) {
++    for (unsigned i=0;i<N;++i) if (p[i].id==id) return i;
++    return N; // explicit unknown bucket, never silently map to configured policy
++}
++}
++#endif

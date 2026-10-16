@@ -1,0 +1,1800 @@
+diff --git a/doc/astf-aws-lc.md b/doc/astf-aws-lc.md
+new file mode 100644
+--- /dev/null
++++ b/doc/astf-aws-lc.md
+@@ -0,0 +1,12 @@
++# AWS-LC integration
++
++AWS-LC is the sole TLS backend. Use the unmodified AWS-LC 5.11.0 dependency
++and shared libraries described in the repository's getting-started guide.
++The extension does not require a vendor-library patch.
++
++TLS operations execute synchronously on the ASTF DP worker that owns the flow.
++Contexts and session state follow worker ownership; no shared crypto worker pool
++or hardware accelerator is required. Full handshakes consume poll-mode CPU time.
++
++See [build dependencies](astf-build-dependencies.md),
++[TLS policy](astf-tls-policy.md) and [validation](astf-tls-validation.md).
+diff --git a/doc/astf-cost-metrics.md b/doc/astf-cost-metrics.md
+new file mode 100644
+--- /dev/null
++++ b/doc/astf-cost-metrics.md
+@@ -0,0 +1,105 @@
++# Sampled ASTF/TLS C++ cost metrics
++
++No perf, external process, network proxy or change to TLS/TCP scheduling is
++introduced. TLS-enabled realtime ASTF exposes per-DP counters through
++`get_util_stats()['cpu'][i]['tls_cost']`. The existing text diagnostics runner
++already captures this object in stats.jsonl and stats.csv. Rebuild TRex; no
++profile or Python collector changes are needed.
++
++## Configuration
++
++Set `TREX_ASTF_COST_SHIFT` in the TRex server environment **before startup**:
++
++- unset or `8`: approximately 1/256 calls timed, the default;
++- `10`: approximately 1/1024 calls timed;
++- `off`: disable counts and timing, for an overhead control run;
++- `0`: every call timed, for small functional tests, not a load-test default.
++
++Accepted numeric range is 0..20. Invalid values disable collection and report
++`config_valid=false`; verify `enabled`, `config_valid` and `sample_shift` in
++the collected RPC data. No RPC changes configuration at runtime. This env
++setting is unrelated to sched_max_stretch; preserve the same scheduler
++configuration for comparisons. Both client and server TLS work run here.
++
++## Meaning and scope
++
++Counters live as long as the DP instance, aggregate all profiles on that DP,
++and are not reset by clearing traffic statistics. Use baseline/end deltas.
++Only work inside the realtime ASTF scheduler invocation is bound to counters.
++Profile preparation, SSL_CTX/provider setup, cleanup outside that scheduler,
++and simulator operations without an explicit binding are excluded. Calls
++ending by exception are counted; failed/no-op calls are also included.
++
++`calls` counts completed wrapper invocations, not TLS sessions or records.
++`bytes` counts successful bytes (definition below). These two counters cover
++all observed calls when enabled. A per-category/per-worker xorshift PRNG
++selects timed calls, avoiding deterministic every-Nth-call phase locking.
++No heap allocation, mutex, or locked atomic RMW is used in probes. CP readers
++use independent atomic loads: a concurrent snapshot is not transactional.
++
++Time is `steady_clock_elapsed_ns`, not CPU cycles or thread CPU time. It
++includes preemption, wrapper logic and library-context switching. Network
++waiting between separate calls is excluded. No timestamp is read for an
++unsampled invocation. Probe overhead is nonzero; measure it with an off/on
++comparison before drawing conclusions from small changes.
++
++Fields for each metric:
++
++- `calls`, `bytes`: cumulative totals for all observed calls;
++- `samples`: cumulative timed invocations;
++- `sampled_ns`: sum of their measured elapsed durations;
++- `max_sampled_ns`: lifetime maximum among samples, **not a maximum of all
++  calls**, and not a counter to subtract;
++- `histogram_log2_ns`: sparse cumulative histogram, missing bins mean zero.
++  Bin 0 covers [0,2) ns, bin b=1..30 covers [2^b,2^(b+1)) ns; bin 31 covers
++  [2^31,infinity). Subtract per-bin baselines for interval distributions.
++
++For an interval with unchanged sample_shift and enough samples:
++`mean_ns_per_call ~= delta(sampled_ns)/delta(samples)`;
++`estimated_total_ns ~= delta(sampled_ns) * 2^sample_shift`.
++No samples means unknown, not zero cost. Sampling uncertainty and long-tail
++outliers matter. Maxima and quantiles cannot be reconstructed exactly.
++The sample mean is per **wrapper invocation**, not full-handshake latency.
++Use existing successful handshake counts and resumption counters separately.
++
++## Categories and nesting
++
++| Metric | Measured region / bytes |
++| --- | --- |
++| flow_create_client/server | Flow constructor body: SSL_new, BIO pair, configuration, session lookup; excludes C++ member initialization / outer operator new; bytes=0 |
++| flow_free_client/server | Flow destructor body: session handling, SSL_free, BIO_free; excludes C++ member destruction / outer operator delete; bytes=0 |
++| handshake_client/server | Entire Flow::handshake wrapper, includes SSL_do_handshake, validation and LibraryScope; bytes=0 |
++| read_client/server | Entire Flow::read; bytes = returned plaintext |
++| write_client/server | Entire Flow::write including retry handling; bytes = accepted plaintext |
++| feed_client/server | Ciphertext input into BIO; bytes = accepted ciphertext |
++| shutdown_client/server | Entire Flow::shutdown wrapper; bytes=0 |
++| wire_copy | tls_copy_wire, includes buffer creation, mbuf allocation and memcpy; bytes = ciphertext in successfully completed calls |
++| mbuf_alloc | TLS adapter tls_alloc_wire, includes failed allocation attempts; bytes = requested capacity for successful allocations; not all TRex allocations |
++| app_create | Outer new CEmulAppTls and context lookup; includes flow_create; bytes=0 |
++| app_free | delete CEmulAppTls; includes flow_free and member destruction; bytes=0 |
++| pump | Non-reentrant tls_pump body; includes many of the above; bytes=0 |
++| rx_batch | handle_rx_pkts implementation; includes packet processing, pump, possibly flow creation, TCP and RX/LRO work; bytes=0 |
++
++**Inclusive regions overlap. Never sum all rows as total CPU consumption.**
++In particular, rx_batch/pump, app_create/flow_create, app_free/flow_free and
++wire_copy/mbuf_alloc overlap. Independently sampled parent/child measurements
++are noisy: subtracting them is not exact exclusive timing. The remainder of
++TCP TX, timers and scheduler work is not separately instrumented here.
++BIO output peek/consume, RX reassembly allocations, generic heap allocations
++and memcpy inside OpenSSL do not have standalone counters. These metrics
++localize broad costs; they do not identify individual RSA/AES/malloc internals.
++
++## Measurement procedure
++
++Use the same 32 local DP cores, full-handshake profile, 20000 multiplier and
++300 second duration. Start the rebuilt server normally (default shift=8), then
++run the existing tcp_https_16KB.py text collector. Send its ZIP; no perf.data
++is produced. Check final flow/byte conservation and errors before interpreting
++costs. A second server restart with shift=off and identical traffic gives an
++overhead control. Do not compare different offered loads as an overhead test.
++
++The feature is diagnostic, not a throughput optimization or a guarantee of
++100G. Leave off in routine production runs if instrumentation is not needed.
++Use tests/tls/cost_metrics_test.cpp for correctness and cost_metrics_bench.cpp
++for an isolated probe benchmark. A microbenchmark, especially under emulation,
++does not establish datapath overhead on a physical NIC.
+diff --git a/doc/astf-error-drain.md b/doc/astf-error-drain.md
+new file mode 100644
+--- /dev/null
++++ b/doc/astf-error-drain.md
+@@ -0,0 +1,14 @@
++# HTTP/2 GOAWAY and TLS fatal-alert completion
++
++HTTP/2 clients stop submitting requests after GOAWAY(NO_ERROR), but allow streams accepted by the peer (through last_stream_id) to finish. nghttp2 closes higher stream IDs with REFUSED_STREAM; the adapter preserves remaining accepted responses. Missing or refused requests still make the profile unsuccessful once accepted streams finish. GOAWAY with a nonzero error code remains an immediate error. This behavior applies to cleartext HTTP/2 and HTTP/2 over TLS.
++
++When a failed TLS operation leaves ciphertext in the output BIO, the adapter enters an error-drain phase. It reports the original TLS error once, stops application/handshake timers, discards retained receive buffers and sends already-generated output through the existing bounded TCP/mbuf queue. It does not resume TLS or application processing. TCP acknowledgements release output and resume the drain; after all output is acknowledged the adapter disconnects. A peer TCP reset also ends the flow normally through the existing abort path.
++
++The existing close_timeout_ms bounds error draining, including a peer with a zero TCP window or missing acknowledgements. Allocation failure aborts the drain immediately. No new profile options, counters or dependencies are introduced. close-timeout diagnostics use the existing tcps_tls_close_timeouts counter; the original TLS error is not counted twice. A failed flow cannot publish a resumable session.
++
++Regression coverage:
++
++- tests/tls/run_http2_engine_tests.sh: fragmented/repeated GOAWAY, accepted responses, refused streams, unsubmitted requests, and nonzero error codes, for secure and cleartext configurations.
++- gt_tcp.native_tls_fatal_alert_wire: real TCP adapter, TLS 1.2/1.3, delivery of fatal unrecognized_name, zero-window deadline and exhausted output-mbuf allocator.
++
++The changes are error-path corrections, not throughput optimizations.
+diff --git a/doc/astf-handshake-cost.md b/doc/astf-handshake-cost.md
+new file mode 100644
+--- /dev/null
++++ b/doc/astf-handshake-cost.md
+@@ -0,0 +1,102 @@
++# Handshake cost diagnostics, schema 2
++
++AWS-LC implementation. Diagnostic only: no cipher, verification,
++TCP scheduling, resumption or HTTP workload changes. No proxy and no perf.
++Rebuild TRex after applying; C++ Metrics layout changed. Start with
++`TREX_ASTF_COST_SHIFT=8`; `off` disables all probes and negotiation collection.
++The existing text collector preserves the new fields without Python updates.
++
++## RPC fields
++
++`utilization.cpu[i].tls_cost.schema=2`, with `openssl_runtime` from the actual
++linked library. Metric names are serialized as strings. Available metrics:
++
++* `handshake_ssl_client/server`: SSL_do_handshake block including entry-state
++  selection and instrumentation. Does not include result classification.
++* `handshake_result_client/server`: result(rc), including SSL_get_error handling.
++* `handshake_post_client/server`: policy checks, first-success metadata and
++  session candidate handling.
++* `handshake_state_client/server_N`: same SSL call bucketed by state at entry,
++  with `entry_state` human-readable OpenSSL label. 63 aggregates states >=63.
++  One call can traverse several states. This is NOT per-internal-state time and
++  NOT a separate measurement of RSA, X509 or key exchange. Historical labels
++  like SSLv3/TLS do not identify the negotiated protocol; the early-data state
++  label alone does not mean that 0-RTT application data was sent.
++
++All old sampling/histogram semantics apply. Timing is steady-clock elapsed ns,
++not CPU cycles. Outer wrappers include inner probes and instrumentation costs.
++Do not add nested metrics or subtract independent sampled totals as exact
++exclusive time. Clocks are read only for selected invocations, counts always
++update when enabled. New probes and per-success metadata have nonzero overhead;
++use an off control. Metrics memory grows by roughly tens of KiB per worker,
++not per flow. CP reads only atomics or immutable release-published metadata.
++
++`negotiated.client/server` contains the FIRST successful tuple for that side
++in the DP lifetime, `completed` and `different_from_first` counters. Tuple:
++
++* tls_version_id: protocol version (771=1.2, 772=1.3).
++* cipher_protocol_id: wire cipher suite ID.
++* group_id and group_name: OpenSSL negotiated group; group_id may include
++  OpenSSL's unknown-NID flag and must not be blindly decoded as a NID.
++* signature_digest_nid: signature digest NID, NOT signature type.
++* signature_type_nid: key/signature type NID (e.g. rsassaPss).
++
++Client observes the peer server signature. The server's own signature metadata
++is unavailable in this AWS-LC interface and remains zero. Zero or empty also
++means unavailable in some resumed sessions. The pair of signature
++NIDs is not the exact wire SignatureScheme or its PSS salt parameters. If
++`different_from_first` grows, first tuple does not describe the whole workload.
++Counts and tuple publication are safe across threads, but whole snapshots are
++not transactions. As in schema 1, counters cover realtime scheduler-bound work.
++
++## Standalone benchmark
++
++Stop TRex before running this CPU benchmark: even idle poll-mode workers distort
++results. The tool does not stop or signal TRex and refuses to run while a normal
++TRex process is detected. Make sure other CPU-intensive tests are stopped too.
++
++From TRex repository root:
++
++```sh
++python3 tests/tls/run_handshake_cost.py \
++  --capture /home/user/https-300s-cpp-cost-32cpu.zip \
++  --output /home/user/https-handshake-cost
++```
++
++Uses the supplied capture only as data, never executes profile.py. Infers pinned
++DP CPU IDs and tcp_https_16KB.py defaults/explicit tunables for cert, key, CA,
++SNI and TLS version. Defaults match the distributed throughput profile; override
++arguments if you edited profile defaults locally. Certificate/key must still
++exist on the server; keys are never copied into output. Encrypted keys are not
++supported and do not trigger an interactive password prompt.
++
++Default thread counts: 1, min(15,N), N, deduplicated. Three repeats, three seconds
++per measurement, deterministic shuffled ordering. `--threads`, `--cpus`,
++`--seconds`, `--repeats`, `--cert`, `--key`, `--ca`, `--hostname`, `--version`
++allow explicit control. On Linux without capture, --cpus is required.
++CXX/CXXFLAGS/LDFLAGS select the toolchain/library. Requires AWS-LC development
++headers/libraries (set CXXFLAGS/LDFLAGS as in astf-tls-validation.md) and a C++11 compiler. Existing engine source is compiled without editing.
++Output is a new directory plus ZIP; failures preserve partial text results.
++
++Full mode uses actual Flow engine and worker-owned Library/Context, certificate
++verification, no resumption, memory BIO transfer and orderly shutdown, no
++application payload. Warmup and context setup are outside the measured loop.
++It measures a different transport/call schedule from NIC traffic. Includes
++Flow creation/destruction, not profile context initialization. Per-worker cost
++counters, first negotiation and runtime OpenSSL version are saved. Full mode
++runs shift=8 and off controls. Result `cps` means completed full sessions per second. Only full exchanges
++are supported. This diagnostic benchmark pins RSA-PSS, X25519 and AES-256-GCM;
++provide an RSA certificate/key. It is not an ECDSA or primitive benchmark.
++
++Binary library paths (ldd on Linux) are compared with captured TRex maps,
++canonicalizing symlinks. A mismatch aborts instead of silently comparing different
++libraries. This is a path check, not proof that files have not changed since the
++capture; output includes current library SHA256 and actual runtime version.
++
++## Tests
++
++`handshake_cost_test.py binary cert key ca`: both TLS versions, exact/sampled/off,
++per-worker lifecycle, state call conservation, negotiation and failed
++hostname verification. `handshake_metadata_test.cpp`: immutable tuple/label
++publication with concurrent reader, mismatch counting and metric names.
++Existing engine/protocol/resumption/worker-context tests must remain green.
+diff --git a/doc/astf-http2.md b/doc/astf-http2.md
+new file mode 100644
+--- /dev/null
++++ b/doc/astf-http2.md
+@@ -0,0 +1,230 @@
++# Native HTTP/2 in ASTF
++
++HTTP/2 runs inside each TCP flow on its DP core. TLS is optional: AWS-LC handles encryption when configured; libnghttp2
++handles framing, HPACK, SETTINGS, streams, flow-control windows, PING,
++RST_STREAM and GOAWAY. The codec has no sockets, threads or external processes.
++TLS uses the existing ciphertext queue. Cleartext HTTP/2 writes framed bytes directly to a bounded TCP/DPDK mbuf queue, retaining buffers until ACK.
++Reference: https://nghttp2.org/documentation/programmers-guide.html and RFC 9113.
++
++## Build and example
++
++Install a maintained libnghttp2 development package, including its security
++updates. On Debian/Ubuntu: `apt-get install libnghttp2-dev`. The build checks for
++`nghttp2_option_set_max_continuations`; older unpatched packages without this
++limit are rejected. HTTP/2 is included in --rfc9411 builds, using the same
++AWS-LC prefix. A non-TLS build remains supported and rejects HTTP/2 profiles.
++libnghttp2 is a direct runtime dependency; no nghttpx/nginx/proxy is involved.
++
++Run configure again with your previous options, then rebuild TRex and NIC PMDs.
++For Mellanox, keep the `mlx5-64` target alongside `_t-rex-64`.
++
++```python
++client = ASTFProgram(
++    tls={'sni': 'localhost', 'ca': '/path/ca.pem'},
++    http2={'requests': 10, 'concurrency': 4, 'authority': 'localhost'})
++server = ASTFProgram(side='s',
++    tls={'cert': '/path/server.pem', 'key': '/path/server.key'},
++    http2={'concurrency': 4, 'body_size': 16384})
++```
++
++Use these programs in ordinary ASTF client/server templates. When TLS is configured, ALPN is set to h2; negotiation must actually select h2. TLS 1.2 and TLS 1.3 are supported. Existing
++TLS certificate validation, mTLS and resumption options remain available.
++
++A ready profile is `scripts/astf/https2.py`:
++
++```text
++start -f astf/https2.py -m 1000 -d 60 -t --cert /path/server.pem --key /path/server.key --ca /path/ca.pem --requests 10 --concurrency 4 --body_size 16384
++```
++
++Its MSS defaults to 1440, suitable for IPv6 with MTU 1500 and also usable with
++IPv4. Override using --mss for your topology. The native TRex TCP MSS setting is
++not globally changed by this patch. Certificate paths refer to the TRex server.
++
++## Cleartext HTTP/2 (prior knowledge)
++
++Omit the tls argument on both programs:
++
++```python
++client = ASTFProgram(http2={'requests': 10, 'concurrency': 4})
++server = ASTFProgram(side='s', http2={'concurrency': 4, 'body_size': 16384})
++```
++
++The client sends the HTTP/2 connection preface immediately after TCP setup and
++uses :scheme=http. No TLS context, handshake, encryption or ALPN is used.
++The peer must support prior knowledge; HTTP/1.1 Upgrade is not implemented.
++Client/server roles are serialized by ASTFProgram from side, not user options.
++Existing serialized TLS HTTP/2 profiles without the role field remain accepted.
++
++Ready profile (TCP port 80):
++
++```text
++start -f astf/http2.py -m 1000 -d 60 -t --requests 10 --concurrency 4 --body_size 16384
++```
++
++Use the --rfc9411 AWS-LC/libnghttp2 binary. This is a build
++packaging requirement, not TLS on the wire: cleartext flows leave TLS counters
++at zero. Builds without --rfc9411 still reject HTTP/2 profiles. There is no
++new dependency or configure option in this update.
++
++Cleartext uses the same HTTP/2 counters and connection-level TTFB/TTLB semantics.
++Use separate template groups if encrypted and cleartext flows must be reported
++separately. Session timeout includes TCP establishment for cleartext flows;
++latency samples begin at the initial TCP SYN, including TCP establishment. The deadline
++also bounds draining the output queue. Partial responses and RST fail the flow.
++TX allocation failure aborts one flow and increments tcps_nombuf and
++HTTP/2 error counters; TCP reassembly retains payload for reordered segments.
++
++## Supported profile model
++
++This first native implementation generates GET requests. All requests on a flow
++share the configured authority/path. The server sends a configured status and a
++body consisting of repeated `x` bytes, with Content-Length. Multiple streams
++can be active simultaneously; the client waits for peer SETTINGS and respects
++the smaller of its configured concurrency and the peer's stream limit.
++
++The HTTP/2 program owns the complete exchange. Additional send/recv commands,
++PCAP input, HTTP/1 validation and protocol addons cannot be combined with it.
++A TCP/TLS connection carries the specified number of requests and then closes.
++No replayed HTTP/2 frames are used. Omitting tls selects HTTP/2 prior knowledge over cleartext TCP. Arbitrary POST uploads, custom request headers,
++server push, HTTP/1.1 Upgrade, CONNECT, gRPC and HTTP/3 are not profile features in this
++version. Connection-level failures abort outstanding streams; no automatic
++reconnection or retry of RST_STREAM/GOAWAY-refused requests is performed.
++
++The following http2 keys are supported:
++
++| Key | Default | Meaning |
++|---|---:|---|
++| requests | 10 | Client requests per TCP connection, 1..1000000 |
++| concurrency | 1 | Maximum active streams, 1..128, on each side |
++| authority | localhost | Client :authority, printable ASCII, 1..1024 bytes |
++| path | / | Client :path beginning with /, 1..1024 bytes |
++| body_size | 16384 | Server response bytes, 0..1073741824 |
++| status | 200 | Server final status, 200..599; 204/304 require body_size=0 |
++| expected_status | 200 | Client expected final status, 200..599 |
++| request_interval_ms | 0 | Client pause after each non-final response; 0..3600000, requires concurrency=1 when nonzero |
++| final_hold_ms | 0 | Client hold after the final response before GOAWAY; 0..3600000 |
++| timeout_ms | 30000 | Whole session deadline (after TLS handshake, or at cleartext flow start), 1..600000 |
++| max_body_size | 1073741824 | Maximum received body per stream |
++| max_header_size | 16384 | Maximum decoded header name/value bytes per stream, 512..65536 |
++
++Server-only response options do not configure client requests, and client-only
++request options do not configure the server's reply. The server cannot infer
++how many requests an external client intends to send. Its session deadline
++therefore also bounds otherwise idle sessions.
++
++## Validation, scheduling and resource bounds
++
++libnghttp2 validates HTTP/2 framing and HTTP header semantics, including
++Content-Length when present. A successful client sample requires the configured
++final status and clean END_STREAM; RST_STREAM, incomplete response and protocol
++errors are failures. Bodies without Content-Length are delimited by END_STREAM.
++Body content is not matched against an expected pattern in this version.
++
++One bounded 64-KiB output buffer holds immutable plaintext until AWS-LC accepts
++it. This preserves SSL_write retry arguments even while incoming HTTP/2 control
++frames are processed. DATA reads are capped at 16 KiB irrespective of a peer's
++advertised maximum frame size. Stream slots are allocated once per session;
++response bodies are generated on demand and not stored per flow. libnghttp2
++still performs its own stream/HPACK allocations. Receive header size, continuation
++count, pending control acknowledgements and active streams are bounded.
++
++Work is driven by the existing bounded TLS pump, TCP ACKs, input callbacks and
++DP timer wheel. Session timeout closes a stalled flow. Timer processing can be
++late under overload. HTTP/2 protocol output drains before close_notify; an
++orderly peer close is accepted after all streams finish without requiring a
++GOAWAY acknowledgement. This is not a claim of zero-copy encryption or a
++measured throughput improvement. Physical-NIC performance remains to be tested.
++
++## Statistics
++
++- `tcps_http2_requests`: requests submitted (client) or accepted (server).
++- `tcps_http2_responses`: validated responses (client), serialized responses
++  (server); server completion is not a TCP acknowledgement.
++- `tcps_http2_errors`, `tcps_http2_timeouts`, `tcps_http2_resets`,
++  `tcps_http2_goaway`: protocol/response errors, session timeouts, reset streams,
++  and received GOAWAY frames. Transport/TLS failures also use existing TLS errors.
++- `tcps_http2_ttfb_*`, `tcps_http2_ttlb_*`: client connection latency from TCP SYN.
++
++The origin is the first TCP SYN send attempt; retransmitted SYNs do not reset
++it. This follows the connection-level origin in RFC 9411 section 6.3:
++https://www.rfc-editor.org/rfc/rfc9411.html#section-6.3
++
++TTFB ends at the first input fragment of the first response HEADERS frame.
++The timestamp is retained even if the 9-byte frame header or HPACK block is
++fragmented. TTLB ends when the last response on the connection completes at
++END_STREAM. This covers all requests/parallel streams on the connection and
++includes TCP establishment and, for HTTPS/2, the TLS handshake. SETTINGS,
++WINDOW_UPDATE, PING, GOAWAY, TCP FIN and TLS close_notify do not extend response
++latency. Informational response HEADERS count as the beginning of the response;
++only the final validated status determines success.
++
++Receive timestamps are now captured at TCP input, before reassembly, and travel
++with the retained byte ranges through reassembly and the TLS receive queues.
++Parser/decryption scheduling no longer replaces arrival times. These are software
++TCP-input timestamps, not NIC hardware ingress timestamps: NIC polling and work
++before TCP input remain part of the observation error.
++
++For cleartext, the first response byte uses its segment's timestamp. Completion
++uses the latest arrival among the retained response fragments, so an earlier
++arrival of the final sequence byte cannot hide a delayed missing fragment.
++Duplicate segments do not replace the timestamps of bytes retained by TCP.
++
++TLS precision is **record-level**: authenticated plaintext inherits the first
++wire byte and latest required fragment timestamp of its TLS record. Several HTTP
++frames inside one encrypted record share these bounds; sub-record byte arrival
++cannot be inferred from this interface. The end bound includes the authentication
++tag and any TLS padding. AWS-LC's complete-record callback consumes timestamp
++metadata; successful SSL_read supplies the associated plaintext. Tickets, alerts,
++and empty records consume their own metadata and cannot shift the next record.
++Response samples are still published only for successful complete connections.
++HTTP response frames, rather than HTTP/2 connection-control frames, define the
++response; control data sharing an encrypted record cannot be separated in time.
++
++The same TCP/TLS timestamp transport also applies to verified HTTP/1.1 and its
++transaction counters. No profile option, counter name, SYN origin, sample count,
++or UDP RTT behavior changes. See `astf-rx-timestamps.md` for implementation and
++validation details.
++
++Exactly one sample is committed per successfully completed client connection,
++after clean transport completion. Cached response times are used, so delayed
++cleanup/FIN/close_notify never extends TTLB. Incomplete, invalid, reset or timed
++out connections do not contribute. Their errors remain visible in counters.
++The same samples populate the common tcps_ttfb_* and tcps_ttlb_* aggregates,
++which now include both validated HTTP/1 and HTTP/2 connections. Server latency
++samples remain zero. Template-group aggregation uses the same measurement.
++
++HTTP/2 latency counts measure connections. For N successful connections with 10 responses
++each, tcps_http2_responses is 10*N and each HTTP/2 latency count is N.
++
++Each latency prefix exports avg_ms/min_ms/max_ms/p50_ms/p95_ms/p99_ms, count,
++and bucket_0..bucket_31. Histograms use the existing logarithmic microsecond
++buckets; percentiles are approximate upper bounds capped at the observed max.
++Latency aggregates are absolute for the profile lifetime, like HTTP/1 latency;
++clear_stats reference resets do not subtract them. Ordinary request/error
++counters retain normal TRex counter semantics. Template-group API is supported.
++The server table shows averages/p99 and basic counters; detailed distributions
++remain API-only. Existing HTTP/1/TLS/UDP metrics are renamed without aliases;
++see astf-metric-names.md before updating data collectors.
++
++### Concurrent-connection workloads
++
++Use `request_interval_ms` for sequential request pacing and `final_hold_ms` to
++keep the connection alive after its final response. Both are client-only; the
++server continues to process HTTP/2 control frames normally. Pacing uses the ASTF
++timer wheel without polling or sleeping the DP worker. The absolute `timeout_ms`
++deadline still applies and must include intentional holds plus exchange time.
++It is not extended by progress or by timer wakeups. HTTP response timestamps are
++unchanged: final hold affects connection lifetime, not the last-byte measurement.
++A session completing all responses may close early if its peer sends GOAWAY/EOF;
++these options do not override peer shutdown.
++
++## Mixed response bodies
++
++`http2.body_sizes` is an optional list of 1..128 integer byte lengths. It overrides
++`body_size`; sizes cycle by client stream ID: stream 1 uses element 0, stream 3
++element 1, and so on. Set the same list on both endpoints. This keeps the mapping
++stable under concurrent responses and does not depend on completion order.
++The server generates each selected length; the client checks that exact length
++before counting a successful response. Every length must satisfy `max_body_size`;
++204/304 responses must have zero length. Without a list, fixed-size behavior is
++unchanged. The list is stored in program configuration, without per-request allocation.
+diff --git a/doc/astf-metric-names.md b/doc/astf-metric-names.md
+new file mode 100644
+--- /dev/null
++++ b/doc/astf-metric-names.md
+@@ -0,0 +1,24 @@
++# Metric naming
++
++Public counters use lowercase names with standard TRex TCP/UDP prefixes.
++Discover counter IDs and descriptions through the API; do not hard-code IDs.
++
++| Prefix | Measurement |
++|---|---|
++| `tcps_ttfb_*` | Connection time to first response byte |
++| `tcps_ttlb_*` | Connection time to last response byte |
++| `tcps_http_req_ttfb_*` | HTTP request time to first response byte |
++| `tcps_http_req_ttlb_*` | HTTP request time to last response byte |
++| `udps_rtt_*` | UDP transaction round-trip time |
++| `tcps_tls_version_*` | Negotiated TLS version |
++| `tcps_tls_cipher_*` | Negotiated cipher suite |
++| `tcps_tls_group_*` | Negotiated key exchange group |
++| `tcps_tls_peer_signature_*` | Peer signature algorithm |
++
++Latency sample totals use the `count` suffix. Cipher/group suffixes are lowercase,
++for example `tcps_tls_cipher_tls_aes_128_gcm_sha256` and `tcps_tls_group_x25519`.
++Detailed distributions and TLS parameters are available through `get_stats()`;
++the terminal table exposes a smaller set for readability.
++
++Nested scheduler and TLS cost diagnostics in `get_util_stats()` have their own
++scope and are not TCP/UDP traffic counters.
+diff --git a/doc/astf-native-tls.md b/doc/astf-native-tls.md
+new file mode 100644
+--- /dev/null
++++ b/doc/astf-native-tls.md
+@@ -0,0 +1,28 @@
++# Native TLS for ASTF
++
++The RFC 9411 extension integrates AWS-LC TLS 1.2 and TLS 1.3 into TRex's
++ASTF TCP/DPDK path. Both endpoints perform real handshakes and exchange
++authenticated application data. TLS is opt-in per ASTF program.
++
++Each flow owns its TLS state and bounded BIO buffers on its DP worker.
++The TCP adapter feeds ordered ciphertext, handles partial records and
++backpressure, and queues encrypted output through the existing mbuf path.
++Certificate, protocol and resource failures close the affected flow.
++There is no external proxy or separate crypto process.
++
++## Configuration and operation
++
++- [TLS policy and mutual authentication](astf-tls-policy.md)
++- [HTTP response validation and measurements](astf-http-validation.md)
++- [HTTP/2, including cleartext prior knowledge](astf-http2.md)
++- [Receive timestamp attribution](astf-rx-timestamps.md)
++- [Build dependencies](astf-build-dependencies.md)
++- [Validation commands](astf-tls-validation.md)
++- [Cost diagnostics](astf-cost-metrics.md)
++
++Use the repository's getting-started guide to apply the complete patch series
++to the pinned TRex source and build with `--rfc9411`.
++
++TLS capability alone does not establish RFC 9411 benchmark compliance. Workload,
++DUT configuration, measurement procedure and reported results also matter.
++Throughput and timestamp accuracy require validation on the target NIC and host.
+diff --git a/doc/astf-build-dependencies.md b/doc/astf-build-dependencies.md
+new file mode 100644
+--- /dev/null
++++ b/doc/astf-build-dependencies.md
+@@ -0,0 +1,11 @@
++# Build dependencies
++
++Build with `--rfc9411 --aws-lc-prefix=/absolute/path/to/aws-lc`.
++AWS-LC 5.11.0 is the supported TLS dependency. Install its shared libraries and
++headers under the selected prefix. Native HTTP/2 also requires libnghttp2.
++Follow the repository's getting-started guide for complete configure/build commands.
++
++Use matching headers and runtime libraries. Verify library resolution on the
++machine that will run TRex; do not mix AWS-LC and system libssl objects.
++The OpenSSL command-line utility may be used for test certificate generation;
++it is not a selectable TLS backend for the extension.
+diff --git a/doc/astf-rx-timestamps.md b/doc/astf-rx-timestamps.md
+new file mode 100644
+--- /dev/null
++++ b/doc/astf-rx-timestamps.md
+@@ -0,0 +1,61 @@
++# TCP receive timestamps for HTTP latency
++
++Verified HTTP/1.1 and native HTTP/2, encrypted or cleartext, use receive
++timestamps for latency endpoints. Connection TTFB/TTLB start at the initial SYN.
++HTTP/1 transaction latency counters also use the carried receive timestamps.
++
++## Observation boundary and attribution
++
++Only measured flows sample the existing monotonic `now_sec()` clock at TCP input
++for packets with payload. This is before TCP trimming, reassembly and application
++callbacks, but after NIC polling, parsing and flow lookup. This change removes
++subsequent software queue/decryption delays from receive endpoints, not the work
++before the observation boundary. It does not add hardware timestamping or change
++the initial SYN send-attempt origin.
++
++Reassembly payload stores run-length timestamp spans. Merging overlapping blocks
++copies metadata for exactly the suffix whose bytes the existing TCP policy keeps.
++Duplicates cannot overwrite retained timestamps. Byte ranges are delivered with
++their own stamps; the last endpoint is the maximum required arrival time, not
++necessarily the timestamp of the greatest TCP sequence number.
++
++Measured TLS flows retain spans alongside the existing mbuf FIFO, including
++partial BIO writes and delayed pump calls. A second span queue follows bytes fed
++to AWS-LC. The per-SSL record-header callback consumes exactly one full record's
++wire bytes and saves the first-byte and latest-fragment times. Only authenticated
++plaintext returned by SSL_read is attributed to that record. Partial plaintext
++reads retain the same bounds; multiple records in BIO, handshake records and
++post-handshake control records cannot shift attribution. No AWS-LC source patch
++or new dependency is needed.
++
++TLS timing is bounded by records, not exact plaintext-byte-to-packet mapping.
++TTFB uses the first wire byte of the record containing the first response fragment.
++TTLB uses the latest retained fragment of the record containing completion, and
++of earlier response fragments. Authentication tags and padding are included.
++Control and response bytes inside the same encrypted record share these bounds.
++No record is accepted, decrypted or counted before authentication succeeds.
++
++## Resource and compatibility behavior
++
++The mbuf layout, pools and ownership are unchanged. Timestamp queues exist only
++on measured TLS flows and coalesce adjacent equal stamps. Their lifetime follows
++retained ciphertext; storage does not accumulate over the connection lifetime.
++Deque blocks amortize allocations across spans. Reassembly span vectors exist
++only for measured payload. Allocation failure aborts the affected flow through
++existing RESOURCE/HTTP failure handling; no exception escapes a C callback.
++Ordinary unmeasured TLS flows do not install the record callback or create queues.
++No new counters, user knobs, profile changes or UDP changes are introduced.
++
++## Validation
++
++- Synthetic timestamps, including zero and non-monotonic sequence-order arrival.
++- Production TCP overlap merge with duplicates and sequence wraparound.
++- TLS 1.2/1.3 partial record headers, WANT_READ, multiple buffered records, small
++  SSL_read buffers and post-handshake tickets, under ASan/UBSan.
++- HTTP/2 fragmented HEADERS, distinct wire/processing times, parallel streams,
++  late PING/EOF exclusion and independent python-h2 interoperability.
++- TCP/HTTP/TLS simulator regressions with drops, reordering and allocation faults;
++  corresponding build without TLS; DPDK/veth IPv4/IPv6 API validation.
++
++These are local software tests. Physical NIC timestamp precision and throughput
++impact are not measured here. No claim of complete RFC 9411 certification is made.
+diff --git a/doc/astf-scheduler-recovery.md b/doc/astf-scheduler-recovery.md
+new file mode 100644
+--- /dev/null
++++ b/doc/astf-scheduler-recovery.md
+@@ -0,0 +1,70 @@
++# ASTF bounded scheduler recovery
++
++The realtime ASTF scheduler now treats the default `sched_max_stretch=0`
++setting as automatic bounded recovery. This applies to ASTF with and without
++TLS. STL and legacy STF retain their original scheduling policy.
++
++Previously, every callback-induced delay beyond the default 100 microsecond
++threshold moved all future deadlines by that delay. Repeated short TLS bursts
++could therefore extend a nominal 300 second run even when CPU capacity was
++available between bursts. This change first processes overdue events against
++the original deadlines. No flow starts, application bytes, or timer events are
++discarded, and no forced stop is introduced at the requested duration.
++
++## Bounds and overload
++
++An episode starts when lateness exceeds the existing stretch threshold. It
++ends when lateness falls back below that threshold. Recovery is allowed for
++less than 10 ms continuously and at most 10 ms of queued time debt. If either
++bound is exceeded, the existing deadline-stretch operation is used. Sustained
++overload can still extend the run; this is intentional, to preserve offered
++work. Normal connection shutdown can also extend the measured duration.
++
++The ASTF work loop returns to its clock/maintenance checks after 32 events or
++100 microseconds of work, whichever is observed first. Checks happen between
++callbacks: a running OpenSSL operation or RX batch cannot be preempted, so
++these are not hard CPU latency guarantees. While overdue, the scheduler also
++services RX when it has not done so for 100 microseconds. This supplements the
++normal queued RX flush event without advancing the TCP timer wheel or changing
++its event ordering. Existing control-plane maintenance remains enabled.
++
++A nonzero explicit `sched_max_stretch` retains its previous stretch-threshold
++meaning (including the existing 100 microsecond minimum). ASTF service checks
++remain active. Remove `--sched-max-stretch-ms` from the diagnostics runner to
++exercise the default policy. Check the saved effective global configuration:
++`sched_max_stretch` must be zero; a value set earlier in an interactive server
++can persist until reset or restart.
++
++## Diagnostics
++
++`ASTFClient.get_util_stats()['cpu'][i]['scheduler']` adds the following fields.
++The existing TLS diagnostics collector, which attaches utilization to its
++`get_stats()` samples, captures them automatically. Bare `get_stats()` does not
++itself fetch utilization.
++
++| Field | Meaning |
++| --- | --- |
++| `scope` | `dp_lifetime`: shared by all profiles on this DP core |
++| `recoveries` | Recovery episodes entered |
++| `recovered` | Episodes that returned below the stretch threshold |
++| `stretches` | Actual deadline-stretch operations |
++| `stretch_us` | Cumulative deadline extension, in microseconds |
++| `max_lag_us` | Maximum observed positive lateness over the DP lifetime |
++| `waits` | Calls to the scheduler's wait path |
++| `wait_us` | Cumulative time in those waits, in microseconds |
++| `batch_yields` | Work batches ended for an ASTF service check |
++| `rx_polls` | Supplemental RX polls; excludes normal queued RX polls |
++
++Use before/after deltas for cumulative counters. `max_lag_us` is a lifetime
++maximum and must not be subtracted as a duration. Counters are read independently
++and a snapshot is not an atomic transaction. Microsecond conversion truncates
++fractions. Per-core stretch and wait times overlap: their sum is not the run's
++wall-clock extension. Diagnostics remain cumulative across profile stop/start.
++
++For NIC comparison, repeat the same profile, CPU mapping, multiplier and duration
++with default zero stretch, saving the collector archive. Compare wall duration,
++completed CPS, plaintext throughput, retransmits/errors and per-core counter
++deltas. Recoveries with few stretches indicate transient debt was absorbed;
++large stretch deltas indicate debt still exceeds the bounds. Hardware throughput
++and CPU/NUMA scaling require measurement and are not established by simulator
++or virtual-interface tests.
+diff --git a/doc/astf-server-sni.md b/doc/astf-server-sni.md
+new file mode 100644
+--- /dev/null
++++ b/doc/astf-server-sni.md
+@@ -0,0 +1,33 @@
++# Server-side SNI validation
++
++Native TLS servers check a supplied SNI DNS name against their leaf certificate
++before completing the handshake (RFC 9411 section 4.3.3.1). This applies to TLS
++1.2 and TLS 1.3, HTTP/1.1 and HTTP/2. No new profile option is needed.
++
++A mismatch fails the TLS handshake with fatal unrecognized_name; no HTTP
++response is generated. The existing tcps_tls_err_protocol counter accounts for
++this failure. Client verify=False does not disable the server check.
++
++DNS subjectAltName takes precedence over CN. AWS-LC performs case-insensitive
++DNS matching and permits a wildcard only as a complete leftmost label matching
++one label. Partial-label wildcards are rejected. For legacy certificates with
++no DNS SAN, AWS-LC falls back to CN. No new certificate trust policy is imposed
++on the server's own configured certificate. Client chain/hostname validation
++and mTLS remain independent checks.
++
++SNI remains optional: clients without SNI retain their previous behavior.
++When supplied, sni must match the server certificate, including on the backend
++connection opened by a TLS-inspection device. This does not add virtual-host
++certificate selection or an HTTP Host/:authority check.
++
++Run the focused test with the AWS-LC installation used by TRex:
++
++```sh
++CXXFLAGS="-I/opt/trex-aws-lc-5.11.0/include" \
++LDFLAGS="-L/opt/trex-aws-lc-5.11.0/lib -Wl,-rpath,/opt/trex-aws-lc-5.11.0/lib" \
++sh tests/tls/run_server_sni_test.sh
++```
++
++The test creates temporary certificates using the openssl CLI, links the engine
++to AWS-LC, and checks both accepted and rejected handshakes. A permissive client
++isolates server-side rejection; valid names also exchange HTTP response bytes.
+diff --git a/doc/astf-performance-testing.md b/doc/astf-performance-testing.md
+new file mode 100644
+--- /dev/null
++++ b/doc/astf-performance-testing.md
+@@ -0,0 +1,11 @@
++# TLS performance testing
++
++Measure completed handshakes, offered and achieved CPS, application throughput,
++CPU utilization, scheduler lag and natural completion time together. Keep request
++size, responses per connection, certificate policy and session reuse constant
++when comparing configurations. Run on CPUs local to the NIC's NUMA node.
++
++Use [sampled cost metrics](astf-cost-metrics.md) and
++[handshake diagnostics](astf-handshake-cost.md) to attribute CPU cost.
++Diagnostic sampling has overhead; compare against a run with diagnostics disabled.
++No throughput or CPS level is guaranteed across machines.
+diff --git a/doc/astf-tls-performance.md b/doc/astf-tls-performance.md
+new file mode 100644
+--- /dev/null
++++ b/doc/astf-tls-performance.md
+@@ -0,0 +1,10 @@
++# TLS lifecycle and progress
++
++TLS state is owned by its ASTF flow on one DP worker. The adapter progresses
++handshake, application records and shutdown according to readiness and bounded
++work budgets. Retried writes preserve the pending buffer and length required by
++the TLS library. TCP acknowledgement and application completion are distinct.
++
++See [record scheduling](astf-tls-records.md), [native TLS](astf-native-tls.md)
++and [error draining](astf-error-drain.md). Use the cost diagnostics before
++attributing load limits to a particular TLS operation.
+diff --git a/doc/astf-tls-records.md b/doc/astf-tls-records.md
+new file mode 100644
+--- /dev/null
++++ b/doc/astf-tls-records.md
+@@ -0,0 +1,70 @@
++# TLS record-aware receive scheduling
++
++Record scheduling preserves certificate verification,
++full handshakes, TLS record contents and HTTP transaction boundaries. No new
++profile options, resumption shortcuts, crypto workers or library changes.
++
++## Receive
++
++The flow tracks the five-byte record header and skips over its payload length
++as bytes enter the bounded BIO. This is a scheduling hint, not a TLS validator.
++After SSL_read returns WANT_READ, fragments of an incomplete record no longer
++wake it. A complete record or a full BIO wakes it. Invalid record headers
++restore eager processing so OpenSSL/AWS-LC sees the header immediately.
++The library decides whether the error is diagnosed at the header or body.
++EOF, write dependencies and output release retain their existing wakeups.
++Buffered plaintext remains readable without new network input.
++
++ASTF enables this only when the TCP receive high-water mark can hold the maximum
++supported ciphertext record (18432+5 bytes). Smaller windows use partial reads
++so that credit is returned before the complete record arrives. Disabling
++coalescing explicitly releases an existing WANT_READ wait. BIO capacity pressure
++also releases it, including the 128-byte transport used by regression tests.
++The parser observes the stream even when coalescing is disabled.
++
++The pump feeds up to 16 queued mbuf segments before the next SSL operation,
++within its existing bounded outer budget. It stops feeding when BIO is full.
++No per-packet heap allocations or new RX mbuf retention queue are introduced.
++The existing TCP window continues to count bytes retained in the input BIO.
++
++## Transmit
++
++Each fixed ciphertext slot now has nine 2-KiB mbuf descriptors, allowing a
++16-KiB application record plus AEAD overhead to fit in one slot. Previously
++that record could be split into a 16384-byte slot and a tiny tag/tail slot.
++The 64-KiB ciphertext queue bound, eight slots, ACK-based lifetime and retransmit
++ownership remain in place. This costs eight extra CMbufObject descriptors per
++flow (128 bytes on the tested 64-bit layout). It reduces queue bookkeeping;
++it does not eliminate encryption copies or guarantee fewer mbuf allocations.
++
++We retain 2-KiB allocation: the existing 4-KiB pool has an explicit exhaustion
++fallback in TRex. CMbufBuffer already uses fixed descriptors in this path;
++Create resets them and is not itself a vector allocation here.
++
++## Certificate work
++
++A local diagnostic, tests/tls/handshake_verify_cost.cpp, times the default
++X509_verify_cert call through the library's certificate-verification callback.
++It preserves the existing store, hostname parameters and verification policy.
++It does not bypass validation or cache an accepted certificate.
++
++The diagnostic measures full handshakes only; it is not an HTTPS throughput
++benchmark and excludes application traffic. ARM timing cannot establish the
++cost breakdown on the user's Xeon. Its result did not justify adding a complex
++validation-result cache. DER parsing, CertificateVerify and key agreement are
++outside this X509_verify_cert measurement. No certificate cache is used.
++
++## Tests
++
++run_engine_test.sh includes record_coalescing_test.cpp. Engine and independent
++peer protocol tests enable coalescing: TLS 1.2/1.3, malformed/truncated records,
++KeyUpdate, small BIO, WANT_WRITE, pending plaintext and shutdown. The new test
++compares enabled/disabled scheduling with 1-byte and 1460-byte input fragments;
++it also checks disabling coalescing mid-record and immediate invalid-length
++dispatch to the TLS library. The optional third argument to its executable measures only the
++post-handshake data path (100 alternating runs, 164784 plaintext bytes).
++
++The simulator tests exercise small TCP windows, retransmissions, reassembly,
++resource exhaustion, deadlines and cleanup. Live DPDK/veth validates application
++lifecycle; physical NIC throughput remains to be measured. Do not convert the
++reduction in SSL_read calls directly into a claimed total CPU reduction.
+diff --git a/doc/astf-tls-runtime.md b/doc/astf-tls-runtime.md
+new file mode 100644
+--- /dev/null
++++ b/doc/astf-tls-runtime.md
+@@ -0,0 +1,14 @@
++# TLS runtime scope
++
++The extension uses AWS-LC in the native TCP/ASTF/DPDK execution path. It supports
++TLS 1.2 and TLS 1.3, certificate verification, mutual TLS and session resumption.
++The profile selects TLS policy explicitly; see [policy](astf-tls-policy.md).
++
++A TLS-capable engine is only one component of an RFC 9411 test. The operator must
++select and report workload, negotiated algorithms, authentication, session reuse,
++DUT inspection settings and measurement conditions. Tests must distinguish full
++handshakes from resumed sessions. No certification or hardware throughput claim
++is implied by enabling the extension.
++
++Use the repository's RFC 9411 scope and limitations documents for the complete
++benchmark boundary, and [validation](astf-tls-validation.md) for local tests.
+diff --git a/doc/astf-tls-policy.md b/doc/astf-tls-policy.md
+new file mode 100644
+--- /dev/null
++++ b/doc/astf-tls-policy.md
+@@ -0,0 +1,153 @@
++# TLS policy and mutual authentication
++
++AWS-LC is the TLS backend. TLS is opt-in per ASTF program.
++
++## TLS policy
++
++ASTFProgram(tls={...}) accepts these additional policy fields on both endpoints:
++
++* `cipher_suite`: one suite for the configured `version` (no colon expressions).
++  TLS 1.2 accepts ECDHE-ECDSA-AES128-GCM-SHA256,
++  ECDHE-RSA-AES128-GCM-SHA256, ECDHE-ECDSA-AES256-GCM-SHA384,
++  ECDHE-RSA-AES256-GCM-SHA384, ECDHE-ECDSA-CHACHA20-POLY1305,
++  ECDHE-RSA-CHACHA20-POLY1305. TLS 1.3 accepts TLS_AES_128_GCM_SHA256,
++  TLS_AES_256_GCM_SHA384 or TLS_CHACHA20_POLY1305_SHA256.
++* `groups`: nonempty ordered list from X25519, P-256, P-384, P-521.
++* `signature_algorithms`: nonempty ordered list from rsa_pss_rsae_sha256/384/512,
++  ecdsa_secp256r1_sha256, ecdsa_secp384r1_sha384, ecdsa_secp521r1_sha512,
++  ed25519, rsa_pkcs1_sha256/384/512. The slash notation here abbreviates three
++  separate names. Profiles use full names, e.g. `rsa_pss_rsae_sha256`.
++
++Omitted fields keep existing defaults. Unknown names, duplicate/empty lists,
++wrong types and a cipher for the other TLS version are rejected before traffic.
++The library negotiates the intersection with the peer: incompatible certificate,
++group or signature policies fail the handshake; there is no silent fallback
++outside the configured policy. RSA PKCS#1 signatures cannot sign a TLS 1.3
++CertificateVerify. Certificate-chain signatures and handshake signatures are
++related but distinct; a restrictive list must also be compatible with the chain.
++TLS version remains an exact choice, not a range. Profiles are immutable after
++loading and worker contexts inherit all policy fields.
++
++## mTLS
++
++Client: `tls={'cert':'/path/client.pem','key':'/path/client.key',
++'ca':'/path/server-ca.pem','sni':'service.example'}`.
++Server: `tls={'cert':'/path/server.pem','key':'/path/server.key',
++'require_client_cert':True,'ca':'/path/client-ca.pem'}` on `side='s'`.
++
++All paths are on the TRex server. Certificates may include their intermediate
++chain. The server CA file supplies trust anchors and advertised acceptable CA
++names. `require_client_cert` requires explicit CA and verification enabled.
++Absent, expired, untrusted and inappropriate-EKU client certificates fail the
++handshake. The client still verifies the server chain and hostname independently.
++Trust authenticates a client certificate; no application authorization mapping,
++CRL/OCSP fetching, post-handshake client authentication or identity ACL is added.
++Session resumption is optional and preserves the authenticated session; it does
++not repeat certificate validation on each resumed connection. Reloading a profile
++creates new ticket contexts. Full-handshake benchmarks keep `resumption=False`.
++
++## HTTP validation and latency
++
++Opt in on the TCP client: `ASTFProgram(http={'responses':10})`.
++For HTTPS add `tls=...`; ALPN must be `http/1.1`. Ordinary HTTP works both
++with and without a `--rfc9411` build. UDP, server-side response validation
++and addon programs are rejected. The response validator is for HTTP/1.x GET workloads.
++ASTF send/recv commands still drive the exchange; `responses` must match the
++number of responses expected on that connection, including profile loops.
++
++HTTP options (all integers, booleans rejected):
++
++| Option | Default | Allowed |
++|---|---:|---:|
++| responses | 1 | 1..1000000 |
++| expected_status | 200 | 200..599 |
++| max_header_bytes | 16384 | 512..65536 |
++| max_body_bytes | 1073741824 | 0..1073741824 |
++
++The incremental parser consumes authenticated plaintext, without copying body
++bytes. It handles fragmented headers/body, multiple responses, informational
++responses, Content-Length, chunked framing/trailers and close-delimited bodies.
++A close-delimited body completes on peer FIN for plain TCP, or authenticated
++TLS close_notify for HTTPS. Reset and timeout never supply a valid EOF.
++Conflicting/duplicate framing headers, excess responses, malformed headers,
++limits, unexpected status or incomplete EOF abort that flow. Header and trailer
++budgets are bounded separately per response; chunk-size lines are bounded too.
++HEAD, CONNECT, upgrades, other transfer codings and HTTP/2 are not supported by
++this validator. Body content/digest is not checked. Without `http`, arbitrary
++TCP/TLS byte programs behave as before and produce no HTTP latency samples.
++
++Client statistics exposed through the existing ASTF stats API/console:
++
++* `tcps_http_responses`: complete responses with expected status (transaction count).
++* `tcps_http_errors`, `tcps_http_bad_status`, `tcps_http_truncated`,
++  `tcps_http_framing`: validation failures and reason counters.
++* `tcps_http_aborted`: flows without validation error that nevertheless failed
++  to complete validated HTTP plus clean stream close (reset, timeout, stop, etc.).
++* `tcps_ttfb_avg_ms/min_ms/max_ms`, `tcps_ttlb_avg_ms/min_ms/max_ms` and
++  `tcps_ttfb_count`, `tcps_ttlb_count`: successful connection latency samples.
++
++One latency sample per connection, published when the flow is destroyed, only
++if all expected responses and a clean stream close succeeded (peer FIN without
++socket error or local abort for TCP; also bidirectional close_notify for TLS). TTFB is
++first HTTP plaintext delivery minus first SYN enqueue time; TTLB
++uses last HTTP plaintext delivery. Retransmitted SYNs do not restart the clock.
++TLS handshake/tickets/alerts are excluded from the data endpoint. TCP FIN wait
++is excluded from the measured interval. Failed/partial connections have no
++successful latency samples; completed-response counts may still include valid
++responses preceding a later failure. Never divide latency sums by transactions.
++
++Aggregation across workers/template groups uses weighted averages and true
++min/max. A carry word protects nanosecond sums from 64-bit overflow. These are
++software timestamps, including local polling and TLS processing latency, not
++NIC wire timestamps. Clear/reload resets follow existing ASTF statistics scope;
++latency fields are absolute gauges, not client-side delta counters.
++
++The origin follows RFC 9411 section 6.3 (first SYN), not per-request send time.
++The successful-only sampling policy, authenticated-plaintext endpoint and the
++lack of hardware timestamps must be stated in reports. Adding these capabilities
++does not establish whole-generator RFC 9411 compliance. Benchmark methodology,
++traffic mix, cipher/key requirements, HTTP/2 and DUT validation remain separate.
++Reference: https://www.rfc-editor.org/rfc/rfc9411.html#section-6.3
++
++The supplied astf-ttfb-ttlb.patch was reviewed and partly reused: latency
++accumulators, CP gauges and cross-worker merge integration. Its raw TCP receive
++hooks were replaced because a TLS handshake record is not HTTP data, and its
++unconditional close sampling could count incomplete responses. New tests cover
++the actual decrypted flow path, not just extracted stubs.
++
++## Example and cost
++
++`scripts/astf/https_verified.py` provides a 16 KiB response, ten GET exchanges per
++connection by default; `--responses` and `--body-size` change the workload.
++Pass `--client-cert`, `--client-key`, `--client-ca` together to enable mTLS.
++Example after generating suitable certificates:
++
++```
++start -f astf/https_verified.py -m 1000 -d 60 -t --cert /tmp/server.pem --key /tmp/server.key --ca /tmp/ca.pem --sni localhost --version 1.2 --cipher-suite ECDHE-ECDSA-AES128-GCM-SHA256 --groups P-256 --signature-algorithms ecdsa_secp256r1_sha256 --client-cert /tmp/client.pem --client-key /tmp/client.key --client-ca /tmp/ca.pem
++```
++
++The parser and timing state belong to the ASTF application, independently of TLS.
++In-order plain TCP mbuf chains are parsed before release, without another copy.
++Out-of-order bytes are retained only for TLS or opted-in HTTP flows; delivered
++plain reassembly vectors are parsed directly without allocating more mbufs.
++Unvalidated TCP retains its byte-count-only reassembly behavior. Each reassembly
++block includes a shared-pointer slot in all builds. Allocation failure for a
++validated flow clears its reassembly queue and aborts that flow.
++
++Plain HTTP example: `start -f astf/http_verified.py -m 1000 -d 60`.
++It defaults to ten 16-KiB responses per connection. Use `-t --responses 1
++--body-size 1024` to change the workload. HTTPS uses `https_verified.py` below.
++HTTP validation is opt-in in existing profiles: add `http={'responses': N}` to
++the client program and set N to the number of expected GET responses.
++
++HTTP parsing adds bounded CPU work and one header buffer allocation per enabled
++flow (default 16 KiB plus parser metadata). Set an appropriate header bound for
++the traffic if memory matters. It is not allocation-free. mTLS adds certificate
++bytes, signing and verification; compare its performance separately from server-
++only authentication. No NIC throughput claim is made.
++
++Tests: `sh tests/tls/run_features_test.sh`, `sh tests/tls/run_engine_test.sh`,
++`python3 tests/tls/api_test.py` with the usual client PYTHONPATH, simulator
++`gt_tcp.native_tls_http_validation`, and `run_interactive_veth.sh` now exercise
++mTLS, explicit policy and HTTP latency on the completed HTTPS stage, plus
++ordinary HTTP latency via the same ASTF stats API on IPv4 and IPv6.
+diff --git a/doc/astf-http-validation.md b/doc/astf-http-validation.md
+new file mode 100644
+--- /dev/null
++++ b/doc/astf-http-validation.md
+@@ -0,0 +1,132 @@
++# HTTP response content, request latency and negotiated TLS
++
++HTTP validation and measurements work with and without TLS. Negotiated
++parameter metadata applies to TLS connections.
++
++## Streamed body validation
++
++```python
++client = ASTFProgram(http={
++    'responses': 10,
++    'expected_status': 200,
++    'body_contains': 'unique expected origin content',
++    'transactions': True,
++})
++```
++
++For HTTPS also pass the existing `tls` options. `body_contains` is a nonempty
++UTF-8 string of at most 4096 encoded bytes. The exact bytes must occur at least
++once in **each** response body. Matching is case sensitive. It operates on the
++body after HTTP chunk framing removal, not on headers, chunk extensions or
++trailers. It handles boundaries between mbufs, TLS records and HTTP chunks.
++The match resets for every response. Bodies are never retained. A bounded KMP
++matcher prevents quadratic work on repetitive adversarial input and stops
++scanning after the first match. Omit the option to retain framing-only checks.
++
++An absent match at a complete response boundary increments `tcps_http_bad_content`
++and `tcps_http_errors`, aborts the flow and excludes that response from successful
++response/transaction counters. A truncated response remains a truncation error.
++A block page with HTTP 200 is therefore rejected if the expected marker is absent.
++This is substring validation, **not SHA-256 or exact body equality**. Content-Encoding
++is not decoded: request identity encoding if the marker describes uncompressed text.
++HEAD, CONNECT, protocol upgrades and HTTP/2 remain outside the GET validator.
++
++## Per-request measurements
++
++Enable `transactions=True` and mark each logical request before sending it:
++
++```python
++client.set_var('n', 10)
++client.set_label('request')
++client.http_request_start()
++client.send(request_part_1)
++client.send(request_part_2)
++client.recv(response_wire_length)
++client.jmp_nz('n', 'request')
++```
++
++`http_request_start()` waits internally for TCP establishment if needed, then
++records the measurement marker. It may be used inside profile loops.
++For TLS the application starts after the TLS handshake. The origin is execution
++of the marker immediately before the request send commands, **not a NIC wire
++transmit timestamp**. It includes subsequent local scheduling/encryption/TCP
++backpressure. Do not insert unrelated delays between the marker and sends.
++One marker covers a request split across any number of send buffers. Automatic
++inference from send boundaries would miscount those requests and is not used.
++
++Responses map to markers FIFO, as required by HTTP/1.x ordered responses. At most
++64 outstanding markers are supported. A response without a marker, duplicate
++response start, overflow, or a marker without the feature enabled is rejected;
++runtime failures increment `tcps_http_transaction_errors`. Pending markers at
++flow destruction prevent a successful connection sample. Loops must mark every
++iteration. A marker is a profile contract: this feature does not parse or validate
++outbound requests. With `transactions=True` but no markers, a response is an error.
++
++* `tcps_http_req_ttfb_*`: marker to first response byte, including informational 1xx.
++* `tcps_http_req_ttlb_*`: marker to end of the complete response (including framing and
++  trailers). A close-delimited response validates at EOF but uses the timestamp
++  of its last data byte, excluding the FIN/close_notify wait.
++* Each prefix exports `count`, `avg_ms`, `min_ms`, `max_ms`, `p50_ms`,
++  `p95_ms`, `p99_ms`, plus `bucket_0` through `bucket_31`.
++
++Each **validated response** commits one pair of samples immediately. Later failure
++of another response or transport does not remove earlier successful transaction
++samples. This differs intentionally from the existing connection `tcps_ttfb_*`/`tcps_ttlb_*`
++counters, which still publish one successful sample at flow destruction starting
++at the first SYN. The two namespaces must not be compared as identical metrics.
++
++Histogram buckets are disjoint, not cumulative: bucket 0 is [0,1] microseconds;
++bucket i (1..30) is (2^(i-1),2^i] microseconds; bucket 31 is all values above 2^30
++microseconds. Latency sums/min/max are measured in nanoseconds. Percentiles use
++nearest-rank bucket **upper-bound estimates**, capped at the observed maximum;
++they are approximate, potentially up to a factor of two above the true quantile.
++Min/avg/max are not rounded to histogram buckets. Merge sums histogram counts and
++uses weighted averages and true min/max across workers/template groups. Counts
++and histogram bins are absolute gauges, following existing connection-latency
++reset semantics. All fields are available through the existing ASTF stats API.
++
++For pipelined/coalesced replies in one TCP delivery or decrypted buffer, several
++boundaries can share a software timestamp. No per-byte hardware time is implied.
++
++## Actual TLS parameters
++
++A completed handshake records exactly one entry in each bounded counter family,
++on each endpoint, from the AWS-LC connection (never inferred from configuration):
++
++* `tcps_tls_version_tls12`, `tcps_tls_version_tls13`, `tcps_tls_version_other`.
++* `tcps_tls_cipher_<IANA/OpenSSL-style name>` and `tcps_tls_cipher_other` (hyphens become
++  underscores, e.g. `tcps_tls_cipher_ecdhe_ecdsa_aes128_gcm_sha256`).
++* `tcps_tls_group_none`, `tcps_tls_group_x25519`, `tcps_tls_group_p256`, `tcps_tls_group_p384`,
++  `tcps_tls_group_p521`, `tcps_tls_group_other`.
++* `tcps_tls_peer_signature_<scheme>`, `tcps_tls_peer_signature_none`,
++  `tcps_tls_peer_signature_other`.
++* `tcps_tls_full_handshakes` and existing `tcps_tls_resumed`; their sum equals
++  `tcps_tls_handshakes`.
++
++The signature describes **peer handshake authentication**, not the certificate
++issuer's signature or this endpoint's own outgoing signature. On the client it
++identifies server handshake authentication (the inspecting NGFW when present).
++On the server it describes client authentication with mTLS; without client
++authentication `none` is expected. Resumed handshakes have no new authentication
++signature and explicitly report `none` even if the library retains session metadata.
++TLS 1.2 resumed handshakes also report group `none` because there is no new key
++exchange; TLS 1.3 reports the negotiated group. Unknown IDs go into `other` rather
++than being mislabeled. Counts are per handshake, not per record/request, and failed
++handshakes do not contribute. Existing TLS error counters remain available.
++
++## Examples, tests and overhead
++
++`astf/http_verified.py` and `astf/https_verified.py` now mark each request loop
++and enable transaction measurements. Nonempty generated bodies are checked for
++`x`; use a distinctive application marker for a real DUT test.
++
++Validation: standalone HTTP matcher/queue/histogram tests, TLS 1.2/1.3 policy+mTLS
++metadata checks, TCP loss/reordering and bad content tests, and a live ASTF RPC
++lifecycle run on IPv4/IPv6 with three requests per connection. The live run also
++rejects a substituted HTTP 200 body and verifies histogram/sample counts.
++
++The enabled matcher adds pattern/prefix storage per HTTP flow. The transaction
++FIFO adds one bounded allocation only when enabled. Histograms add fixed storage
++to TCP statistics per worker/template group (two 32-bin histograms, including
++summaries), not per flow. No per-response allocation or dynamic TLS parameter
++map is used. These features add work; no new physical-NIC performance claim is made.
+diff --git a/doc/astf-tls-validation.md b/doc/astf-tls-validation.md
+new file mode 100644
+--- /dev/null
++++ b/doc/astf-tls-validation.md
+@@ -0,0 +1,46 @@
++# Native TLS validation
++
++The production backend is AWS-LC only. OpenSSL CLI remains useful for generating
++fixtures and as an independent interoperability peer; it is not a selectable
++production backend. External PSK profiles are rejected; certificate-based ticket
++resumption remains supported. HTTP/2 additionally requires maintained nghttp2.
++
++From the source root, after installing AWS-LC shared libraries:
++
++```sh
++export AWS_LC_PREFIX=/opt/aws-lc
++# Use lib64 instead if that is the actual installation directory.
++export CXXFLAGS="-I$AWS_LC_PREFIX/include"
++export LDFLAGS="-L$AWS_LC_PREFIX/lib -Wl,-rpath,$AWS_LC_PREFIX/lib"
++sh tests/tls/run_engine_test.sh
++sh tests/tls/run_http2_engine_tests.sh
++python3 tests/tls/build_prefix_test.py
++# Requires the AWS-LC-enabled ASTF simulator built by linux/b.
++sh tests/tls/run_profiles.sh
++```
++
++`run_engine_test.sh` includes error-classification regressions and a 16-seed
++record-fuzzer smoke test. Verification failures, invalid records and EOF are
++separate outcomes. EOF without close_notify is truncation, even before a
++certificate exists. Remote alerts are not local certificate verification errors.
++
++For coverage-guided testing, use `tests/tls/record_fuzzer.cpp` with libFuzzer
++and AWS-LC. Supply certificate fixtures through `TREX_TLS_TEST_CERT` and
++`TREX_TLS_TEST_KEY`, and compile without NDEBUG to keep authentication assertions
++active. Instrument AWS-LC separately for coverage inside the crypto library.
++
++Handshake cost validation:
++
++```sh
++c++ -std=c++11 -O2 -DTREX_TLS -pthread $CXXFLAGS -Isrc \
++  tests/tls/handshake_bench.cpp src/44bsd/tls/astf_tls.cpp \
++  $LDFLAGS -lssl -lcrypto -o /tmp/trex-handshake-bench
++python3 tests/tls/handshake_cost_test.py /tmp/trex-handshake-bench cert.pem key.pem cert.pem
++```
++
++Use an RSA localhost certificate for this pinned RSA benchmark.
++`run_handshake_cost.py` schedules supported full handshake exchanges.
++
++Server own-signature diagnostic fields are unavailable and remain zero.
++Client TLS parameter counters record the negotiated peer signature.
++Cost diagnostics are optional and add measurement overhead.
+diff --git a/doc/astf-udp-rtt.md b/doc/astf-udp-rtt.md
+new file mode 100644
+--- /dev/null
++++ b/doc/astf-udp-rtt.md
+@@ -0,0 +1,102 @@
++# ASTF UDP transaction RTT
++
++Opt-in API for sequential, single-datagram request/response exchanges:
++
++```python
++c = ASTFProgram(stream=False)
++c.udp_request(b'hello', timeout_ms=1000)
++s = ASTFProgram(stream=False)
++s.recv_msg(1)
++s.send_msg(b'world')
++```
++
++`udp_request(buf, timeout_ms=1000, size=0, fill=None)` replaces BOTH
++`send_msg(buf)` and its matching `recv_msg(1)`. It sends one datagram and blocks
++until the next datagram received on this flow or a deadline expires. Put it in
++an ASTF loop to measure every exchange. Existing `send_msg`/`recv_msg` retain
++their behavior and collect no RTT samples. TCP TTFB/TTLB are unchanged.
++
++Only a UDP client template without an addon is supported. The matched response
++is consumed by udp_request, independently of recv_msg's cumulative watermarks.
++The peer uses ordinary recv_msg/send_msg. There are no timestamps, IDs or extra
++headers on the wire; profile payloads and packet lengths remain unchanged.
++
++## Measurement and failure semantics
++
++The clock starts just before the application's send call and stops in the UDP
++receive callback. This is software request-response time including TRex TX
++buffering, network/DUT in both directions, peer application delay, and polling
++latency. It is not NIC hardware timestamping or pure DUT latency. Server delay
++is intentionally included. No per-request allocation or payload copy is added;
++two uint64_t fields are added to CEmulApp, and summaries are per profile/group.
++
++The timeout is an integer 1..60000 ms (default 1000). At the deadline the flow
++closes; subsequent commands on that flow are not run. The receive callback also
++checks the deadline, so a delayed timer does not admit an expired response.
++The ASTF timer wheel handles idle timeout processing; under overload actual
++cleanup may be later than the deadline. Generic UDP keepalive does not preempt
++a pending measured request. A stop/other closure before completion counts as
++aborted, not a successful response. Only completed transactions enter the
++histogram. Missing answers must be reported alongside latency percentiles.
++
++This command assumes one outstanding request and one response datagram. It does
++not parse the application protocol or validate contents, sequence IDs, duplicates
++or multi-datagram responses. A duplicated response received while the next request
++is pending can be attributed to that next request. Closing on timeout prevents
++advancing to another request on that same flow, but does not solve stale datagrams
++after tuple reuse. Use protocol-specific correlation for such scenarios. No UDP
++retransmission, jitter or one-way latency is implemented by this feature.
++
++## API and screen
++
++`client.get_stats(skip_zero=False)['traffic']['client']` exposes:
++
++- `udps_rtt_avg_ms`, `udps_rtt_min_ms`, `udps_rtt_max_ms`;
++- `udps_rtt_p50_ms`, `udps_rtt_p95_ms`, `udps_rtt_p99_ms`;
++- `udps_rtt_count` — completed exchanges;
++- `udps_rtt_bucket_0` ... `udps_rtt_bucket_31` — disjoint sample counts;
++- `udps_rtt_started`, `udps_rtt_timeouts`, `udps_rtt_aborted`.
++
++For a named profile pass `pid_input=...`. With `tg_name='udp_rtt'`, use
++`client.get_traffic_tg_stats('udp_rtt', skip_zero=False, pid_input=...)` for the
++same group counters. Counters on the server side remain zero for this feature.
++
++All these metrics are absolute profile-lifetime aggregates, like existing HTTP
++latency statistics. API clear_stats reference resets do not subtract them.
++Reload/restart the profile for a fresh measurement interval. At flow completion:
++started = count + timeouts + aborted. During a test the difference is the
++number of pending measured requests. Read counters after traffic stops for a
++stable identity; live cross-core snapshots are not atomic.
++
++Bucket 0 covers 0..1 us; buckets 1..30 cover (2^(i-1),2^i] us; bucket 31 is the
++remaining overflow. Percentiles are approximate upper bucket bounds, capped at
++the observed maximum, not exact percentiles. Aggregation merges sample counts,
++sums with carry, and true min/max across workers and template groups.
++
++Only avg/p99, started and nonzero timeout/abort counters are shown on the server
++screen. Histogram, sample count and other summaries remain available through
++API. For zero-valued summaries use skip_zero=False.
++
++## Example
++
++`scripts/astf/udp_imix_rtt.py` adapts the supplied udp_imix.py. Defaults retain
++64-byte untagged IPv4 frames (including FCS), one request/response per flow.
++`--frame_size_b`, `--flow_size`, `--delay`, `--ramp_up` are preserved; new option
++`--timeout_ms` selects the response deadline. flow_size must be even and >=2;
++frame_size_b must be 64..1518 (IPv4, MTU 1500). The profile still uses one fixed
++frame size per invocation, not a distribution of IMIX sizes. It keeps the
++original arbitrary x/y payloads and UDP port 53; it does not implement DNS.
++
++```text
++start -f astf/udp_imix_rtt.py -m 1000 -d 60 -t --frame_size_b 64 --flow_size 20 --timeout_ms 1000
++```
++
++## Tests
++
++- `tests/tls/udp_rtt_api_test.py`: serialization, legacy behavior, invalid options,
++  unsupported server template.
++- `gt_tcp.udps_rtt_merge`: true worker min/max, histogram totals, sum carry.
++- `tests/tls/run_udp_rtt_veth.sh`: dedicated NET_ADMIN Linux container only;
++  real ASTF RPC/DPDK, IPv4 and optional `--ipv6`, repeated requests, server delay,
++  timeout exceeding keepalive, late answer, forced stop, profile reload, TG stats,
++  clear_stats semantics, no TCP latency updates, unchanged L7 byte counts.
+diff --git a/scripts/astf/http2.py b/scripts/astf/http2.py
+new file mode 100644
+--- /dev/null
++++ b/scripts/astf/http2.py
+@@ -0,0 +1,26 @@
++"""Native cleartext HTTP/2 (prior knowledge); no captured frames or external proxy."""
++from trex.astf.api import *
++import argparse
++
++class Profile:
++    def get_profile(self,tunables,**kwargs):
++        p=argparse.ArgumentParser()
++        p.add_argument('--authority',default='localhost')
++        p.add_argument('--requests',type=int,default=10)
++        p.add_argument('--concurrency',type=int,default=4)
++        p.add_argument('--body_size',type=int,default=16384)
++        p.add_argument('--mss',type=int,default=1440)
++        p.add_argument('--timeout_ms',type=int,default=30000)
++        a=p.parse_args(tunables)
++        c=ASTFProgram(http2={
++            'authority':a.authority,'requests':a.requests,'concurrency':a.concurrency,'timeout_ms':a.timeout_ms})
++        s=ASTFProgram(side='s',http2={
++            'concurrency':a.concurrency,'body_size':a.body_size,'timeout_ms':a.timeout_ms})
++        ip=ASTFIPGen(glob=ASTFIPGenGlobal(ip_offset='1.0.0.0'),
++            dist_client=ASTFIPGenDist(ip_range=['16.0.0.1','16.0.0.255'],distribution='seq'),
++            dist_server=ASTFIPGenDist(ip_range=['48.0.0.1','48.0.0.255'],distribution='seq'))
++        glob=ASTFGlobalInfo();glob.tcp.mss=a.mss
++        return ASTFProfile(default_ip_gen=ip,default_c_glob_info=glob,default_s_glob_info=glob,templates=ASTFTemplate(
++            client_template=ASTFTCPClientTemplate(program=c,ip_gen=ip,port=80,cps=1),
++            server_template=ASTFTCPServerTemplate(program=s,assoc=ASTFAssociationRule(port=80)),tg_name='http2'))
++def register():return Profile()
+diff --git a/scripts/astf/http_verified.py b/scripts/astf/http_verified.py
+new file mode 100644
+--- /dev/null
++++ b/scripts/astf/http_verified.py
+@@ -0,0 +1,29 @@
++"""Validated HTTP/1.1 over ordinary TCP, with SYN-based TTFB/TTLB."""
++import argparse
++from trex.astf.api import *
++
++class Profile:
++    def get_profile(self, tunables, **kwargs):
++        parser=argparse.ArgumentParser(description=__doc__)
++        parser.add_argument('--responses',type=int,default=10)
++        parser.add_argument('--body-size',type=int,default=16384)
++        args=parser.parse_args(tunables)
++        if not 1<=args.responses<=1000000 or not 0<=args.body_size<=1048576:
++            parser.error('responses must be 1..1000000; body-size must be 0..1048576')
++        c=ASTFProgram(http={'responses':args.responses,'expected_status':200,'transactions':True,**({'body_contains':'x'} if args.body_size else {})})
++        s=ASTFProgram(side='s')
++        request=b'GET / HTTP/1.1\r\nHost: localhost\r\n\r\n'
++        response=('HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n' % args.body_size).encode('ascii')+b'x'*args.body_size
++        c.set_var('n',args.responses); c.set_label('request')
++        c.http_request_start(); c.send(request); c.recv(len(response)); c.jmp_nz('n','request')
++        s.set_var('n',args.responses); s.set_label('response')
++        s.recv(len(request)); s.send(response); s.jmp_nz('n','response')
++        ip=ASTFIPGen(glob=ASTFIPGenGlobal(ip_offset='1.0.0.0'),
++                    dist_client=ASTFIPGenDist(ip_range=['16.0.0.1','16.0.0.254'],distribution='seq'),
++                    dist_server=ASTFIPGenDist(ip_range=['48.0.0.1','48.0.0.254'],distribution='seq'))
++        template=ASTFTemplate(client_template=ASTFTCPClientTemplate(program=c,ip_gen=ip,port=80,cps=1),
++                              server_template=ASTFTCPServerTemplate(program=s,assoc=ASTFAssociationRule(port=80)))
++        return ASTFProfile(default_ip_gen=ip,templates=template)
++
++def register():
++    return Profile()
+diff --git a/scripts/astf/https2.py b/scripts/astf/https2.py
+new file mode 100644
+--- /dev/null
++++ b/scripts/astf/https2.py
+@@ -0,0 +1,27 @@
++"""Native HTTP/2 over TLS; no captured frames or external proxy."""
++from trex.astf.api import *
++import argparse
++
++class Profile:
++    def get_profile(self,tunables,**kwargs):
++        p=argparse.ArgumentParser()
++        p.add_argument('--cert',required=True);p.add_argument('--key',required=True)
++        p.add_argument('--ca',required=True);p.add_argument('--sni',default='localhost')
++        p.add_argument('--requests',type=int,default=10)
++        p.add_argument('--concurrency',type=int,default=4)
++        p.add_argument('--body_size',type=int,default=16384)
++        p.add_argument('--mss',type=int,default=1440)
++        p.add_argument('--timeout_ms',type=int,default=30000)
++        a=p.parse_args(tunables)
++        c=ASTFProgram(tls={'sni':a.sni,'ca':a.ca},http2={
++            'authority':a.sni,'requests':a.requests,'concurrency':a.concurrency,'timeout_ms':a.timeout_ms})
++        s=ASTFProgram(side='s',tls={'cert':a.cert,'key':a.key},http2={
++            'concurrency':a.concurrency,'body_size':a.body_size,'timeout_ms':a.timeout_ms})
++        ip=ASTFIPGen(glob=ASTFIPGenGlobal(ip_offset='1.0.0.0'),
++            dist_client=ASTFIPGenDist(ip_range=['16.0.0.1','16.0.0.255'],distribution='seq'),
++            dist_server=ASTFIPGenDist(ip_range=['48.0.0.1','48.0.0.255'],distribution='seq'))
++        glob=ASTFGlobalInfo();glob.tcp.mss=a.mss
++        return ASTFProfile(default_ip_gen=ip,default_c_glob_info=glob,default_s_glob_info=glob,templates=ASTFTemplate(
++            client_template=ASTFTCPClientTemplate(program=c,ip_gen=ip,port=443,cps=1),
++            server_template=ASTFTCPServerTemplate(program=s,assoc=ASTFAssociationRule(port=443)),tg_name='http2'))
++def register():return Profile()
+diff --git a/scripts/astf/https_native.py b/scripts/astf/https_native.py
+new file mode 100644
+--- /dev/null
++++ b/scripts/astf/https_native.py
+@@ -0,0 +1,63 @@
++"""Native ASTF TLS. Paths are local to the TRex server (not the API client)."""
++import argparse
++from trex.astf.api import *
++
++
++class Profile:
++    def get_profile(self, tunables, **kwargs):
++        parser = argparse.ArgumentParser(description=__doc__)
++        parser.add_argument('--version', choices=['1.2', '1.3'], default='1.3')
++        parser.add_argument('--cert', default='/tmp/trex-cert.pem')
++        parser.add_argument('--key', default='/tmp/trex-key.pem')
++        parser.add_argument('--ca', default='/tmp/trex-cert.pem')
++        parser.add_argument('--psk', help='16..64 bytes encoded as hex; lab traffic only')
++        parser.add_argument('--resumption', action='store_true', help='Enable certificate session tickets and bounded client cache')
++        parser.add_argument('--h2', action='store_true', help='Scripted single-stream HTTP/2 exchange between TRex endpoints')
++        args = parser.parse_args(tunables)
++        c = dict(version=args.version, resumption=args.resumption, alpn='h2' if args.h2 else 'http/1.1')
++        s = dict(c)
++        if args.psk:
++            c.update(psk_identity='trex', psk_hex=args.psk)
++            s.update(psk_identity='trex', psk_hex=args.psk)
++        else:
++            c.update(sni='localhost', ca=args.ca)
++            s.update(cert=args.cert, key=args.key)
++        client = ASTFProgram(tls=c)
++        server = ASTFProgram(side='s', tls=s)
++        if args.h2:
++            def frame(kind, flags, stream, payload=b''):
++                return len(payload).to_bytes(3, 'big') + bytes([kind, flags]) + stream.to_bytes(4, 'big') + payload
++            settings = frame(4, 0, 0)
++            ack = frame(4, 1, 0)
++            preface = b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n' + settings
++            # HPACK static indices: GET, https, /. Literal :authority=localhost.
++            headers = frame(1, 5, 1, b'\x82\x87\x84\x01\x09localhost')
++            response = frame(1, 4, 1, b'\x88') + frame(0, 1, 1, b'hello\n')
++            client.send(preface)
++            client.recv(len(settings) + len(ack))
++            client.send(ack + headers)
++            client.recv(len(response))
++            server.recv(len(preface))
++            server.send(settings + ack)
++            server.recv(len(ack) + len(headers))
++            server.send(response)
++        else:
++            request = b'GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n'
++            response = b'HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nhello\n'
++            client.send(request)
++            client.recv(len(response))
++            server.recv(len(request))
++            server.send(response)
++        client.add_stats('A', 1)
++        server.add_stats('A', 1)
++        ip_gen = ASTFIPGen(glob=ASTFIPGenGlobal(ip_offset='1.0.0.0'),
++                          dist_client=ASTFIPGenDist(ip_range=['16.0.0.1', '16.0.0.254'], distribution='seq'),
++                          dist_server=ASTFIPGenDist(ip_range=['48.0.0.1', '48.0.0.254'], distribution='seq'))
++        template = ASTFTemplate(
++            client_template=ASTFTCPClientTemplate(program=client, ip_gen=ip_gen, port=443, cps=1),
++            server_template=ASTFTCPServerTemplate(program=server, assoc=ASTFAssociationRule(port=443)))
++        return ASTFProfile(default_ip_gen=ip_gen, templates=template)
++
++
++def register():
++    return Profile()
+diff --git a/scripts/astf/https_verified.py b/scripts/astf/https_verified.py
+new file mode 100644
+--- /dev/null
++++ b/scripts/astf/https_verified.py
+@@ -0,0 +1,52 @@
++"""TLS policy, optional mTLS and validated HTTP/1.1 with SYN-based latency."""
++import argparse
++from trex.astf.api import *
++
++class Profile:
++    def get_profile(self, tunables, **kwargs):
++        parser = argparse.ArgumentParser(description=__doc__)
++        parser.add_argument('--version', choices=['1.2','1.3'], default='1.3')
++        parser.add_argument('--cert', required=True)
++        parser.add_argument('--key', required=True)
++        parser.add_argument('--ca', required=True)
++        parser.add_argument('--sni', default='localhost')
++        parser.add_argument('--client-cert')
++        parser.add_argument('--client-key')
++        parser.add_argument('--client-ca')
++        parser.add_argument('--cipher-suite')
++        parser.add_argument('--groups', nargs='+')
++        parser.add_argument('--signature-algorithms', nargs='+')
++        parser.add_argument('--responses', type=int, default=10)
++        parser.add_argument('--body-size', type=int, default=16384)
++        args=parser.parse_args(tunables)
++        if not 1 <= args.responses <= 1000000 or not 0 <= args.body_size <= 1048576:
++            parser.error('responses must be 1..1000000; body-size must be 0..1048576')
++        mtls=[args.client_cert,args.client_key,args.client_ca]
++        if any(mtls) and not all(mtls):
++            parser.error('mTLS needs --client-cert, --client-key and --client-ca')
++        policy=dict(version=args.version, resumption=False)
++        for name in ('cipher_suite','groups','signature_algorithms'):
++            value=getattr(args,name)
++            if value is not None: policy[name]=value
++        ct=dict(policy,sni=args.sni,ca=args.ca)
++        st=dict(policy,cert=args.cert,key=args.key)
++        if all(mtls):
++            ct.update(cert=args.client_cert,key=args.client_key)
++            st.update(require_client_cert=True,ca=args.client_ca)
++        client=ASTFProgram(tls=ct,http=dict(responses=args.responses,expected_status=200,transactions=True,**({'body_contains':'x'} if args.body_size else {})))
++        server=ASTFProgram(side='s',tls=st)
++        request=('GET / HTTP/1.1\r\nHost: '+args.sni+'\r\n\r\n').encode('ascii')
++        response=('HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n' % args.body_size).encode('ascii')+b'x'*args.body_size
++        client.set_var('n',args.responses); client.set_label('request')
++        client.http_request_start(); client.send(request); client.recv(len(response)); client.jmp_nz('n','request')
++        server.set_var('n',args.responses); server.set_label('response')
++        server.recv(len(request)); server.send(response); server.jmp_nz('n','response')
++        ip=ASTFIPGen(glob=ASTFIPGenGlobal(ip_offset='1.0.0.0'),
++                    dist_client=ASTFIPGenDist(ip_range=['16.0.0.1','16.0.0.254'],distribution='seq'),
++                    dist_server=ASTFIPGenDist(ip_range=['48.0.0.1','48.0.0.254'],distribution='seq'))
++        template=ASTFTemplate(client_template=ASTFTCPClientTemplate(program=client,ip_gen=ip,port=443,cps=1),
++                              server_template=ASTFTCPServerTemplate(program=server,assoc=ASTFAssociationRule(port=443)))
++        return ASTFProfile(default_ip_gen=ip,templates=template)
++
++def register():
++    return Profile()
+diff --git a/scripts/astf/tcp_https_16KB_ecdsa.py b/scripts/astf/tcp_https_16KB_ecdsa.py
+new file mode 100644
+--- /dev/null
++++ b/scripts/astf/tcp_https_16KB_ecdsa.py
+@@ -0,0 +1,143 @@
++"""TLS 1.3 throughput profile for native TLS v4.1; ECDSA lab certificate defaults.
++Certificate paths refer to the TRex server filesystem.
++"""
++# Direct execution delegates before importing the ASTF API. The runner finds it.
++if __name__ == '__main__':
++    import sys
++    from pathlib import Path
++    from run_https_stats import main
++    sys.argv[1:1] = ['--profile', str(Path(__file__).resolve())]
++    sys.exit(main())
++
++from trex.astf.api import *
++import argparse
++import os
++
++
++class Prof1():
++    def __init__(self):
++        self.p1_src_start_ip = '16.0.0.1'
++        self.p1_src_end_ip = '16.0.255.199'
++
++        self.p1_dst_start_ip = '48.0.0.1'
++        self.p1_dst_end_ip = '48.1.255.199'
++
++        self.http_req = ('GET /index.html HTTP/1.1\r\n' \
++                         'Host: {host}\r\n' \
++                         'Connection: Keep-Alive\r\n' \
++                         'User-Agent: Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 5.1; SV1; .NET CLR 1.1.4322; .NET CLR 2.0.50727)\r\n' \
++                         'Accept: */*\r\n' \
++                         'Accept-Language: en-us\r\n' \
++                         'Accept-Encoding: gzip, deflate, compress\r\n' \
++                         '\r\n'
++                         .format(host=self.p1_dst_start_ip))
++
++        self.http_response_template = 'HTTP/1.1 200 OK\r\n' \
++                                      'Server: Microsoft-IIS/6.0\r\n' \
++                                      'Content-Type: text/html\r\n' \
++                                      'Content-Length: {0}\r\n' \
++                                      '\r\n' \
++                                      '<html><pre>{1}</pre></html>'
++
++        self.response_body_tags_bytes = 24
++
++
++    def create_profile(self, resp_size, delay, flow_size, ramp_up, args):
++
++        http_response = self.http_response_template.format(resp_size, '*' * ( resp_size - self.response_body_tags_bytes ))
++        client_tls = dict(version=args.tls_version, alpn='http/1.1',
++                          sni=args.sni, ca=args.ca, verify=True,
++                          resumption=False, cipher_suite=args.cipher_suite)
++        server_tls = dict(version=args.tls_version, alpn='http/1.1',
++                          cert=args.cert, key=args.key,
++                          resumption=False, cipher_suite=args.cipher_suite)
++        # One TLS session carries all flow_size HTTP transactions.
++        # client commands
++        prog_c = ASTFProgram(tls=client_tls)
++        prog_c.set_var("i", flow_size)
++        prog_c.set_label("a:")
++        prog_c.send(self.http_req)
++        prog_c.recv(len(http_response))
++        prog_c.jmp_nz("i", "a:")
++        # implicit  close
++
++        # server commands
++        prog_s = ASTFProgram(side='s', tls=server_tls)
++        prog_s.set_var("i", flow_size)
++        prog_s.set_label("a:")
++        prog_s.recv(len(self.http_req))
++        if delay: prog_s.delay(delay)
++        prog_s.send(http_response)
++        prog_s.jmp_nz("i", "a:")
++        prog_s.wait_for_peer_close()
++
++        # ip generator
++        ip_gen_c = ASTFIPGenDist(ip_range=[self.p1_src_start_ip, self.p1_src_end_ip], distribution="rand")
++        ip_gen_s = ASTFIPGenDist(ip_range=[self.p1_dst_start_ip, self.p1_dst_end_ip], distribution="rand")
++        ip_gen = ASTFIPGen(glob=ASTFIPGenGlobal(ip_offset="1.0.0.0"),
++                           dist_client=ip_gen_c,
++                           dist_server=ip_gen_s)
++
++        # template
++        temp_c = ASTFTCPClientTemplate(program=prog_c, ip_gen=ip_gen, port=443, cps=1)
++        temp_s = ASTFTCPServerTemplate(program=prog_s, assoc=ASTFAssociationRule(port=443))
++        template = ASTFTemplate(client_template=temp_c, server_template=temp_s)
++
++        # Set rx/tx buffer to 64K. TCP window size also will be 64K
++        c_glob_info = ASTFGlobalInfo()
++        c_glob_info.tcp.rxbufsize = 65535
++        c_glob_info.tcp.txbufsize = 65535
++        if ramp_up: c_glob_info.scheduler.rampup_sec = ramp_up
++        s_glob_info = ASTFGlobalInfo()
++        s_glob_info.tcp.rxbufsize = 65535
++        s_glob_info.tcp.txbufsize = 65535
++
++        # profile
++        return ASTFProfile(default_ip_gen=ip_gen,
++                           default_c_glob_info=c_glob_info,
++                           default_s_glob_info=s_glob_info,
++                           templates=template)
++
++    def get_profile(self, tunables, **kwargs):
++        parser = argparse.ArgumentParser(description='Argparser for {}'.format(os.path.basename(__file__)), 
++                                         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
++        parser.add_argument('--response_size_kb',
++                            type=int,
++                            default=16,
++                            help='The response size in KB')
++        parser.add_argument('--delay',
++                            type=int,
++                            default=None,
++                            help='Server response delay (usec)')
++        parser.add_argument('--flow_size',
++                            type=int,
++                            default=10,
++                            help='Flow size (transactions)')
++        parser.add_argument('--ramp_up',
++                            type=int,
++                            default=0,
++                            help='Ramp up period (sec)')
++        parser.add_argument('--tls_version', choices=['1.3'], default='1.3')
++        parser.add_argument('--cipher_suite', choices=['TLS_AES_128_GCM_SHA256', 'TLS_AES_256_GCM_SHA384', 'TLS_CHACHA20_POLY1305_SHA256'], default='TLS_AES_128_GCM_SHA256')
++        parser.add_argument('--cert', default='/tmp/trex-ecdsa/cert.pem')
++        parser.add_argument('--key', default='/tmp/trex-ecdsa/key.pem')
++        parser.add_argument('--ca', default='/tmp/trex-ecdsa/cert.pem')
++        parser.add_argument('--sni', default='localhost', help='Must match certificate SAN')
++        parser.add_argument('--resumption', action='store_true',
++                            help='Rejected: this benchmark requires full handshakes')
++        args, unknown = parser.parse_known_args(tunables)
++        if args.resumption:
++            parser.error('This full-handshake profile disables resumption (RFC 9411)')
++        if unknown:
++            raise Exception('unrecognized arguments {0}\n{1}'.format(unknown, parser.format_usage()))
++        if args.response_size_kb < 1 or args.flow_size < 1:
++            parser.error('response_size_kb and flow_size must be positive')
++        if args.ramp_up < 0 or (args.delay is not None and args.delay < 0):
++            parser.error('delay and ramp_up must be nonnegative')
++        resp_size = args.response_size_kb * 1024
++        return self.create_profile(resp_size, args.delay, args.flow_size, args.ramp_up, args)
++
++
++def register():
++    return Prof1()
++
+diff --git a/scripts/astf/tls_openssl3_compat.cnf b/scripts/astf/tls_openssl3_compat.cnf
+new file mode 100644
+--- /dev/null
++++ b/scripts/astf/tls_openssl3_compat.cnf
+@@ -0,0 +1,11 @@
++# Optional compatibility policy for migrating an OpenSSL 3.0 default-provider
++# workload to a newer OpenSSL. Keeps classical groups and X25519 preference.
++# Select explicitly through OPENSSL_CONF when starting TRex. This file is not
++# a replacement for a site's custom provider/FIPS policy; merge that policy.
++openssl_conf = initialization
++[initialization]
++ssl_conf = tls_configuration
++[tls_configuration]
++system_default = classical_groups
++[classical_groups]
++Groups = X25519:P-256:X448:P-521:P-384:ffdhe2048:ffdhe3072:ffdhe4096:ffdhe6144:ffdhe8192
+diff --git a/scripts/astf/udp_imix_rtt.py b/scripts/astf/udp_imix_rtt.py
+new file mode 100644
+--- /dev/null
++++ b/scripts/astf/udp_imix_rtt.py
+@@ -0,0 +1,86 @@
++from trex.astf.api import *
++import argparse
++
++UDP_REQ_BASE = 'x'
++UDP_RESP_BASE = 'y'
++FCS = 4
++ETHER_HEADER = 14
++IP_HEADER = 20
++UDP_HEADER = 8
++FRAME_HEADERS = FCS + ETHER_HEADER + IP_HEADER + UDP_HEADER
++
++
++class Prof1():
++    def __init__(self):
++        pass  # tunables
++
++    def create_profile(self, ramp_up, frame_size, delay, flow_size, timeout_ms):
++        if not 64 <= frame_size <= 1518:
++            raise ValueError("frame_size_b must be 64..1518 for untagged IPv4/MTU 1500")
++        if flow_size < 2 or flow_size % 2:
++            raise ValueError("flow_size must be positive and even (request/response pairs)")
++
++        # client commands
++        udp_req = UDP_REQ_BASE * (frame_size - FRAME_HEADERS)
++        prog_c = ASTFProgram(stream=False)
++        for i in range(0, int(flow_size / 2)):
++            prog_c.udp_request(udp_req, timeout_ms=timeout_ms)
++
++        udp_resp = UDP_RESP_BASE * (frame_size - FRAME_HEADERS)
++        prog_s = ASTFProgram(stream=False)
++        for i in range(0, int(flow_size / 2)):
++            prog_s.recv_msg(1)
++            if delay: prog_s.delay(delay)
++            prog_s.send_msg(udp_resp)
++
++        # ip generator
++        ip_gen_c = ASTFIPGenDist(ip_range=["10.0.0.1", "10.0.255.199"], distribution="rand")
++        ip_gen_s = ASTFIPGenDist(ip_range=["48.0.0.1", "48.1.255.199"], distribution="rand")
++        ip_gen = ASTFIPGen(glob=ASTFIPGenGlobal(ip_offset="1.0.0.0"),
++                           dist_client=ip_gen_c,
++                           dist_server=ip_gen_s)
++
++        # template
++        assoc = ASTFAssociationRule(port=53)
++        temp_c = ASTFTCPClientTemplate(program=prog_c, ip_gen=ip_gen, port=53)
++        temp_s = ASTFTCPServerTemplate(program=prog_s, assoc=assoc)
++        template = ASTFTemplate(client_template=temp_c, server_template=temp_s, tg_name="udp_rtt")
++        # UDP does not use the TCP socket buffer settings.
++        c_glob_info = ASTFGlobalInfo()
++        if ramp_up: c_glob_info.scheduler.rampup_sec = ramp_up
++        s_glob_info = ASTFGlobalInfo()
++        # profile
++        profile = ASTFProfile(default_ip_gen=ip_gen,
++                              default_c_glob_info=c_glob_info,
++                              default_s_glob_info=s_glob_info,
++                              templates=template)
++        return profile
++
++    def get_profile(self, tunables, **kwargs):
++        parser = argparse.ArgumentParser(description='Argparser for {}'.format(os.path.basename(__file__)),
++                                         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
++        parser.add_argument('--frame_size_b',
++                            type=int,
++                            default=64,
++                            help='Frame size with FCS, bytes')
++        parser.add_argument('--delay',
++                            type=int,
++                            default=None,
++                            help='Server response delay (usec)')
++        parser.add_argument('--flow_size',
++                            type=int,
++                            default=2,
++                            help='Flow size (packets)')
++        parser.add_argument('--ramp_up',
++                            type=int,
++                            default=0,
++                            help='Ramp up period (sec)')
++        parser.add_argument("--timeout_ms", type=int, default=1000, help="UDP response deadline (ms)")
++        args, unknown = parser.parse_known_args(tunables)
++        if unknown:
++            raise Exception('unrecognized arguments {0}\n{1}'.format(unknown, parser.format_usage()))
++        return self.create_profile(args.ramp_up, args.frame_size_b, args.delay, args.flow_size, args.timeout_ms)
++
++
++def register():
++    return Prof1()
