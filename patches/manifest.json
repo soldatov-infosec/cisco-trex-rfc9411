@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "release": "1.0.0",
+  "release": "1.0.1",
   "upstream": {
     "repository": "https://github.com/cisco-system-traffic-generator/trex-core",
     "tag": "v3.06",
@@ -156,14 +156,14 @@
     {
       "path": "src/44bsd/netinet/tcp_output.c",
       "base_sha256": "7a61b821df7178d9b4d78e3494a0f9f3720461cc6ca0713f189805fbfedb78ed",
-      "result_sha256": "8603fe08ca3d58e6c4f10d7883a532f0a1ceb3ab8d4f8c31171a027d59f2c876",
+      "result_sha256": "59206bf76215da3a4dcb807fafc72300880e31e9210570542856272ea8571ba2",
       "patch": "0004-astf-transport-and-latency.patch",
       "origin": "rfc9411-extension"
     },
     {
       "path": "src/44bsd/netinet/tcp_socket.h",
       "base_sha256": "486c61749e72d15d3fae1c211c3b388b9b9eb6e0f947b16d60842f5e66f48c50",
-      "result_sha256": "5df9f213b62861429e74b042851d2b525d43f78da20bf25b4eed9345bffe0dbe",
+      "result_sha256": "41251701569ac58dc274bea2036895413a3b407960a58e67da8c5f4e6ba5cce2",
       "patch": "0004-astf-transport-and-latency.patch",
       "origin": "rfc9411-extension"
     },
@@ -191,14 +191,14 @@
     {
       "path": "src/44bsd/tcp_socket.cpp",
       "base_sha256": "28ee61929c1616bb8958bd7606a3ef3f24fc132ccea5fc6a0031ecff9021c589",
-      "result_sha256": "68759339569c684eff2b65f1f3036bbd1134285d0ea18f597c748e342d18ee80",
+      "result_sha256": "cd56ecb564015989eaa13744e111e354676db0452aba803036bfe99828293982",
       "patch": "0004-astf-transport-and-latency.patch",
       "origin": "rfc9411-extension"
     },
     {
       "path": "src/44bsd/tcp_socket.h",
       "base_sha256": "145b2cf004bc7504f9e09022f6c489a50798f214dd41e9b2000d721e6a536171",
-      "result_sha256": "457cda5fed6220acec01430d98c2f00331e8373cf7ee87151195486e41acc0aa",
+      "result_sha256": "47e7f9314ff580d2667e5563c04d9dabecbff1aa2c905273496e633395d86987",
       "patch": "0004-astf-transport-and-latency.patch",
       "origin": "rfc9411-extension"
     },
@@ -212,7 +212,7 @@
     {
       "path": "src/44bsd/tcp_var.h",
       "base_sha256": "a1097351e7ad2a14bd9e31effd746aa5cfa315b64a6628d5d1a528e1afd8a20b",
-      "result_sha256": "02763d8a0448ef5931853b3ba8f73781971976beadc3a1a346e5d174fe22dd8b",
+      "result_sha256": "730ba0e2e3e002cf460d219a95e69db053da61051a9aafbfcbfe5793655d516b",
       "patch": "0004-astf-transport-and-latency.patch",
       "origin": "rfc9411-extension"
     },
@@ -331,7 +331,7 @@
     {
       "path": "src/bp_sim_tcp.cpp",
       "base_sha256": "09cfade03f3c543b1d22f19a9db5c2e09ec4e9e52dd7d9b3534e94781ea5779b",
-      "result_sha256": "3a1b4e9b7e68698e62c438070ee1cfa424c01e777ddaeca5cdf6f08dbb189710",
+      "result_sha256": "43a108f7f8e9962301e4ef8c18aa0567b47317a7a3651091e03609d7b030809c",
       "patch": "0006-scheduler-and-diagnostics.patch",
       "origin": "rfc9411-extension"
     },
@@ -359,14 +359,14 @@
     {
       "path": "src/44bsd/sim_cs_tcp.cpp",
       "base_sha256": "5aa5be3f2215c114a4fa84570bf99a661cff5eaf95db3ba82151f2a6875dbed5",
-      "result_sha256": "ae25abf7b0dfc58aae66249551faa225c49c11b3436e727a1af38395f88f8983",
+      "result_sha256": "ad7af9f304e0aa5efacef4da5820cf0ca4380a02a07938252d6125712ec08d84",
       "patch": "0007-tests-and-simulator.patch",
       "origin": "rfc9411-extension"
     },
     {
       "path": "src/44bsd/sim_cs_tcp.h",
       "base_sha256": "da53e314dfd495da256adcd2fc8187bda4c9ef7a3bafa8c53142b968d1aa2ad8",
-      "result_sha256": "7da8a2506f0208c81779c97450fd5ac924544c0fc204c8d31b8254a04aaaed2e",
+      "result_sha256": "00223980a44f88e8a8af74116f662c70202c73f26cce7c96279f6e1660a4a6bb",
       "patch": "0007-tests-and-simulator.patch",
       "origin": "rfc9411-extension"
     },
@@ -380,7 +380,7 @@
     {
       "path": "src/gtest/bp_tcp_gtest.cpp",
       "base_sha256": "3795ee9f4fc86fb9f7fcb483fff9510fd132ad607958999116d9ca2bfa494109",
-      "result_sha256": "e915cf2f781bada0a0325b0d7bac43dbf2201f2fc06667fc56a4d82ef9632ae1",
+      "result_sha256": "67d9fa320cf7a7aa4264dd7ab03c6344ee22f9856f0ea1056a313724a0fd76f0",
       "patch": "0007-tests-and-simulator.patch",
       "origin": "rfc9411-extension"
     },
@@ -1041,6 +1041,20 @@
       "result_sha256": "7d017ead37663d223bcbd0f9aca31b3124612151ae8375fa5b2074b20c7738d3",
       "patch": "0009-nic-validation-toolkit.patch",
       "origin": "rfc9411-extension"
+    },
+    {
+      "path": "src/44bsd/flow_table.cpp",
+      "patch": "0004-astf-transport-and-latency.patch",
+      "base_sha256": "f432390d66918e86060f9495524750761b81a6c3edd171109a403905fcefb506",
+      "result_sha256": "2cfd94c46a4e5ad5534cfad972e6848d1ab75b70eb1d48d4075517d9b67a3da6",
+      "origin": "maintainer-addition"
+    },
+    {
+      "path": "src/44bsd/flow_table.h",
+      "patch": "0004-astf-transport-and-latency.patch",
+      "base_sha256": "6d22072ab73b1d5ef27b76a67752d5647535079f1c3faf5c9998b7683aa575b4",
+      "result_sha256": "c97c99c0f7c16c497c50f8540ea6d769822a9bfe9df73379466cbaf4135d10dc",
+      "origin": "maintainer-addition"
     }
   ],
   "patches": [
@@ -1058,7 +1072,7 @@
     },
     {
       "path": "0004-astf-transport-and-latency.patch",
-      "sha256": "05a646bbc2f7e7e79e1cc96ea681b6c64543b620fc111a356155db8cace73639"
+      "sha256": "d4d86d2a6ffa1a75735dfa964cb3ec05f2de66950863cc1d6c7d4bce15a1655d"
     },
     {
       "path": "0005-profile-api-and-loading.patch",
@@ -1066,11 +1080,11 @@
     },
     {
       "path": "0006-scheduler-and-diagnostics.patch",
-      "sha256": "173685047d78e083b77e3da58af1a2a84f6669f344d4371e9c586c2b1975a8cd"
+      "sha256": "2943d8ab7f50b6b24d8280ca4def8c4f9c9b572659c7531dbc2bfe87d24c9ebd"
     },
     {
       "path": "0007-tests-and-simulator.patch",
-      "sha256": "15a119d95f20df7075fee1fea3b0b11082323a632aba8c6af372a7a8da5ad6e9"
+      "sha256": "f48905e375a7e5eaea15dbd800aa71683f81bba486fc2dcb4484bc3c9cc623fa"
     },
     {
       "path": "0008-documentation-and-examples.patch",

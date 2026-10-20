@@ -1,5 +1,10 @@
 # Validation
 
+Current release: see the [1.0.1 queue review](rx-queue-review.md) and
+[machine-readable results](results.json). The table below records inherited
+1.0.0 validation, not newly repeated checks.
+
+
 Validation is split by scope. A passing simulator test is not a physical-NIC
 capacity result, and these checks do not certify an RFC 9411 experiment.
 
@@ -19,7 +24,7 @@ compiler/linker build and physical-NIC qualification of the final release artifa
 remain pending. A long coverage-guided fuzz campaign is not claimed. Hosted
 GitHub Actions has not yet run for this repository.
 
-See [profile validation](profiles.md), [machine-readable evidence](results.json)
+See [profile validation](profiles.md), [1.0.0 machine-readable evidence](results-1.0.0.json)
 and [repeatable commands](../docs/testing.md). No headline throughput or maximum
 CPS claim is made. Collect fresh results with your hardware, NUMA placement,
 profiles and DUT configuration before drawing performance conclusions.

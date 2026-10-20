@@ -1,0 +1,5 @@
+PASS: all source paths match 1.0.0 except the 11 RX-phase paths.
+PASS: RX queue and timestamp production code matches the NIC-tested experimental manifest.
+Additional production fix: tcp_output.c, netinet/tcp_socket.h and tcp_socket.cpp suppress unsolicited repeated FIN on TLS flows.
+Additional simulator/test changes: controlled packet loss and closure/queue regression cases.
+PASS: no source changes from the previous 1.0.1-1.0.3 candidates included.

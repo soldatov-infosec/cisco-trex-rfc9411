@@ -155,3 +155,9 @@ Paths below refer to the **patched TRex tree**, not this patch repository.
 | Regression tests | `tests/tls/`, `src/gtest/bp_tcp_gtest.cpp` |
 
 The [patch map](../patches/README.md) identifies where each component is maintained.
+
+## Transport-first TLS receive processing
+
+See the [RX phase diagram](release-1.0.1.md#receive-path) and
+[queue lifetime review](../validation/rx-queue-review.md) for the burst-local
+transport/TLS split, capacity fallback and flow destruction rules.

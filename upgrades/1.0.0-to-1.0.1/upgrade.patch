@@ -1,0 +1,774 @@
+diff --git a/src/44bsd/flow_table.cpp b/src/44bsd/flow_table.cpp
+--- a/src/44bsd/flow_table.cpp
++++ b/src/44bsd/flow_table.cpp
+@@ -437,6 +437,81 @@
+     flow->check_defer_function();
+ }
+ 
++#ifdef TREX_TLS
++#ifdef TREX_SIM
++unsigned CFlowTable::tls_rx_test_mode=2;
++#endif
++bool CFlowTable::defer_tls_ack(CTcpCb *tp) {
++    if (!m_ack_batch_active) return false;
++    // Do not collapse a whole receive flight into one ACK. Large GRO/LRO
++    // deliveries bypass batching, and a second ACK opportunity with new data
++    // flushes the first. With the normal ACK-every-two-segments policy this
++    // limits aggregation to approximately four wire segments.
++#ifdef TREX_SIM
++    const bool bounded=tls_rx_test_mode!=1 && tls_rx_test_mode!=3;
++#else
++    const bool bounded=true;
++#endif
++    const uint32_t unacked = uint32_t(tp->rcv_nxt - tp->last_ack_sent);
++    if (bounded && (!tp->t_maxseg || unacked >= uint64_t(tp->t_maxseg) * 4)) {
++        cancel_tls_ack(tp);
++        return false;
++    }
++    if (tp->m_ack_batch_slot) {
++        if(!bounded)return true;
++        const unsigned slot = tp->m_ack_batch_slot - 1;
++        if (m_ack_batch_seq[slot] == tp->rcv_nxt) return true;
++        cancel_tls_ack(tp);
++        return false;
++    }
++    if (m_ack_batch_used == 64) return false;
++    m_ack_batch_seq[m_ack_batch_used] = tp->rcv_nxt;
++    m_ack_batch[m_ack_batch_used++] = tp;
++    tp->m_ack_batch_slot = m_ack_batch_used;
++    return true;
++}
++void CFlowTable::cancel_tls_ack(CTcpCb *tp) {
++    if(tp->m_ack_batch_slot) {
++        m_ack_batch[tp->m_ack_batch_slot-1]=nullptr;tp->m_ack_batch_slot=0;
++    }
++}
++void CFlowTable::end_rx_ack_batch(CTcpPerThreadCtx *ctx) {
++    m_ack_batch_active=false;
++    for(unsigned i=0;i<m_ack_batch_used;++i) {
++        auto tp=m_ack_batch[i];m_ack_batch[i]=nullptr;
++        if(!tp)continue;
++        tp->m_ack_batch_slot=0;
++        // Application data may already have piggybacked the cumulative ACK.
++        if(tp->t_state==TCPS_ESTABLISHED && (tp->t_flags&TF_ACKNOW))tcp_output(tp);
++    }
++    m_ack_batch_used=0;
++    // Submit the transport output before running expensive application work.
++    if(ctx && m_tls_batch_used)ctx->m_cb->on_flush_tx();
++    m_tls_batch_active=false;
++    for(unsigned i=0;i<m_tls_batch_used;++i) {
++        auto tp=m_tls_batch[i];m_tls_batch[i]=nullptr;
++        if(!tp)continue;
++        tp->m_tls_batch_slot=0;
++        // The callback may close and delete this flow; do not access tp afterwards.
++        tp->m_flow->m_app.tls_run_deferred();
++    }
++    m_tls_batch_used=0;
++}
++bool CFlowTable::defer_tls_work(CTcpCb *tp) {
++    if(!m_tls_batch_active)return false;
++    if(tp->m_tls_batch_slot)return true;
++    // Capacity exhaustion falls back to immediate service, never drops data.
++    if(m_tls_batch_used==64)return false;
++    m_tls_batch[m_tls_batch_used++]=tp;tp->m_tls_batch_slot=m_tls_batch_used;
++    return true;
++}
++void CFlowTable::cancel_tls_work(CTcpCb *tp) {
++    if(tp->m_tls_batch_slot) {
++        m_tls_batch[tp->m_tls_batch_slot-1]=nullptr;tp->m_tls_batch_slot=0;
++    }
++}
++#endif
++
+ void HOT_FUNC CFlowTable::process_tcp_packet(CTcpPerThreadCtx * ctx,
+                                     CTcpFlow *  flow,
+                                     struct rte_mbuf * mbuf,
+@@ -447,7 +522,23 @@
+         tcphdr = *lpTcp;
+     }
+ 
++#ifdef TREX_TLS
++    // Only ordinary in-order data can defer a pure ACK within this RX burst.
++    // Reordering, duplicate data, FIN/RST, handshake and window reopening keep
++    // their immediate output paths. No timer or future burst is awaited.
++    auto &tp=flow->m_tcp;
++    tp.m_ack_batch_eligible=m_ack_batch_active && flow->m_app.is_tls() &&
++        tp.m_socket.so_rcv.sb_hiwat>=18437 &&
++        tp.t_state==TCPS_ESTABLISHED &&
++        lpTcp->getSeqNumber()==tp.rcv_nxt && ftuple.m_l7_total_len>0 &&
++        (lpTcp->getFlags() & ~(TCPHeader::Flag::ACK|TCPHeader::Flag::PSH))==0 &&
++        (lpTcp->getFlags() & TCPHeader::Flag::ACK) &&
++        !(tp.t_flags&TF_RXWIN0SENT) && tcp_reass_is_empty(&tp);
++#endif
+     tcp_flow_input(flow, mbuf, lpTcp, ftuple);
++#ifdef TREX_TLS
++    tp.m_ack_batch_eligible=false;
++#endif
+ 
+     if (unlikely(flow->new_template_identified())) {
+         /* identifying new template has been done */
+@@ -569,6 +660,10 @@
+         delete udp_flow;
+     }else{
+         CTcpFlow * tcp_flow=(CTcpFlow *)flow;
++#ifdef TREX_TLS
++        cancel_tls_ack(&tcp_flow->m_tcp);
++        cancel_tls_work(&tcp_flow->m_tcp);
++#endif
+         flow->m_pctx->clear_flow_info(tcp_flow);
+         tcp_flow->Delete();
+         delete tcp_flow;
+diff --git a/src/44bsd/flow_table.h b/src/44bsd/flow_table.h
+--- a/src/44bsd/flow_table.h
++++ b/src/44bsd/flow_table.h
+@@ -265,8 +265,37 @@
+ };
+ 
+ 
++class CTcpCb;
++
+ class CFlowTable {
+ public:
++#ifdef TREX_TLS
++#ifdef TREX_SIM
++    static unsigned tls_rx_test_mode;
++#endif
++    void begin_rx_ack_batch() {
++        m_ack_batch_active=true;m_tls_batch_active=true;
++#ifdef TREX_SIM
++        m_ack_batch_active=tls_rx_test_mode!=0;
++        m_tls_batch_active=tls_rx_test_mode>=2;
++#endif
++    }
++    void end_rx_ack_batch(CTcpPerThreadCtx *ctx=nullptr);
++    bool defer_tls_work(CTcpCb *tp);
++    void cancel_tls_work(CTcpCb *tp);
++    bool defer_tls_ack(CTcpCb *tp);
++    void cancel_tls_ack(CTcpCb *tp);
++private:
++    CTcpCb *m_tls_batch[64] = {};
++    unsigned m_tls_batch_used=0;
++    bool m_tls_batch_active=false;
++    CTcpCb *m_ack_batch[64] = {};
++    uint32_t m_ack_batch_seq[64] = {};
++    unsigned m_ack_batch_used=0;
++    bool m_ack_batch_active=false;
++public:
++#endif
++
+     bool Create(uint32_t size,
+                 bool client_side);
+ 
+diff --git a/src/44bsd/netinet/tcp_output.c b/src/44bsd/netinet/tcp_output.c
+--- a/src/44bsd/netinet/tcp_output.c
++++ b/src/44bsd/netinet/tcp_output.c
+@@ -369,6 +369,17 @@
+             flags &= ~TH_FIN;
+     }
+ 
++    /* TLS may acknowledge close_notify before its peer's close_notify arrives.
++     * Once our FIN is in flight, acknowledging that later input must not resend
++     * the FIN just because the state still contains TH_FIN. A real retransmit
++     * rewinds snd_nxt below snd_max, and therefore retains the FIN here.
++     * Keep the legacy behavior for applications outside the TLS adapter.
++     */
++    if (!len && !sack_rxmit && (flags & TH_FIN) &&
++        (tp->t_flags & TF_SENTFIN) && tp->snd_nxt == tp->snd_max &&
++        so_is_tls(so))
++        flags &= ~TH_FIN;
++
+     recwin = lmin(lmax(sbspace(&so->so_rcv), 0),
+         (long)TCP_MAXWIN << tp->rcv_scale);
+ 
+@@ -558,6 +569,14 @@
+     return (0);
+ 
+ send:
++#ifdef TREX_TLS
++    /* Coalesce cumulative ACKs only inside an already received DP burst.
++     * Do not defer control, data, retransmit or receive-window reopening. */
++    if (len==0 && flags==TH_ACK && tp->t_state==TCPS_ESTABLISHED &&
++        (tp->t_flags&TF_ACKNOW) && !(tp->t_flags&TF_RXWIN0SENT) &&
++        tp->snd_nxt==tp->snd_max && so_defer_tls_ack(so))
++        return 0;
++#endif
+     /*
+      * Before ESTABLISHED, force sending of initial options
+      * unless TCP set not to do any options.
+diff --git a/src/44bsd/netinet/tcp_socket.h b/src/44bsd/netinet/tcp_socket.h
+--- a/src/44bsd/netinet/tcp_socket.h
++++ b/src/44bsd/netinet/tcp_socket.h
+@@ -64,6 +64,8 @@
+ void sbdrop(struct sockbuf *sb, int len, struct socket *so);
+ 
+ /* C ABI: no TLS-dependent structure layout is exposed to the TCP C code. */
++int so_is_tls(struct socket *so);
++int so_defer_tls_ack(struct socket *so);
+ int so_requires_tls_ack_output(struct socket *so);
+ void so_http_syn(struct socket *so);
+ void so_rx_timestamp(struct socket *so);
+diff --git a/src/44bsd/sim_cs_tcp.cpp b/src/44bsd/sim_cs_tcp.cpp
+--- a/src/44bsd/sim_cs_tcp.cpp
++++ b/src/44bsd/sim_cs_tcp.cpp
+@@ -1,3 +1,8 @@
++#include <ctime>
++#include <cstdlib>
++static const bool rx_phase_all=std::getenv("TREX_RX_PHASE_ALL")!=nullptr;
++bool rx_phase_benchmark=false;
++double rx_phase_cpu=0;
+ /*
+  Hanoh Haim
+  Cisco Systems, Inc.
+@@ -116,6 +121,7 @@
+ void  CTcpCtxPcapWrt::write_pcap_mbuf(rte_mbuf_t *m,
+                                       double time){
+ 
++    if(rx_phase_benchmark)return;
+     char *p;
+     uint32_t pktlen=m->pkt_len;
+     if (pktlen>MAX_PKT_SIZE) {
+@@ -394,6 +400,13 @@
+     for (CTxRxCallback* callback : m_callbacks) {
+         callback->on_tx(dir, m);
+     }
++#ifdef TREX_TLS
++    if (m_drop_next_tx_test) {
++        m_drop_next_tx_test = false;
++        rte_pktmbuf_free(m);
++        return;
++    }
++#endif
+     on_tx_shaper(dir,m); /* start shaping */
+ }
+ 
+@@ -402,7 +415,12 @@
+                              rte_mbuf_t *m){
+ 
+     if (!m_shaper_enable){
+-        m_tx_diff+=1/1000000.0;  /* to make sure there is no out of order */
++#ifdef TREX_TLS
++        // Preserve packet order inside a synthetic NIC burst.
++        m_tx_diff += m_rx_burst_test ? 1e-12 : 1e-6;
++#else
++        m_tx_diff += 1e-6;
++#endif
+     }
+     double t=m_sim.get_time()+m_tx_diff;
+ 
+@@ -562,6 +580,7 @@
+      m_time +=m_d_time;
+      m_p->m_c_ctx.timer_w_on_tick();
+      m_p->m_s_ctx.timer_w_on_tick();
++      if(rx_phase_benchmark && m_p->m_c_ctx.get_tcpstat()->m_sts.tcps_closed && m_p->m_s_ctx.get_tcpstat()->m_sts.tcps_closed){reschedule=false;return true;}
+      return(false);
+  }
+ 
+@@ -579,6 +598,26 @@
+ }
+ 
+ 
++#ifdef TREX_TLS
++// Test-only grouping of packets with the same simulated arrival time.
++// The epsilon lets all already scheduled RX events run before ACK emission.
++class CTcpSimAckFlush : public CSimEventBase {
++public:
++    CTcpSimAckFlush(CClientServerTcp *sim, int dir, double time)
++        : m_simulator(sim), m_dir(dir) { m_time = time; }
++    bool on_event(CSimEventDriven *, bool &reschedule) override {
++        reschedule = false;
++        m_simulator->m_rx_ack_batch_pending[m_dir] = false;
++        auto &ctx = m_dir ? m_simulator->m_s_ctx : m_simulator->m_c_ctx;
++        ctx.m_ft.end_rx_ack_batch();
++        return false;
++    }
++private:
++    CClientServerTcp *m_simulator;
++    int m_dir;
++};
++#endif
++
+ void CClientServerTcp::on_rx(int dir,
+                              rte_mbuf_t *m){
+     for (CTxRxCallback* callback : m_callbacks) {
+@@ -599,6 +638,13 @@
+         m_c_pcap.write_pcap_mbuf(m,t);
+     }
+ 
++#ifdef TREX_TLS
++    if ((m_rx_ack_batch_test || rx_phase_all) && !m_rx_ack_batch_pending[dir]) {
++        m_rx_ack_batch_pending[dir] = true;
++        ctx->m_ft.begin_rx_ack_batch();
++        m_sim.add_event(new CTcpSimAckFlush(this, dir, t + 1e-9));
++    }
++#endif
+     ctx->m_ft.rx_handle_packet(ctx,m,false,0);
+ }
+ 
+@@ -1200,11 +1246,20 @@
+     m_sim.add_event( new CTcpSimEventTimers(this, (((double)(TCP_TIMER_W_TICK)/((double)TCP_TIMER_W_DIV*1000.0)))));
+     m_sim.add_event( new CTcpSimEventStop(10000.0) );
+ 
++#ifdef TREX_TLS
++    if(rx_phase_benchmark) {
++        if(prog_c->m_tls_context)c_pctx->m_tls_contexts.prepare_one(prog_c->m_tls_context);
++        if(prog_s->m_tls_context)s_pctx->m_tls_contexts.prepare_one(prog_s->m_tls_context);
++    }
++#endif
++    timespec phase_start,phase_end;clock_gettime(CLOCK_THREAD_CPUTIME_ID,&phase_start);
+     /* start client */
+     app_c->start(true);
+     tcp_connect(&c_flow->m_tcp);
+ 
+     m_sim.run_sim();
++    clock_gettime(CLOCK_THREAD_CPUTIME_ID,&phase_end);
++    rx_phase_cpu=(phase_end.tv_sec-phase_start.tv_sec)+(phase_end.tv_nsec-phase_start.tv_nsec)*1e-9;
+ 
+     dump_counters();
+ 
+diff --git a/src/44bsd/sim_cs_tcp.h b/src/44bsd/sim_cs_tcp.h
+--- a/src/44bsd/sim_cs_tcp.h
++++ b/src/44bsd/sim_cs_tcp.h
+@@ -368,6 +368,12 @@
+     CEmulAppApiImpl             m_tcp_bh_api_impl_s;
+     CTcpCtxPcapWrt              m_c_pcap; /* capture to file */
+     CTcpCtxPcapWrt              m_s_pcap;
++#ifdef TREX_TLS
++    bool m_drop_next_tx_test = false; // One packet, consumed after TX callbacks.
++    bool m_rx_ack_batch_test = false;
++    bool m_rx_burst_test = false;
++    bool m_rx_ack_batch_pending[2] = {};
++#endif
+     bool                        m_debug;
+     cs_sim_mode_t               m_sim_type;
+     uint16_t                    m_sim_data;
+diff --git a/src/44bsd/tcp_socket.cpp b/src/44bsd/tcp_socket.cpp
+--- a/src/44bsd/tcp_socket.cpp
++++ b/src/44bsd/tcp_socket.cpp
+@@ -159,6 +159,7 @@
+     const uint8_t *plain_data = nullptr;
+     uint32_t offset = 0, queued = 0;
+     uint8_t tx_retry_shift=0;
++    bool deferred_rx = false;
+     bool pumping = false, started = false, closing = false, close_done = false, error_reported = false;
+     // Plaintext is counted and discarded before any application callback.
+     // The read call is synchronous; no buffer address is retained by this adapter.
+@@ -450,6 +451,33 @@
+ void so_http_syn(struct socket *so) {
+     auto app=reinterpret_cast<tcp_socket *>(so)->m_app;
+     if (app) app->http_syn();
++}
++
++#ifdef TREX_TLS
++bool CEmulApp::defer_tls_ack() {
++    if (!is_tls()) return false;
++    auto &tp = m_flow->m_tcp;
++    return tp.m_ack_batch_eligible && !tp.m_delay_limit && tp.m_ctx &&
++           tp.m_ctx->m_ft.defer_tls_ack(&tp);
++}
++#endif
++
++int so_is_tls(struct socket *so) {
++#ifdef TREX_TLS
++    auto app = reinterpret_cast<tcp_socket *>(so)->m_app;
++    return app && app->is_tls();
++#else
++    return 0;
++#endif
++}
++
++int so_defer_tls_ack(struct socket *so) {
++#ifdef TREX_TLS
++    auto app = reinterpret_cast<tcp_socket *>(so)->m_app;
++    return app && app->defer_tls_ack();
++#else
++    return 0;
++#endif
+ }
+ 
+ int so_requires_tls_ack_output(struct socket *so) {
+@@ -2309,9 +2337,22 @@
+     return true;
+ }
+ 
++void CEmulApp::tls_run_deferred() {
++    m_tls->deferred_rx=true;
++    tls_pump();
++    m_tls->deferred_rx=false;
++    run_dpc_callbacks();
++    release_closed_tcp_flow();
++}
++
+ void CEmulApp::tls_pump() {
+     auto &t = *m_tls;
+     if (t.pumping || t.terminal) return;
++    // Small windows require immediate TLS consumption to release TCP credit.
++    // Preserve the original path for them and for receive-window reopening.
++    if(m_flow->m_tcp.m_socket.so_rcv.sb_hiwat>=18437 &&
++       !(m_flow->m_tcp.t_flags&TF_RXWIN0SENT) &&
++       m_pctx->m_ctx->m_ft.defer_tls_work(&m_flow->m_tcp))return;
+     astf_cost::Probe cost_probe(astf_cost::PUMP);
+     if (t.work_timer.is_running()) m_pctx->m_ctx->m_timer_w.timer_stop(&t.work_timer);
+     t.pumping = true;
+@@ -2505,9 +2546,13 @@
+         }
+         if (retained < rx.sb_cc) {
+             rx.sb_cc = retained;
+-            // Includes ACK callbacks which release TLS output backpressure.
+-            // Ensure TCP emits a window update even without new application TX.
+-            m_flow->m_tcp.t_flags |= TF_ACKNOW;
++            // The transport phase already acknowledged this input. Let TCP's
++            // normal window-update thresholds advertise newly consumed credit
++            // instead of emitting another ACK solely for TLS consumption.
++            // Preserve immediate progress outside the deferred large-window path.
++            auto &tp=m_flow->m_tcp;
++            if(!t.deferred_rx || (tp.t_flags&TF_RXWIN0SENT) ||
++               tp.last_ack_sent!=tp.rcv_nxt)tp.t_flags|=TF_ACKNOW;
+         }
+         // SSL has accepted this entire immutable profile buffer: no write
+         // retry can refer to it now. Nonblocking sends may advance while TCP
+diff --git a/src/44bsd/tcp_socket.h b/src/44bsd/tcp_socket.h
+--- a/src/44bsd/tcp_socket.h
++++ b/src/44bsd/tcp_socket.h
+@@ -816,6 +816,8 @@
+     void h2_rx(const uint8_t *,size_t);
+     CEmulAppTls *m_tls = nullptr;
+     bool is_tls() const { return m_tls != nullptr; }
++    bool defer_tls_ack();
++    void tls_run_deferred();
+     void tls_pump();
+     bool tls_begin_alert_drain();
+     static void http2_event(void *, astf_http2::Event, uint64_t, uint64_t);
+diff --git a/src/44bsd/tcp_var.h b/src/44bsd/tcp_var.h
+--- a/src/44bsd/tcp_var.h
++++ b/src/44bsd/tcp_var.h
+@@ -128,6 +128,10 @@
+     CTcpReass * m_tpc_reass; /* tcp reassembley object, allocated only when needed */
+     CTcpFlow  * m_flow;      /* back pointer to flow*/
+     CTcpPerThreadCtx* m_ctx; /* direct link to the current TCP thread context */
++#ifdef TREX_TLS
++    unsigned m_ack_batch_slot=0, m_tls_batch_slot=0;
++    bool m_ack_batch_eligible=false;
++#endif
+     bool m_reass_disabled;   /* don't reassemble ooo packet, to make payload content in order */
+ 
+ public:
+diff --git a/src/bp_sim_tcp.cpp b/src/bp_sim_tcp.cpp
+--- a/src/bp_sim_tcp.cpp
++++ b/src/bp_sim_tcp.cpp
+@@ -340,6 +340,9 @@
+                 break;
+             }
+             m_cpu_dp_u.start_work1();   // for TrexDpCore::idle_state_loop()
++#ifdef TREX_TLS
++            ctx->m_ft.begin_rx_ack_batch();
++#endif
+             int i;
+             for (i=0; i<(int)cnt;i++) {
+                 rte_mbuf_t * m=rx_pkts[i];
+@@ -379,6 +382,9 @@
+                     }
+                 }
+             }
++#ifdef TREX_TLS
++            ctx->m_ft.end_rx_ack_batch(ctx);
++#endif
+             sum+=cnt;
+             if (sum>NUM_RX_OFFLOAD) {
+                 ctx->m_ft.inc_rx_throttled_cnt();
+diff --git a/src/gtest/bp_tcp_gtest.cpp b/src/gtest/bp_tcp_gtest.cpp
+--- a/src/gtest/bp_tcp_gtest.cpp
++++ b/src/gtest/bp_tcp_gtest.cpp
+@@ -4273,3 +4273,293 @@
+     }
+ }
+ #endif
++
++#ifdef TREX_TLS
++TEST_F(gt_tcp, tls_ack_batch_lifetime) {
++    CFlowTable ft;CTcpCb flows[65];
++    for(auto &tp:flows){tp.t_state=TCPS_CLOSED;tp.t_maxseg=1440;tp.rcv_nxt=tp.last_ack_sent=0;} // Flush must not output closed flows.
++    EXPECT_FALSE(ft.defer_tls_ack(&flows[0]));
++    ft.begin_rx_ack_batch();
++    for(unsigned i=0;i<64;++i)EXPECT_TRUE(ft.defer_tls_ack(&flows[i]));
++    EXPECT_TRUE(ft.defer_tls_ack(&flows[0])); // Idempotent: no duplicate slot.
++    EXPECT_FALSE(ft.defer_tls_ack(&flows[64])); // Overflow sends immediately.
++    ft.cancel_tls_ack(&flows[3]);ft.cancel_tls_ack(&flows[3]);
++    ft.end_rx_ack_batch();
++    for(auto &tp:flows)EXPECT_EQ(0u,tp.m_ack_batch_slot);
++    ft.begin_rx_ack_batch();EXPECT_TRUE(ft.defer_tls_ack(&flows[3]));
++    ft.end_rx_ack_batch();EXPECT_EQ(0u,flows[3].m_ack_batch_slot);
++}
++#endif
++
++#ifdef TREX_TLS
++TEST_F(gt_tcp, tls_rx_burst_ack_coalescing) {
++    for (const auto version : {"1.2", "1.3"}) {
++        for (auto mode : {csSIM_NONE, csSIM_DROP, csSIM_REORDER}) {
++        uint64_t baseline_acks = 0;
++        for (bool batch : {false, true}) {
++            CClientServerTcp sim;
++            sim.Create("generated", "tls_rx_burst_ack_coalescing");
++            CFlowTable::tls_rx_test_mode=batch?2:0;
++            sim.m_rx_ack_batch_test = batch;
++            sim.m_rx_burst_test = true;
++            sim.set_simulate_rst_error(mode);
++            sim.set_drop_rate(0.01);
++            sim.m_mss = 1440; sim.m_initwnd_factor = 10; sim.set_rtt(100);
++            for (auto ctx : {&sim.m_c_ctx, &sim.m_s_ctx}) {
++                ctx->set_offload_dev_flags(OFFLOAD_TX_CHKSUM | OFFLOAD_RX_CHKSUM);
++                auto &tune = DEFAULT_PROFILE_CTX(ctx)->m_tunable_ctx;
++                tune.tcp_rx_socket_bsize = 1048576;
++                tune.tcp_tx_socket_bsize = 1048576;
++                tune.tcp_no_delay_counter = 0;
++            }
++            TlsHttpWireTime timing(sim); sim.m_callbacks.push_back(&timing);
++            sim.tls_http_transactions(version);
++            const auto &c = sim.m_c_ctx.get_tcpstat()->m_sts;
++            const auto &s = sim.m_s_ctx.get_tcpstat()->m_sts;
++            EXPECT_EQ_UINT32(10, c.tcps_http_responses);
++            EXPECT_EQ_UINT32(10, c.tcps_http_req_ttlb.values.count);
++            EXPECT_EQ_UINT32(0, c.tcps_tls_errors);
++            EXPECT_EQ_UINT32(0, s.tcps_tls_errors);
++            EXPECT_EQ_UINT32(1, c.tcps_closed);
++            EXPECT_EQ_UINT32(1, s.tcps_closed);
++            EXPECT_EQ(c.tcps_tls_sndbyte, s.tcps_tls_rcvbyte);
++            EXPECT_EQ(c.tcps_tls_rcvbyte, s.tcps_tls_sndbyte);
++            if (mode == csSIM_NONE) { EXPECT_LT(timing.last, 0.05); }
++            if (batch && mode == csSIM_NONE) { EXPECT_LT(c.tcps_sndacks, baseline_acks); }
++            else baseline_acks = c.tcps_sndacks;
++            printf("TLS %s RX batch=%d mode=%d: ACKs=%llu, completion=%.9f s\n",
++                   version, batch, int(mode), (unsigned long long)c.tcps_sndacks, timing.last);
++            sim.m_callbacks.clear(); sim.close_file(); sim.Delete();
++        }
++        }
++    }
++}
++#endif
++
++#ifdef TREX_TLS
++TEST_F(gt_tcp, tls_deferred_work_lifetime) {
++    CFlowTable::tls_rx_test_mode=2;
++    CFlowTable table; CTcpCb flows[65];
++    EXPECT_FALSE(table.defer_tls_work(&flows[0]));
++    table.begin_rx_ack_batch();
++    for(unsigned i=0;i<64;++i)EXPECT_TRUE(table.defer_tls_work(&flows[i]));
++    EXPECT_TRUE(table.defer_tls_work(&flows[0]));
++    EXPECT_FALSE(table.defer_tls_work(&flows[64]));
++    for(unsigned i=0;i<64;++i) {table.cancel_tls_work(&flows[i]);table.cancel_tls_work(&flows[i]);}
++    table.end_rx_ack_batch();
++    for(auto &tp:flows)EXPECT_EQ(0u,tp.m_tls_batch_slot);
++    table.begin_rx_ack_batch();EXPECT_TRUE(table.defer_tls_work(&flows[64]));
++    table.cancel_tls_work(&flows[64]);table.end_rx_ack_batch();
++}
++#endif
++
++#ifdef TREX_TLS
++extern bool rx_phase_benchmark;
++extern double rx_phase_cpu;
++TEST_F(gt_tcp, tls_rx_phase_comparison) {
++    rx_phase_benchmark=std::getenv("TREX_RX_PHASE_BENCH")!=nullptr;
++    auto lib=astf_tls::Library::local();
++    unsigned repeats=rx_phase_benchmark?7:1, iterations=rx_phase_benchmark?256:1;
++    for(unsigned repeat=0;repeat<repeats;++repeat)for(unsigned order=0;order<4;++order){
++        unsigned mode=(repeat+order)%4;CFlowTable::tls_rx_test_mode=mode;
++        double cpu=0,completion=0;uint64_t acks=0;
++        for(unsigned i=0;i<iterations+4;++i){
++            CClientServerTcp sim;sim.Create("generated","tls_rx_phase_comparison");
++            sim.m_rx_ack_batch_test=true;sim.m_rx_burst_test=true;
++            sim.m_mss=1440;sim.m_initwnd_factor=10;sim.set_rtt(100);
++            for(auto ctx:{&sim.m_c_ctx,&sim.m_s_ctx}){
++                ctx->set_offload_dev_flags(OFFLOAD_TX_CHKSUM|OFFLOAD_RX_CHKSUM);
++                auto &t=DEFAULT_PROFILE_CTX(ctx)->m_tunable_ctx;
++                t.tcp_rx_socket_bsize=1048576;t.tcp_tx_socket_bsize=1048576;
++            }
++            TlsHttpWireTime timing(sim);sim.m_callbacks.push_back(&timing);
++            sim.tls_http_transactions("1.3");
++            const auto &c=sim.m_c_ctx.get_tcpstat()->m_sts;
++            const auto &server=sim.m_s_ctx.get_tcpstat()->m_sts;
++            EXPECT_EQ_UINT32(10,c.tcps_http_responses);
++            EXPECT_EQ_UINT32(10,c.tcps_http_req_ttlb.values.count);
++            EXPECT_EQ_UINT32(0,c.tcps_tls_errors);EXPECT_EQ_UINT32(0,server.tcps_tls_errors);
++            EXPECT_EQ_UINT32(1,c.tcps_closed);EXPECT_EQ_UINT32(1,server.tcps_closed);
++            EXPECT_EQ_UINT32(0,c.tcps_tls_resumed);EXPECT_EQ_UINT32(0,server.tcps_tls_resumed);
++            EXPECT_EQ(c.tcps_tls_rcvbyte,server.tcps_tls_sndbyte);
++            if(i>=4){cpu+=rx_phase_cpu;acks+=c.tcps_sndacks;completion+=timing.last;}
++            sim.m_callbacks.clear();sim.close_file();sim.Delete();
++        }
++        printf("RXPHASE repeat=%u mode=%u iterations=%u cpu=%.9f acks=%llu completion=%.9f\n",repeat,mode,iterations,cpu,(unsigned long long)acks,completion/iterations);
++    }
++    rx_phase_benchmark=false;CFlowTable::tls_rx_test_mode=2;
++}
++#endif
++
++#ifdef TREX_TLS
++class TlsLateEmptyAck : public TlsWireFault {
++public:
++    int direction;
++    TlsLateEmptyAck(CClientServerTcp &s,int d):TlsWireFault(s,OVERLAP),direction(d) {}
++    int on_tx(int dir,rte_mbuf_t *m) override {
++        if(injected || dir!=direction || !sim.m_c_ctx.get_tcpstat()->m_sts.tcps_tls_sndbyte)return 0;
++        auto bytes=rte_pktmbuf_mtod(m,uint8_t *);
++        auto ip=reinterpret_cast<IPHeader *>(bytes+14);
++        auto tcp=reinterpret_cast<TCPHeader *>(bytes+14+ip->getHeaderLength());
++        unsigned len=ip->getTotalLength()-ip->getHeaderLength()-tcp->getHeaderLength();
++        if(len || tcp->getFlags()!=TCPHeader::Flag::ACK)return 0;
++        ++injected;
++        deliver(copy(m),dir,sim.m_sim.get_time()+0.00045);
++        return 0;
++    }
++};
++TEST_F(gt_tcp, tls_late_empty_ack) {
++    for(auto version:{"1.2","1.3"})for(int direction:{0,1}) {
++        CClientServerTcp sim;sim.Create("generated","tls_late_empty_ack");
++        sim.m_rx_ack_batch_test=true;sim.m_rx_burst_test=true;
++        sim.m_mss=1440;sim.m_initwnd_factor=10;sim.set_rtt(100);
++        for(auto ctx:{&sim.m_c_ctx,&sim.m_s_ctx}) {
++            ctx->set_offload_dev_flags(OFFLOAD_TX_CHKSUM|OFFLOAD_RX_CHKSUM);
++            auto &t=DEFAULT_PROFILE_CTX(ctx)->m_tunable_ctx;
++            t.tcp_rx_socket_bsize=1048576;t.tcp_tx_socket_bsize=1048576;
++        }
++        TlsLateEmptyAck late(sim,direction);sim.m_callbacks.push_back(&late);
++        sim.tls_http_transactions(version);
++        auto &c=sim.m_c_ctx.get_tcpstat()->m_sts;auto &s=sim.m_s_ctx.get_tcpstat()->m_sts;
++        EXPECT_EQ(1u,late.injected);EXPECT_EQ_UINT32(10,c.tcps_http_responses);
++        EXPECT_EQ_UINT32(0,c.tcps_tls_errors+s.tcps_tls_errors);
++        EXPECT_EQ_UINT32(0,c.tcps_rcvdupbyte+s.tcps_rcvdupbyte);
++        EXPECT_EQ_UINT32(0,c.tcps_sndrexmitpack+s.tcps_sndrexmitpack);
++        EXPECT_GT(c.tcps_rcvduppack+s.tcps_rcvduppack,0u);
++        EXPECT_EQ_UINT32(1,c.tcps_closed);EXPECT_EQ_UINT32(1,s.tcps_closed);
++        printf("LATE_ACK TLS=%s direction=%d duplicate_packets=%llu duplicate_bytes=%llu\n",version,direction,
++            (unsigned long long)(c.tcps_rcvduppack+s.tcps_rcvduppack),
++            (unsigned long long)(c.tcps_rcvdupbyte+s.tcps_rcvdupbyte));
++        sim.m_callbacks.clear();sim.close_file();sim.Delete();
++    }
++}
++#endif
++
++#ifdef TREX_TLS
++// Exercise the real flow destructor, not only explicit queue cancellation.
++TEST_F(gt_tcp, tls_rx_queues_free_flow) {
++    CFlowTable::tls_rx_test_mode = 2;
++    CClientServerTcp sim;
++    sim.Create("generated", "tls_rx_queues_free_flow");
++    auto &table = sim.m_c_ctx.m_ft;
++    auto pctx = DEFAULT_PROFILE_CTX(&sim.m_c_ctx);
++    const auto initial_count = pctx->m_flow_cnt;
++    for (unsigned burst = 0; burst < 3; ++burst) {
++        table.begin_rx_ack_batch();
++        for (unsigned i = 0; i < 64; ++i) {
++            tunnel_cfg_data_t tunnel_data = {};
++            auto flow = table.alloc_flow(pctx, 0x10000001, 0x30000001,
++                                        1025, 443, tunnel_data, false, nullptr);
++            ASSERT_TRUE(flow != nullptr);
++            auto &tp = flow->m_tcp;
++            tp.t_maxseg = 1440;
++            tp.rcv_nxt = tp.last_ack_sent = 0;
++            EXPECT_TRUE(table.defer_tls_ack(&tp));
++            EXPECT_TRUE(table.defer_tls_work(&tp));
++            // Allocator reuse must not leave a pointer to the destroyed flow
++            // in either queue. Draining such a TLS entry would dereference m_tls.
++            table.free_flow(flow);
++        }
++        table.end_rx_ack_batch();
++        EXPECT_EQ(initial_count, pctx->m_flow_cnt);
++    }
++    sim.close_file();
++    sim.Delete();
++}
++#endif
++
++#ifdef TREX_TLS
++class TlsCloseServiceDelay : public CTxRxCallback {
++public:
++    CClientServerTcp &sim;
++    int side;
++    double delay;
++    bool injected = false, delay_fin;
++    unsigned fins[2] = {};
++    TlsCloseServiceDelay(CClientServerTcp &s, int dir, double gap, bool fin):sim(s),side(dir),delay(gap),delay_fin(fin) {}
++    int on_rx(int, rte_mbuf_t *) override {return 0;}
++    int on_tx(int dir, rte_mbuf_t *m) override {
++        auto bytes=rte_pktmbuf_mtod(m,uint8_t *);
++        auto ip=reinterpret_cast<IPHeader *>(bytes+14);
++        auto tcp=reinterpret_cast<TCPHeader *>(bytes+14+ip->getHeaderLength());
++        unsigned len=ip->getTotalLength()-ip->getHeaderLength()-tcp->getHeaderLength();
++        if(tcp->getFinFlag()) ++fins[dir];
++        if(!injected && dir==side &&
++           (delay_fin ? tcp->getFinFlag() : (len>0 && len<100)) &&
++           sim.m_c_ctx.get_tcpstat()->m_sts.tcps_http_responses==10) {
++            sim.m_tx_diff+=delay;
++            injected=true;
++        }
++        return 0;
++    }
++};
++TEST_F(gt_tcp, tls_close_service_delay) {
++    CFlowTable::tls_rx_test_mode=2;
++    for(auto version:{"1.2","1.3"})for(int dir:{0,1})for(double gap:{0.0,0.00001,0.0001,0.001}) for(bool wrap:{false,true}) for(bool fin:{false,true}) {
++        CClientServerTcp sim;sim.Create("generated","tls_close_delay");
++        if(wrap) {sim.m_c_ctx.tcp_iss=0xfffffff0;sim.m_s_ctx.tcp_iss=0xfffffff0;}
++        sim.m_rx_ack_batch_test=true;sim.m_rx_burst_test=true;
++        sim.m_mss=1440;sim.m_initwnd_factor=10;sim.set_rtt(100);
++        for(auto ctx:{&sim.m_c_ctx,&sim.m_s_ctx}) {
++            auto &t=DEFAULT_PROFILE_CTX(ctx)->m_tunable_ctx;
++            t.tcp_rx_socket_bsize=1048576;t.tcp_tx_socket_bsize=1048576;
++        }
++        TlsCloseServiceDelay delay(sim,dir,gap,fin);sim.m_callbacks.push_back(&delay);
++        sim.tls_http_transactions(version);
++        const auto &c=sim.m_c_ctx.get_tcpstat()->m_sts;const auto &s=sim.m_s_ctx.get_tcpstat()->m_sts;
++        printf("CLOSEDELAY TLS=%s dir=%d gap=%g wrap=%d delay_fin=%d injected=%d FIN=%u/%u dup=%llu/%llu bytes=%llu/%llu\n",version,dir,gap,wrap,fin,delay.injected,delay.fins[0],delay.fins[1],(unsigned long long)c.tcps_rcvduppack,(unsigned long long)s.tcps_rcvduppack,(unsigned long long)c.tcps_rcvdupbyte,(unsigned long long)s.tcps_rcvdupbyte);
++        EXPECT_TRUE(delay.injected);EXPECT_EQ_UINT32(10,c.tcps_http_responses);
++        EXPECT_EQ(1u,delay.fins[0]);EXPECT_EQ(1u,delay.fins[1]);
++        EXPECT_EQ_UINT32(0,c.tcps_rcvduppack+s.tcps_rcvduppack);
++        EXPECT_EQ_UINT32(0,c.tcps_rcvdupbyte+s.tcps_rcvdupbyte);
++        EXPECT_EQ_UINT32(0,c.tcps_tls_errors+s.tcps_tls_errors);
++        EXPECT_EQ_UINT32(1,c.tcps_closed);EXPECT_EQ_UINT32(1,s.tcps_closed);
++        sim.m_callbacks.clear();sim.close_file();sim.Delete();
++    }
++}
++#endif
++
++#ifdef TREX_TLS
++class TlsFinLoss : public CTxRxCallback {
++public:
++    CClientServerTcp &sim;
++    int side;
++    unsigned fins[2] = {}, dropped = 0, resets = 0;
++    TlsFinLoss(CClientServerTcp &s,int dir):sim(s),side(dir) {}
++    int on_rx(int, rte_mbuf_t *) override {return 0;}
++    int on_tx(int dir,rte_mbuf_t *m) override {
++        auto bytes=rte_pktmbuf_mtod(m,uint8_t *);
++        auto ip=reinterpret_cast<IPHeader *>(bytes+14);
++        auto tcp=reinterpret_cast<TCPHeader *>(bytes+14+ip->getHeaderLength());
++        if(tcp->getResetFlag())++resets;
++        if(tcp->getFinFlag()) {
++            ++fins[dir];
++            if(dir==side && !dropped) {sim.m_drop_next_tx_test=true;++dropped;}
++        }
++        return 0;
++    }
++};
++TEST_F(gt_tcp, tls_fin_loss_retransmission) {
++    CFlowTable::tls_rx_test_mode=2;
++    for(auto version:{"1.2","1.3"})for(int dir:{0,1})for(bool wrap:{false,true}) {
++        CClientServerTcp sim;sim.Create("generated","tls_fin_loss");
++        if(wrap) {sim.m_c_ctx.tcp_iss=0xfffffff0;sim.m_s_ctx.tcp_iss=0xfffffff0;}
++        sim.m_rx_ack_batch_test=true;sim.m_rx_burst_test=true;
++        sim.m_mss=1440;sim.m_initwnd_factor=10;sim.set_rtt(100);
++        for(auto ctx:{&sim.m_c_ctx,&sim.m_s_ctx}) {
++            auto &t=DEFAULT_PROFILE_CTX(ctx)->m_tunable_ctx;
++            t.tcp_rx_socket_bsize=1048576;t.tcp_tx_socket_bsize=1048576;
++        }
++        TlsFinLoss loss(sim,dir);sim.m_callbacks.push_back(&loss);
++        sim.tls_http_transactions(version);
++        const auto &c=sim.m_c_ctx.get_tcpstat()->m_sts;const auto &s=sim.m_s_ctx.get_tcpstat()->m_sts;
++        EXPECT_EQ(1u,loss.dropped);EXPECT_GE(loss.fins[dir],2u);
++        EXPECT_EQ(0u,loss.resets);EXPECT_EQ_UINT32(10,c.tcps_http_responses);
++        EXPECT_EQ_UINT32(0,c.tcps_tls_errors+s.tcps_tls_errors);
++        EXPECT_EQ_UINT32(1,c.tcps_closed);EXPECT_EQ_UINT32(1,s.tcps_closed);
++        EXPECT_GT(c.tcps_rexmttimeo+s.tcps_rexmttimeo,0u);
++        printf("FINLOSS TLS=%s dir=%d wrap=%d FIN=%u/%u RTO=%llu/%llu\n",version,dir,wrap,loss.fins[0],loss.fins[1],(unsigned long long)c.tcps_rexmttimeo,(unsigned long long)s.tcps_rexmttimeo);
++        sim.m_callbacks.clear();sim.close_file();sim.Delete();
++    }
++}
++#endif

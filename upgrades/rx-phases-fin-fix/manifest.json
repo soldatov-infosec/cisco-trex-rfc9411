@@ -1,0 +1,23 @@
+{
+  "base_release": "rx-phases",
+  "release": "1.0.1",
+  "patch": "fin-ack-fix.patch",
+  "patch_sha256": "34cf3770662a9851c2aaff7bbb8ef2a01341395c66b85ccb3344e32a663eedf9",
+  "files": [
+    {
+      "path": "src/44bsd/netinet/tcp_output.c",
+      "base_sha256": "f3fa34f1e4373cb43c7328929c99a4ca563719db34e72a7ee1798a1ce870a055",
+      "result_sha256": "59206bf76215da3a4dcb807fafc72300880e31e9210570542856272ea8571ba2"
+    },
+    {
+      "path": "src/44bsd/netinet/tcp_socket.h",
+      "base_sha256": "3db93261c79b2fb86869ddfa04543313223c5b48ec98b02d44136dc5654eaf9e",
+      "result_sha256": "41251701569ac58dc274bea2036895413a3b407960a58e67da8c5f4e6ba5cce2"
+    },
+    {
+      "path": "src/44bsd/tcp_socket.cpp",
+      "base_sha256": "9f248a11f15376ba36f6aed17d890f6ad0a3dee2dc0a4bbdeaaf303b6322acb1",
+      "result_sha256": "cd56ecb564015989eaa13744e111e354676db0452aba803036bfe99828293982"
+    }
+  ]
+}

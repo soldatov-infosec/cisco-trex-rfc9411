@@ -1,0 +1,63 @@
+{
+  "base_release": "1.0.0",
+  "release": "1.0.1",
+  "patch": "upgrade.patch",
+  "patch_sha256": "3a34b4dc4021e48ac6cb6f7c899abd2f1e2192000bd8daedf7dff336ad71e123",
+  "files": [
+    {
+      "path": "src/44bsd/flow_table.cpp",
+      "base_sha256": "f432390d66918e86060f9495524750761b81a6c3edd171109a403905fcefb506",
+      "result_sha256": "2cfd94c46a4e5ad5534cfad972e6848d1ab75b70eb1d48d4075517d9b67a3da6"
+    },
+    {
+      "path": "src/44bsd/flow_table.h",
+      "base_sha256": "6d22072ab73b1d5ef27b76a67752d5647535079f1c3faf5c9998b7683aa575b4",
+      "result_sha256": "c97c99c0f7c16c497c50f8540ea6d769822a9bfe9df73379466cbaf4135d10dc"
+    },
+    {
+      "path": "src/44bsd/netinet/tcp_output.c",
+      "base_sha256": "8603fe08ca3d58e6c4f10d7883a532f0a1ceb3ab8d4f8c31171a027d59f2c876",
+      "result_sha256": "59206bf76215da3a4dcb807fafc72300880e31e9210570542856272ea8571ba2"
+    },
+    {
+      "path": "src/44bsd/netinet/tcp_socket.h",
+      "base_sha256": "5df9f213b62861429e74b042851d2b525d43f78da20bf25b4eed9345bffe0dbe",
+      "result_sha256": "41251701569ac58dc274bea2036895413a3b407960a58e67da8c5f4e6ba5cce2"
+    },
+    {
+      "path": "src/44bsd/sim_cs_tcp.cpp",
+      "base_sha256": "ae25abf7b0dfc58aae66249551faa225c49c11b3436e727a1af38395f88f8983",
+      "result_sha256": "ad7af9f304e0aa5efacef4da5820cf0ca4380a02a07938252d6125712ec08d84"
+    },
+    {
+      "path": "src/44bsd/sim_cs_tcp.h",
+      "base_sha256": "7da8a2506f0208c81779c97450fd5ac924544c0fc204c8d31b8254a04aaaed2e",
+      "result_sha256": "00223980a44f88e8a8af74116f662c70202c73f26cce7c96279f6e1660a4a6bb"
+    },
+    {
+      "path": "src/44bsd/tcp_socket.cpp",
+      "base_sha256": "68759339569c684eff2b65f1f3036bbd1134285d0ea18f597c748e342d18ee80",
+      "result_sha256": "cd56ecb564015989eaa13744e111e354676db0452aba803036bfe99828293982"
+    },
+    {
+      "path": "src/44bsd/tcp_socket.h",
+      "base_sha256": "457cda5fed6220acec01430d98c2f00331e8373cf7ee87151195486e41acc0aa",
+      "result_sha256": "47e7f9314ff580d2667e5563c04d9dabecbff1aa2c905273496e633395d86987"
+    },
+    {
+      "path": "src/44bsd/tcp_var.h",
+      "base_sha256": "02763d8a0448ef5931853b3ba8f73781971976beadc3a1a346e5d174fe22dd8b",
+      "result_sha256": "730ba0e2e3e002cf460d219a95e69db053da61051a9aafbfcbfe5793655d516b"
+    },
+    {
+      "path": "src/bp_sim_tcp.cpp",
+      "base_sha256": "3a1b4e9b7e68698e62c438070ee1cfa424c01e777ddaeca5cdf6f08dbb189710",
+      "result_sha256": "43a108f7f8e9962301e4ef8c18aa0567b47317a7a3651091e03609d7b030809c"
+    },
+    {
+      "path": "src/gtest/bp_tcp_gtest.cpp",
+      "base_sha256": "e915cf2f781bada0a0325b0d7bac43dbf2201f2fc06667fc56a4d82ef9632ae1",
+      "result_sha256": "67d9fa320cf7a7aa4264dd7ab03c6344ee22f9856f0ea1056a313724a0fd76f0"
+    }
+  ]
+}

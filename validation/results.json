@@ -1,60 +1,46 @@
 {
-  "release": "1.0.0",
-  "date": "2026-10-16",
-  "upstream": "TRex v3.06",
+  "release": "1.0.1",
+  "date": "2026-10-20",
+  "base_release": "1.0.0",
   "checks": {
-    "simulator_debug_build": "passed",
-    "tcp_astf_scheduler_tests": {
-      "passed": 103,
+    "queue_review": "No blocking finding; see rx-queue-review.md",
+    "simulator_optimized_build": "passed; two documented local harness accommodations not exported",
+    "tcp_astf_scheduler_normal": {
+      "passed": 111,
       "failed": 0
     },
-    "http2_engine_sanitizers_and_python_h2_interop": "passed; leak detection disabled under emulation",
-    "http2_api_tests": {
+    "tcp_astf_scheduler_rx_batched": {
+      "passed": 111,
+      "failed": 0
+    },
+    "source_provenance": "1.0.0 + NIC-tested RX-phase implementation + TLS FIN fix; no earlier release candidates",
+    "tls_engine_protocol_resumption_policy_timestamps_fuzzer_smoke": "passed",
+    "udp_rtt_api": {
       "passed": 4,
       "failed": 0
     },
-    "standalone_profile_api_tests": {
-      "passed": 7,
+    "repository_and_profiles": {
+      "passed": 13,
       "failed": 0
     },
-    "cli_smoke_short_cc": {
-      "passed": 15,
-      "failed": 0
+    "patch_application": "full series and incremental patch; patch -p1 and git apply checks; exact hashes verified",
+    "repository_inventory": "9 patches, 149 source paths; local links and artifact scan passed",
+    "tls_close_service_delay": {
+      "scenarios": 64,
+      "before_extra_fin_cases": 24,
+      "after_extra_fin_cases": 0
     },
-    "cli_smoke_named_groups": {
-      "passed": 15,
-      "failed": 0
-    },
-    "cli_smoke_full_cc_named_groups": {
-      "passed": 15,
-      "failed": 0,
-      "cc_requests": 10,
-      "cc_pause_seconds": 30
-    },
-    "patch_and_git_apply_with_result_hashes": "passed",
-    "repository_tool_tests": 6,
-    "build_configuration_tests": 3,
-    "mixed_profiles": {
-      "profile_api_tests": 7,
-      "profiles_loaded": 33,
-      "http2_api_tests": 5,
-      "environment": "Python 3.9 macOS; unused RPC client import stubbed; real profile serialization",
-      "http2_cpp": "ASan/UBSan passed with local nghttp2 1.68.0; mixed and existing regressions"
+    "tls_fin_loss_retransmission": {
+      "passed_scenarios": 8,
+      "failed_scenarios": 0
     }
   },
   "limitations": [
-    "Complete compiler/linker build of the final release artifact pending",
-    "Physical NIC qualification of the final release artifact pending",
-    "No capacity measurements claimed",
-    "Leak detection disabled under emulation",
-    "Mixed HTTP/2 full TRex build, loader integration and NIC test pending"
+    "No new production DPDK build on this host",
+    "No queue ASan/TSan run",
+    "No fresh multi-profile NIC campaign of the release bundle",
+    "NIC duplicate-only zero-payload packet origin not conclusively determined",
+    "TLS FIN fix locally validated; physical-NIC counters and CPU impact not yet measured"
   ],
-  "commands": [
-    "python3 tools/test_profile_smoke.py --trex TREX --output NEW_DIRECTORY",
-    "python3 tools/test_profile_smoke.py --trex TREX --named-groups --output NEW_DIRECTORY",
-    "python3 tools/test_profile_smoke.py --trex TREX --named-groups --cc-defaults --output NEW_DIRECTORY",
-    "ASAN_OPTIONS=detect_leaks=0 sh tests/tls/run_http2_engine_tests.sh",
-    "./bp-sim-64-debug --ut --gtest_filter=gt_tcp.*:gt_astf_inter.*:astf_scheduler.*"
-  ],
-  "scope": "Protocol implementation tests; final public names and build option checked separately"
+  "inherited_validation": "results-1.0.0.json"
 }

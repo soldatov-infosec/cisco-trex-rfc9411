@@ -1,0 +1,42 @@
+BIO=128 1.2 certificate http/1.1 OK
+BIO=128 1.2 certificate h2 OK
+BIO=128 1.3 certificate http/1.1 OK
+BIO=128 1.3 certificate h2 OK
+BIO=65536 1.2 certificate http/1.1 OK
+BIO=65536 1.2 certificate h2 OK
+BIO=65536 1.3 certificate http/1.1 OK
+BIO=65536 1.3 certificate h2 OK
+1.2 Flow client protocol OK
+1.2 Flow client protocol OK
+1.2 Flow server protocol OK
+1.2 Flow server protocol OK
+1.2 independent resumption client OK
+1.2 independent resumption server OK
+1.3 Flow client protocol OK
+1.3 Flow client protocol OK
+1.3 Flow server protocol OK
+1.3 Flow server protocol OK
+1.3 independent resumption client OK
+1.3 independent resumption server OK
+1.2 BIO=128 mTLS=0 resumption OK
+1.2 BIO=128 mTLS=1 resumption OK
+1.2 BIO=65536 mTLS=0 resumption OK
+1.2 BIO=65536 mTLS=1 resumption OK
+1.3 BIO=128 mTLS=0 resumption OK
+1.3 BIO=128 mTLS=1 resumption OK
+1.3 BIO=65536 mTLS=0 resumption OK
+1.3 BIO=65536 mTLS=1 resumption OK
+BIO cache overflow/dirty EOF reuse, full handshake isolation, worker contexts, WANT_READ wakeup, fragments, buffered plaintext, EOF and close: PASS
+1.2 worker isolation/lifetime/rollback/cross-context tickets OK
+1.3 worker isolation/lifetime/rollback/cross-context tickets OK
+aws-lc AWS-LC 5.11.0 policy: PASS
+aws-lc AWS-LC 5.11.0 policy: PASS
+capacity=128 fragment=1 SSL_read attempts 224009 -> 5151 payload/close PASS
+capacity=128 fragment=1460 SSL_read attempts 5995 -> 5150 payload/close PASS
+capacity=65536 fragment=1 SSL_read attempts 165037 -> 23 payload/close PASS
+capacity=65536 fragment=1460 SSL_read attempts 125 -> 23 payload/close PASS
+BIO ring wrap, bidirectional byte order, backpressure and reset: PASS
+RX timestamps: overlap metadata, zero, reordered fragments, TLS records, partial reads PASS
+TLS 1.2 error classification: protocol, pre/post-certificate EOF, chain, hostname PASS
+TLS 1.3 error classification: protocol, pre/post-certificate EOF, chain, hostname PASS
+record fuzzer: 16 seeds reached TLS processing PASS

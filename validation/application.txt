@@ -1,0 +1,5 @@
+PASS: full series patch -p1 (fuzz=0), all result hashes.
+PASS: full series git apply, all result hashes.
+PASS: application dry-run, repeated-application rejection and unrelated-file preservation.
+PASS: 1.0.0 upgrade: patch -p1 and git apply, all 11 result hashes.
+PASS: RX-phase FIN hotfix: patch -p1 and git apply, all 3 result hashes.

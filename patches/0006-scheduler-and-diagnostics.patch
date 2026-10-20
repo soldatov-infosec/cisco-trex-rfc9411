@@ -440,7 +440,27 @@ diff --git a/src/bp_sim_tcp.cpp b/src/bp_sim_tcp.cpp
      CVirtualIF * v_if=m_node_gen.m_v_if;
      rte_mbuf_t * rx_pkts[64];
      int dir;
-@@ -813,6 +816,16 @@
+@@ -337,6 +340,9 @@
+                 break;
+             }
+             m_cpu_dp_u.start_work1();   // for TrexDpCore::idle_state_loop()
++#ifdef TREX_TLS
++            ctx->m_ft.begin_rx_ack_batch();
++#endif
+             int i;
+             for (i=0; i<(int)cnt;i++) {
+                 rte_mbuf_t * m=rx_pkts[i];
+@@ -376,6 +382,9 @@
+                     }
+                 }
+             }
++#ifdef TREX_TLS
++            ctx->m_ft.end_rx_ack_batch(ctx);
++#endif
+             sum+=cnt;
+             if (sum>NUM_RX_OFFLOAD) {
+                 ctx->m_ft.inc_rx_throttled_cnt();
+@@ -813,6 +822,16 @@
      if ( !template_db ) {
          throw TrexException("Could not create RO template database");
      }
@@ -457,7 +477,7 @@ diff --git a/src/bp_sim_tcp.cpp b/src/bp_sim_tcp.cpp
      m_c_tcp->set_template_ro(template_db, profile_id);
      m_c_tcp->resize_stats(profile_id);
      m_s_tcp->set_template_ro(template_db, profile_id);
-@@ -854,6 +867,10 @@
+@@ -854,6 +873,10 @@
      m_c_tcp->remove_active_profile(profile_id);
      m_s_tcp->remove_active_profile(profile_id);
  

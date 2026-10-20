@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.0.1
+
+- Process TCP input and submit transport ACKs before deferred TLS work in each RX burst.
+- Bound both worker-local queues to 64 entries; cancel queued pointers before flow destruction and process immediately on capacity exhaustion.
+- Preserve synchronous TLS consumption for small receive windows and zero-window reopening.
+- Keep receive timestamp propagation and HTTP/UDP measurement definitions unchanged.
+- Avoid unsolicited repeated FIN when acknowledging input after a TLS close; preserve loss-driven FIN retransmission.
+- Add queue-lifetime, delayed empty-ACK, closure-gap and FIN-loss regression coverage.
+
+Built directly from 1.0.0 plus the NIC-tested RX-phase change. See
+[release notes](docs/release-1.0.1.md) and [queue review](validation/rx-queue-review.md).
+
 ## 1.0.0
 
 First public release of the Cisco TRex RFC 9411 extension.

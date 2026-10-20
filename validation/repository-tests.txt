@@ -1,0 +1,18 @@
+test_added_file_collision_rejected (test_apply.ApplyTests) ... ok
+test_dry_run_then_apply_and_repeat (test_apply.ApplyTests) ... ok
+test_modified_base_rejected_before_new_files (test_apply.ApplyTests) ... ok
+test_regenerate_existing_and_added_paths (test_apply.ApplyTests) ... ok
+test_symlink_parent_rejected (test_apply.ApplyTests) ... ok
+test_tampered_patch_rejected (test_apply.ApplyTests) ... ok
+test_all_entries (test_profiles.Profiles) ... ok
+test_cc_hold_and_no_delayed_ack_override (test_profiles.Profiles) ... ok
+test_each_profile_is_standalone (test_profiles.Profiles) ... ok
+test_h2_cc_pacing_and_deadline (test_profiles.Profiles) ... ok
+test_invalid_workloads_rejected (test_profiles.Profiles) ... ok
+test_response_length_and_small_body (test_profiles.Profiles) ... ok
+test_tls12_and_parallel_h2 (test_profiles.Profiles) ... ok
+
+----------------------------------------------------------------------
+Ran 13 tests in 1.937s
+
+OK

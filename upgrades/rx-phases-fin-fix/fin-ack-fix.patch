@@ -1,0 +1,51 @@
+diff --git a/src/44bsd/netinet/tcp_output.c b/src/44bsd/netinet/tcp_output.c
+--- a/src/44bsd/netinet/tcp_output.c
++++ b/src/44bsd/netinet/tcp_output.c
+@@ -369,6 +369,17 @@
+             flags &= ~TH_FIN;
+     }
+ 
++    /* TLS may acknowledge close_notify before its peer's close_notify arrives.
++     * Once our FIN is in flight, acknowledging that later input must not resend
++     * the FIN just because the state still contains TH_FIN. A real retransmit
++     * rewinds snd_nxt below snd_max, and therefore retains the FIN here.
++     * Keep the legacy behavior for applications outside the TLS adapter.
++     */
++    if (!len && !sack_rxmit && (flags & TH_FIN) &&
++        (tp->t_flags & TF_SENTFIN) && tp->snd_nxt == tp->snd_max &&
++        so_is_tls(so))
++        flags &= ~TH_FIN;
++
+     recwin = lmin(lmax(sbspace(&so->so_rcv), 0),
+         (long)TCP_MAXWIN << tp->rcv_scale);
+ 
+diff --git a/src/44bsd/netinet/tcp_socket.h b/src/44bsd/netinet/tcp_socket.h
+--- a/src/44bsd/netinet/tcp_socket.h
++++ b/src/44bsd/netinet/tcp_socket.h
+@@ -64,6 +64,7 @@
+ void sbdrop(struct sockbuf *sb, int len, struct socket *so);
+ 
+ /* C ABI: no TLS-dependent structure layout is exposed to the TCP C code. */
++int so_is_tls(struct socket *so);
+ int so_defer_tls_ack(struct socket *so);
+ int so_requires_tls_ack_output(struct socket *so);
+ void so_http_syn(struct socket *so);
+diff --git a/src/44bsd/tcp_socket.cpp b/src/44bsd/tcp_socket.cpp
+--- a/src/44bsd/tcp_socket.cpp
++++ b/src/44bsd/tcp_socket.cpp
+@@ -461,6 +461,15 @@
+            tp.m_ctx->m_ft.defer_tls_ack(&tp);
+ }
+ #endif
++
++int so_is_tls(struct socket *so) {
++#ifdef TREX_TLS
++    auto app = reinterpret_cast<tcp_socket *>(so)->m_app;
++    return app && app->is_tls();
++#else
++    return 0;
++#endif
++}
+ 
+ int so_defer_tls_ack(struct socket *so) {
+ #ifdef TREX_TLS

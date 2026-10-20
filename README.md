@@ -48,7 +48,7 @@ flowchart LR
 
 ## Release and compatibility
 
-- **Extension:** `1.0.0` — first public release.
+- **Extension:** `1.0.1` — transport-first TLS receive processing.
 - **Upstream:** TRex **v3.06**, commit `46be64bedbe9d505dfb55099c38119d6e86267ca`.
 - **TLS backend:** AWS-LC **5.11.0**, shared libraries; OpenSSL is not an alternative backend.
 - **HTTP/2:** a maintained nghttp2 development package exposing continuation limits.
@@ -57,6 +57,9 @@ flowchart LR
 
 The series applies directly to a **clean v3.06 checkout**. Apply the complete series once to the unmodified source tree. Arbitrary TRex master/main
 revisions and newer tags are not yet supported.
+
+For changes, validation limits and the upgrade from 1.0.0, see
+[release notes](docs/release-1.0.1.md).
 
 ## Start here
 

@@ -39,6 +39,7 @@ cd ../scripts
 export TREX_TLS_TEST_CERT=/path/cert.pem
 export TREX_TLS_TEST_KEY=/path/key.pem
 ./bp-sim-64-debug --ut --gtest_filter='gt_tcp.*:gt_astf_inter.*:astf_scheduler.*'
+TREX_RX_PHASE_ALL=1 ./bp-sim-64-debug --ut --gtest_filter='gt_tcp.*:gt_astf_inter.*:astf_scheduler.*'
 cd ..
 sh tests/tls/run_profiles.sh
 ```
