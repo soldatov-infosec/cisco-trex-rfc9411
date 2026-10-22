@@ -39,10 +39,14 @@ class Profile:
             p.add_argument('--key', required=True)
             p.add_argument('--ca', required=True)
             p.add_argument('--version', choices=['1.2', '1.3'], default='1.3')
-            p.add_argument('--cipher-suite')
+            p.add_argument('--cipher-suite', help='Default: TLS_AES_128_GCM_SHA256 (1.3), ECDHE-ECDSA-AES128-GCM-SHA256 (1.2)')
             p.add_argument('--groups', nargs='+')
             p.add_argument('--signature-algorithms', nargs='+')
+        p.add_argument('--http-timeout-ms', type=int, default=30000,
+                       help='Per-response deadline; server request deadline also includes the CC hold')
         a = p.parse_args(tunables)
+        if not 1 <= a.http_timeout_ms <= 86400000:
+            p.error('http-timeout-ms must be 1..86400000')
         # RFC 9411 Table 5; binary KB convention matches the fixed profiles.
         # 0.2 * 1024 is rounded down to 204 whole payload bytes.
         sizes = [204, 6144, 8192, 9216, 10240, 25600, 26624, 35840, 60416, 355328]
@@ -70,6 +74,10 @@ class Profile:
         if h2 and (not 1 <= a.concurrency <= min(128, a.flow_size) or not 1 <= a.timeout_ms <= 600000):
             p.error('concurrency must be 1..min(128, flow_size); timeout_ms 1..600000')
 
+        request_timeout_ms = a.http_timeout_ms + (int(math.ceil(a.delay * 1000)) if cc else 0)
+        if request_timeout_ms > 86400000:
+            p.error('HTTP timeout plus CC hold must not exceed one day')
+
         client_tls = server_tls = None
         if encrypted:
             for name in ('cert', 'key', 'ca'):
@@ -77,7 +85,11 @@ class Profile:
                 if not value.is_file():
                     p.error('%s file does not exist: %s' % (name, value))
                 setattr(a, name, str(value))
-            policy = dict(version=a.version, resumption=False)
+            policy = dict(version=a.version, resumption=False,
+                          cipher_suite='TLS_AES_128_GCM_SHA256' if a.version == '1.3'
+                          else 'ECDHE-ECDSA-AES128-GCM-SHA256')
+            if a.version == '1.2':
+                policy['groups'] = ['P-256']
             for option in ('cipher_suite', 'groups', 'signature_algorithms'):
                 value = getattr(a, option)
                 if value is not None:
@@ -95,7 +107,7 @@ class Profile:
         else:
             client = ASTFProgram(tls=client_tls, http=dict(responses=a.flow_size,
                 expected_status=200, max_body_bytes=size, transactions=True, body_contains='x'))
-            server = ASTFProgram(side='s', tls=server_tls)
+            server = ASTFProgram(side='s', tls=server_tls, http=dict(requests=a.flow_size))
             request = ('GET /index.html HTTP/1.1\r\nHost: %s\r\n'
                        'User-Agent: trex-rfc9411\r\nAccept: */*\r\n'
                        'Connection: %s\r\n\r\n' %
@@ -105,8 +117,8 @@ class Profile:
                             'Content-Length: %d\r\n\r\n' % body_size).encode('ascii') + b'x' * body_size
                 client.http_request_start()
                 client.send(request)
-                client.recv(len(response))
-                server.recv(len(request))
+                client.recv_http_response(a.http_timeout_ms)
+                server.recv_http_request(request_timeout_ms)
                 if a.delay:
                     server.delay(int(a.delay))
                 server.send(response)
@@ -118,6 +130,9 @@ class Profile:
             dist_server=ASTFIPGenDist(ip_range=['48.0.0.1', '48.1.255.199'], distribution=distribution))
         cg, sg = ASTFGlobalInfo(), ASTFGlobalInfo()
         for glob in (cg, sg):
+            # IPv4 defaults from RFC 9411 sections 4.3.1.1 and 4.3.2.1.
+            glob.tcp.mss = 1460
+            glob.tcp.initwnd = 10
             glob.tcp.rxbufsize = 65535
             glob.tcp.txbufsize = 65535
             if cc:

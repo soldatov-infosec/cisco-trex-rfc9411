@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "release": "1.0.1",
+  "release": "1.1.0",
   "upstream": {
     "repository": "https://github.com/cisco-system-traffic-generator/trex-core",
     "tag": "v3.06",
@@ -114,7 +114,7 @@
     {
       "path": "src/44bsd/http/astf_http.h",
       "base_sha256": null,
-      "result_sha256": "4ddff43ded092a2998270b22cb2a8676ddf0408f598354ca1f4634c720eaf8c2",
+      "result_sha256": "258500a57ee638df1bc3938d84a4c42613c72ccf68494b1ecb3d62c9b6819607",
       "patch": "0003-http-engines.patch",
       "origin": "rfc9411-extension"
     },
@@ -191,14 +191,14 @@
     {
       "path": "src/44bsd/tcp_socket.cpp",
       "base_sha256": "28ee61929c1616bb8958bd7606a3ef3f24fc132ccea5fc6a0031ecff9021c589",
-      "result_sha256": "cd56ecb564015989eaa13744e111e354676db0452aba803036bfe99828293982",
+      "result_sha256": "fa27910160ca69a7780d3c0e54259b606d8fa312cdfc6086d9fe1241a1ddd24b",
       "patch": "0004-astf-transport-and-latency.patch",
       "origin": "rfc9411-extension"
     },
     {
       "path": "src/44bsd/tcp_socket.h",
       "base_sha256": "145b2cf004bc7504f9e09022f6c489a50798f214dd41e9b2000d721e6a536171",
-      "result_sha256": "47e7f9314ff580d2667e5563c04d9dabecbff1aa2c905273496e633395d86987",
+      "result_sha256": "472ec6ab114dd6602e994992b7c6e1ec296ce27c51b67d127e496a99677f80be",
       "patch": "0004-astf-transport-and-latency.patch",
       "origin": "rfc9411-extension"
     },
@@ -212,7 +212,7 @@
     {
       "path": "src/44bsd/tcp_var.h",
       "base_sha256": "a1097351e7ad2a14bd9e31effd746aa5cfa315b64a6628d5d1a528e1afd8a20b",
-      "result_sha256": "730ba0e2e3e002cf460d219a95e69db053da61051a9aafbfcbfe5793655d516b",
+      "result_sha256": "d0fe269e1c3cfae530cc2d688b054c09aae8ed6b07e5a3004fa154d643b55304",
       "patch": "0004-astf-transport-and-latency.patch",
       "origin": "rfc9411-extension"
     },
@@ -233,7 +233,7 @@
     {
       "path": "src/stt_cp.cpp",
       "base_sha256": "1fae2dd3e7d80e2251d6f2edc97da8fcb9be2f3eb231158c4ed84ee1f245f70a",
-      "result_sha256": "9a71fc66b338d6a2f8069c4dfecd4ce275e89453c4a7b157b539f6ae0bde0ab4",
+      "result_sha256": "48290e882f9300c756dcd604b452b123d394fb84b01f711bbd008ef4691d8c7a",
       "patch": "0004-astf-transport-and-latency.patch",
       "origin": "rfc9411-extension"
     },
@@ -261,21 +261,21 @@
     {
       "path": "scripts/astf_schema.json",
       "base_sha256": "e5bc6bd1ec590490b5a03a0afc6c602c6587a7f561be4b5ba2f477af064b7e24",
-      "result_sha256": "b6b905d0c81adc2cdb0690229737dd2103b1a710d0ce2d1dd41bfa66af40b234",
+      "result_sha256": "6da68b2e44f6915808f0705e6553529750c442720fa2e6d34b7cfe4b73aa2336",
       "patch": "0005-profile-api-and-loading.patch",
       "origin": "rfc9411-extension"
     },
     {
       "path": "scripts/automation/trex_control_plane/interactive/trex/astf/trex_astf_profile.py",
       "base_sha256": "f9fe87b2a293b51c7e7bbc8cd19d59f70dce6568d8a5ee9ca6d96a62b9337535",
-      "result_sha256": "dd3f635724a0b78442967ff26219eff649f36e165919a3b081d09e6ebd93a9c7",
+      "result_sha256": "3cb31d2fb1f5fd6d8028ee29c29394a7aa00c6803aeb200396051265754133ba",
       "patch": "0005-profile-api-and-loading.patch",
       "origin": "rfc9411-extension"
     },
     {
       "path": "src/astf/astf_db.cpp",
       "base_sha256": "d768f058e27ca13d28d740e0d75439c08a86972e46fff632359c0b2b3887ef44",
-      "result_sha256": "6cb745d0009472bdd0bbca3d4e21045353b87ca7b29a3df231ca1034745168dc",
+      "result_sha256": "48af9db2c8884c0adb39e96c262912fbc8a98a118b7e3401a27a5ba10d1a13e9",
       "patch": "0005-profile-api-and-loading.patch",
       "origin": "rfc9411-extension"
     },
@@ -289,7 +289,7 @@
     {
       "path": "src/astf/astf_json_validator.cpp",
       "base_sha256": "72afc6ffca182f8fd8554e916b5f2c1b94c2fbfa8b5653553b7231fa6524ffcc",
-      "result_sha256": "8876bd4bcaf5bbe688fd30bc8bc904c27807e67f4963bdb1773751826a2ccded",
+      "result_sha256": "94513be4d0cccf7b087c29254cdb5cff2bd3045e864877f8ca50edf0d9c02060",
       "patch": "0005-profile-api-and-loading.patch",
       "origin": "rfc9411-extension"
     },
@@ -359,35 +359,35 @@
     {
       "path": "src/44bsd/sim_cs_tcp.cpp",
       "base_sha256": "5aa5be3f2215c114a4fa84570bf99a661cff5eaf95db3ba82151f2a6875dbed5",
-      "result_sha256": "ad7af9f304e0aa5efacef4da5820cf0ca4380a02a07938252d6125712ec08d84",
+      "result_sha256": "11d55131ea65dac3eb472d846bbebc990d48ce79112667211605ce2bb7dc8b30",
       "patch": "0007-tests-and-simulator.patch",
       "origin": "rfc9411-extension"
     },
     {
       "path": "src/44bsd/sim_cs_tcp.h",
       "base_sha256": "da53e314dfd495da256adcd2fc8187bda4c9ef7a3bafa8c53142b968d1aa2ad8",
-      "result_sha256": "00223980a44f88e8a8af74116f662c70202c73f26cce7c96279f6e1660a4a6bb",
+      "result_sha256": "9fc8b99ab159e9fa81104d1ec50c9d9c2577dc9463adfaaf38f8747329a5b624",
       "patch": "0007-tests-and-simulator.patch",
       "origin": "rfc9411-extension"
     },
     {
       "path": "src/gtest/bp_astf_interactive_gtest.cpp",
       "base_sha256": "9c8763a121599323367b4e908b512c45f8ae4529ccfb0afc00ae0655fbfdba51",
-      "result_sha256": "4d6594e845da31860934fb97924070b7bca67a8adc5156996e23fbcbe242fd9f",
+      "result_sha256": "b13b84aeab522117551a988127fc8552a6dcfdc8c3b0ecdbf94f9245bc65585f",
       "patch": "0007-tests-and-simulator.patch",
       "origin": "rfc9411-extension"
     },
     {
       "path": "src/gtest/bp_tcp_gtest.cpp",
       "base_sha256": "3795ee9f4fc86fb9f7fcb483fff9510fd132ad607958999116d9ca2bfa494109",
-      "result_sha256": "67d9fa320cf7a7aa4264dd7ab03c6344ee22f9856f0ea1056a313724a0fd76f0",
+      "result_sha256": "6134f6f001fed2e1d9ee952ebe5e291cbe24f4c1584a1b3875761b673f1484be",
       "patch": "0007-tests-and-simulator.patch",
       "origin": "rfc9411-extension"
     },
     {
       "path": "tests/tls/api_test.py",
       "base_sha256": null,
-      "result_sha256": "9ab1ab781daf2451ca18a8e2a694f8c7363794a1efa4d157e3c44fe62fc0933f",
+      "result_sha256": "856cfc41db7e063b58f6352f72cc9459049b0dba08597084a8ce5e6229715472",
       "patch": "0007-tests-and-simulator.patch",
       "origin": "rfc9411-extension"
     },
@@ -709,7 +709,7 @@
     {
       "path": "tests/tls/run_interactive_veth.sh",
       "base_sha256": null,
-      "result_sha256": "f00824a6d9105b9653b69e72e417f349e8c9b036e383218ffd1ffaa1a4328545",
+      "result_sha256": "38d979cb08114d511a71d8033198c85f1ab65b818313f31fedb95366030ec574",
       "patch": "0007-tests-and-simulator.patch",
       "origin": "rfc9411-extension"
     },
@@ -1055,6 +1055,41 @@
       "base_sha256": "6d22072ab73b1d5ef27b76a67752d5647535079f1c3faf5c9998b7683aa575b4",
       "result_sha256": "c97c99c0f7c16c497c50f8540ea6d769822a9bfe9df73379466cbaf4135d10dc",
       "origin": "maintainer-addition"
+    },
+    {
+      "path": "scripts/astf/http_messages.py",
+      "patch": "0008-documentation-and-examples.patch",
+      "base_sha256": null,
+      "result_sha256": "357c9c68a6ce013078c245710f56bd401fd57e0863bbfb0f5beaf14e77203372",
+      "origin": "maintainer-addition"
+    },
+    {
+      "path": "doc/astf-http-messages.md",
+      "patch": "0008-documentation-and-examples.patch",
+      "base_sha256": null,
+      "result_sha256": "cc7cdaa929e260512a8a9c674c317f9a9b376fb17bd60de7f4d94e3ea0b68a9f",
+      "origin": "maintainer-addition"
+    },
+    {
+      "path": "tests/tls/http_message_live.py",
+      "patch": "0007-tests-and-simulator.patch",
+      "base_sha256": null,
+      "result_sha256": "5e9a49179cad9c62d69deb2439a6dc3bd27ba854789bf7dfec98baa762756954",
+      "origin": "maintainer-addition"
+    },
+    {
+      "path": "tests/tls/http_message_test.cpp",
+      "patch": "0007-tests-and-simulator.patch",
+      "base_sha256": null,
+      "result_sha256": "1e50d5d66a6de20bc2a158351cbc705b19ed3b226b21c0c2eb4d389f8e51f307",
+      "origin": "maintainer-addition"
+    },
+    {
+      "path": "tests/tls/http_bench.cpp",
+      "patch": "0007-tests-and-simulator.patch",
+      "base_sha256": null,
+      "result_sha256": "4e920c5aca800abe93166efaf711545f41f51c3f30c547cfeb75c75cf0be3479",
+      "origin": "maintainer-addition"
     }
   ],
   "patches": [
@@ -1068,15 +1103,15 @@
     },
     {
       "path": "0003-http-engines.patch",
-      "sha256": "a6b4eaefde20506eeec14172adea6635870555cdb3df4c50d159d9ae0742ff20"
+      "sha256": "b37e6e2ed6f6ce09eee4ad43f5fb0a5da18bc50fcff9cda9e2ccf90943cb3b98"
     },
     {
       "path": "0004-astf-transport-and-latency.patch",
-      "sha256": "d4d86d2a6ffa1a75735dfa964cb3ec05f2de66950863cc1d6c7d4bce15a1655d"
+      "sha256": "776d922def99b1e788c04e1c56f29d558f1ac7ebeefd389b3dba7b4410b650bf"
     },
     {
       "path": "0005-profile-api-and-loading.patch",
-      "sha256": "4923a29c163a3efaa11c096052dea790aba07395719d0b50f449a53afa456ed5"
+      "sha256": "372f10540403dc4a5b6b86ecfb06a40d8b266b9dbc0e567962a567bcc40e6d35"
     },
     {
       "path": "0006-scheduler-and-diagnostics.patch",
@@ -1084,11 +1119,11 @@
     },
     {
       "path": "0007-tests-and-simulator.patch",
-      "sha256": "f48905e375a7e5eaea15dbd800aa71683f81bba486fc2dcb4484bc3c9cc623fa"
+      "sha256": "c930bcfc34036d79b6eb0fe7978e07c607a557197917d9f0a6633fcc1e874d01"
     },
     {
       "path": "0008-documentation-and-examples.patch",
-      "sha256": "cd679b0a4aa62173ba11789891d5f8f207962754a5971df2b8354b8e80c8af91"
+      "sha256": "f0549e7572d832de87be8fbc75f4c0d3436562d180fa8c121d050940af1a761c"
     },
     {
       "path": "0009-nic-validation-toolkit.patch",

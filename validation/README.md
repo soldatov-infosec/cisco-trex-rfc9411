@@ -1,8 +1,9 @@
 # Validation
 
-Current release: see the [1.0.1 queue review](rx-queue-review.md) and
-[machine-readable results](results.json). The table below records inherited
-1.0.0 validation, not newly repeated checks.
+Current release: see the [1.1.0 HTTP message validation](http-message-1.1.0.md).
+The [1.0.1 queue review](rx-queue-review.md) and [results](results.json) are
+historical evidence. The table below records inherited 1.0.0 validation, not
+newly repeated checks.
 
 
 Validation is split by scope. A passing simulator test is not a physical-NIC

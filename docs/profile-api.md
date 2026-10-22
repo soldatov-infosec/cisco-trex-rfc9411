@@ -112,3 +112,8 @@ The server generates each selected length; the client checks that exact length
 before counting a successful response. Every length must satisfy `max_body_size`;
 204/304 responses must have zero length. Without a list, fixed-size behavior is
 unchanged. The list is stored in program configuration, without per-request allocation.
+
+## HTTP/1.1 message receive commands
+
+See [message receives](http-message-api.md) for `recv_http_request()`,
+`recv_http_response()`, per-command deadlines and exact body-length validation.

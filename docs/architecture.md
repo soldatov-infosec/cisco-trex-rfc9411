@@ -161,3 +161,7 @@ The [patch map](../patches/README.md) identifies where each component is maintai
 See the [RX phase diagram](release-1.0.1.md#receive-path) and
 [queue lifetime review](../validation/rx-queue-review.md) for the burst-local
 transport/TLS split, capacity fallback and flow destruction rules.
+
+## HTTP/1.1 message receives
+
+See the [message receive architecture](http-message-design.md) for framing, completion credits and timer ownership.

@@ -1,0 +1,1453 @@
+diff --git a/src/44bsd/http/astf_http.h b/src/44bsd/http/astf_http.h
+--- a/src/44bsd/http/astf_http.h
++++ b/src/44bsd/http/astf_http.h
+@@ -5,6 +5,8 @@
+ #include <cstdint>
+ #include <cstring>
+ #include <vector>
++#include <memory>
++#include <limits>
+ #include <string>
+ namespace astf_http {
+ struct Config {
+@@ -14,16 +16,19 @@
+     unsigned expected_status=200;
+     std::string body_contains; // UTF-8 bytes in the dechunked body, per response.
+     bool transactions=false;
++    // Request framing and HEAD responses are opt-in; legacy response defaults remain.
++    bool request=false, head_response=false;
++    int64_t expected_body_bytes=-1; // Dechunked bytes; -1 disables exact-size checking.
+ };
+ enum class Error { NONE, STATUS, FRAMING, LIMIT, TRUNCATED, EXCESS, CONTENT, TRANSACTION };
+-// Streaming HTTP/1.x GET response validator. A single bounded allocation at
++// Streaming HTTP/1.x request/response validator. A single bounded allocation at
+ // flow creation; body bytes are skipped, never retained or copied. No callbacks
+ // into the application while the parser holds an input buffer.
+ class Response {
+ public:
+     typedef bool (*Event)(void *, bool); // false: first byte; true: validated response end
+     explicit Response(const Config &c, Event event=nullptr, void *owner=nullptr):
+-        cfg(c), line(c.max_header_bytes+1), prefix(c.body_contains.size()), event(event), owner(owner) {
++        cfg(c), line(new char[size_t(c.max_header_bytes)+1]), prefix(c.body_contains.size()), event(event), owner(owner) {
+         for (size_t i=1,j=0;i<prefix.size();++i) {
+             while (j && cfg.body_contains[i]!=cfg.body_contains[j]) j=prefix[j-1];
+             if (cfg.body_contains[i]==cfg.body_contains[j]) ++j;
+@@ -34,8 +39,21 @@
+     bool done() const { return error==Error::NONE && count==cfg.responses; }
+     Error failure() const { return error; }
+     bool feed(const uint8_t *p, size_t len) {
++        size_t consumed=0;
++        return feed(p,len,consumed,false);
++    }
++    // Stop at one complete message when requested. The caller owns the unconsumed
++    // suffix; this parser neither copies it nor invokes ASTF command execution.
++    bool feed(const uint8_t *p, size_t len, size_t &consumed, bool one_message) {
++        const uint32_t initial_count=count;
++        struct Consumption {
++            size_t &out; const size_t total; size_t &remaining;
++            ~Consumption() { out=total-remaining; }
++        } consumption{consumed,len,len};
++        consumed=0;
+         if (error!=Error::NONE) return false;
+         while (len) {
++            if (one_message && count!=initial_count) return error==Error::NONE;
+             if (error!=Error::NONE) return false;
+             if (done()) return fail(Error::EXCESS);
+             if (!started) {
+@@ -44,17 +62,18 @@
+             }
+             if (state==BODY || state==CHUNK_BODY) {
+                 size_t n=size_t(std::min<uint64_t>(left,len));
+-                body_data(p,n); p+=n; len-=n; left-=n;
++                body_data(p,n); body+=n; p+=n; len-=n; left-=n;
+                 if (!left) { if (state==BODY) finish(); else state=CHUNK_CR; }
+                 continue;
+             }
+             if (state==CLOSE_BODY) {
+                 if (len>cfg.max_body_bytes-body) return fail(Error::LIMIT);
+-                body_data(p,len); body+=len; return true;
++                body_data(p,len); body+=len; len=0; return true;
+             }
+             if (state==CHUNK_CR || state==CHUNK_LF) {
+-                if (*p++ != (state==CHUNK_CR ? '\r' : '\n')) return fail(Error::FRAMING);
+-                --len; state=state==CHUNK_CR ? CHUNK_LF : CHUNK_SIZE; continue;
++                const unsigned char c=*p++; --len;
++                if (c != (state==CHUNK_CR ? '\r' : '\n')) return fail(Error::FRAMING);
++                state=state==CHUNK_CR ? CHUNK_LF : CHUNK_SIZE; continue;
+             }
+             unsigned char c=*p++; --len;
+             if ((c<32 && c!='\r' && c!='\n' && c!='\t') || c==127) return fail(Error::FRAMING);
+@@ -64,10 +83,13 @@
+             if (c!='\n') continue;
+             if (used<2 || line[used-2]!='\r') return fail(Error::FRAMING);
+             size_t n=used-2; line[n]=0;
+-            if (std::memchr(line.data(),'\r',n)) return fail(Error::FRAMING);
++            if (std::memchr(line.get(),'\r',n)) return fail(Error::FRAMING);
+             used=0;
+-            if (state==STATUS_LINE) {
+-                if (n<12 || (std::memcmp(line.data(),"HTTP/1.1 ",9) && std::memcmp(line.data(),"HTTP/1.0 ",9)) ||
++            if (state==STATUS_LINE && cfg.request) {
++                if (!request_line(n)) return fail(Error::FRAMING);
++                state=HEADERS;
++            } else if (state==STATUS_LINE) {
++                if (n<12 || (std::memcmp(line.get(),"HTTP/1.1 ",9) && std::memcmp(line.get(),"HTTP/1.0 ",9)) ||
+                     (n>12 && line[12]!=' ')) return fail(Error::FRAMING);
+                 status=0;
+                 for (size_t i=9;i<12;++i) {
+@@ -80,13 +102,18 @@
+                 if (n) { if (!field(n,false)) return false; }
+                 else {
+                     if (has_length && chunked) return fail(Error::FRAMING);
+-                    if (status<200) {
++                    if (cfg.request) {
++                        // Requests without an explicit body length have no body.
++                        if (chunked) state=CHUNK_SIZE;
++                        else if (has_length && left) state=BODY;
++                        else finish();
++                    } else if (status<200) {
+                         if (has_length || chunked || ++interims>16) return fail(Error::FRAMING);
+                         state=STATUS_LINE; // Bound all informational headers together.
+                     } else {
+                         if (status!=cfg.expected_status) return fail(Error::STATUS);
+-                        if (status==204 || status==304) {
+-                            if (chunked || (status==204 && left)) return fail(Error::FRAMING);
++                        if (cfg.head_response || status==204 || status==304) {
++                            if (status==204 && (chunked || has_length)) return fail(Error::FRAMING);
+                             finish();
+                         } else if (chunked) state=CHUNK_SIZE;
+                         else if (has_length) { if (left) state=BODY; else finish(); }
+@@ -95,16 +122,16 @@
+                 }
+             } else if (state==CHUNK_SIZE) {
+                 uint64_t value=0; size_t i=0;
+-                for (;i<n && line[i]!=';';++i) {
++                for (;i<n;++i) {
+                     int digit=hex(line[i]);
+-                    if (digit<0) return fail(Error::FRAMING);
++                    if (digit<0) break;
+                     if (uint64_t(digit)>cfg.max_body_bytes || value>(cfg.max_body_bytes-uint64_t(digit))/16)
+                         return fail(Error::LIMIT);
+                     value=value*16+unsigned(digit);
+                 }
+-                if (!i) return fail(Error::FRAMING);
++                if (!i || !chunk_extensions(i,n)) return fail(Error::FRAMING);
+                 if (value>cfg.max_body_bytes-body) return fail(Error::LIMIT);
+-                body+=value; left=value;
++                left=value;
+                 if (value) state=CHUNK_BODY;
+                 else { state=TRAILERS; header_bytes=0; }
+             } else if (state==TRAILERS) {
+@@ -123,7 +150,9 @@
+ private:
+     enum State { STATUS_LINE, HEADERS, BODY, CLOSE_BODY, CHUNK_SIZE, CHUNK_BODY, CHUNK_CR, CHUNK_LF, TRAILERS };
+     Config cfg;
+-    std::vector<char> line;
++    // Only bytes already received are read; avoid clearing the header limit
++    // worth of memory on every new connection. Capacity stays bounded.
++    std::unique_ptr<char[]> line;
+     std::vector<size_t> prefix;
+     Event event; void *owner;
+     size_t matched=0;
+@@ -158,6 +187,56 @@
+         }
+         return true;
+     }
++    static bool token(unsigned char c) {
++        return (c>='a'&&c<='z') || (c>='A'&&c<='Z') || (c>='0'&&c<='9') ||
++               (c && std::strchr("!#$%&'*+-.^_`|~",c));
++    }
++    bool chunk_extensions(size_t i, size_t n) const {
++        // RFC 9112 section 7.1.1: validate syntax, ignore extension semantics.
++        while (i<n) {
++            while (i<n && (line[i]==' ' || line[i]=='\t')) ++i;
++            if (i==n || line[i++]!=';') return false;
++            while (i<n && (line[i]==' ' || line[i]=='\t')) ++i;
++            const size_t start=i;
++            while (i<n && token(line[i])) ++i;
++            if (i==start) return false;
++            const size_t after_name=i;
++            while (i<n && (line[i]==' ' || line[i]=='\t')) ++i;
++            if (i==n || line[i]!='=') { i=after_name; continue; }
++            ++i;
++            while (i<n && (line[i]==' ' || line[i]=='\t')) ++i;
++            if (i==n) return false;
++            if (line[i]=='"') {
++                ++i;
++                while (i<n && line[i]!='"') {
++                    if (line[i]=='\\' && ++i==n) return false;
++                    ++i; // Controls other than HTAB were rejected by line scanning.
++                }
++                if (i==n) return false;
++                ++i;
++            } else {
++                const size_t value=i;
++                while (i<n && token(line[i])) ++i;
++                if (i==value) return false;
++            }
++        }
++        return true;
++    }
++    bool request_line(size_t n) {
++        size_t method=0;
++        while (method<n && token(line[method])) ++method;
++        if (!method || method==n || line[method]!=' ') return false;
++        // Tunnels need a different interpreter and are not HTTP messages here.
++        if (method==7 && !std::memcmp(line.get(),"CONNECT",7)) return false;
++        size_t end=method+1;
++        while (end<n && line[end]!=' ') {
++            if (static_cast<unsigned char>(line[end])<=32) return false;
++            ++end;
++        }
++        if (end==method+1 || n-end!=9) return false;
++        return !std::memcmp(line.get()+end," HTTP/1.1",9) ||
++               !std::memcmp(line.get()+end," HTTP/1.0",9);
++    }
+     bool field(size_t n, bool trailer) {
+         size_t colon=0;
+         while (colon<n && line[colon]!=':') {
+@@ -169,23 +248,30 @@
+         size_t first=colon+1;
+         while (first<n && (line[first]==' ' || line[first]=='\t')) ++first;
+         while (n>first && (line[n-1]==' ' || line[n-1]=='\t')) --n;
+-        if (equal(line.data(),colon,"content-length")) {
++        if (cfg.request && (equal(line.get(),colon,"upgrade") ||
++                            equal(line.get(),colon,"expect"))) return fail(Error::FRAMING);
++        if (equal(line.get(),colon,"content-length")) {
+             if (trailer || has_length || first==n) return fail(Error::FRAMING);
++            const uint64_t limit=(!cfg.request && (cfg.head_response || status==304))
++                ? std::numeric_limits<uint64_t>::max() : cfg.max_body_bytes;
+             uint64_t value=0;
+             for (size_t i=first;i<n;++i) {
+                 if (line[i]<'0' || line[i]>'9') return fail(Error::FRAMING);
+                 unsigned digit=unsigned(line[i]-'0');
+-                if (digit>cfg.max_body_bytes || value>(cfg.max_body_bytes-digit)/10) return fail(Error::LIMIT);
++                if (digit>limit || value>(limit-digit)/10) return fail(Error::LIMIT);
+                 value=value*10+digit;
+             }
+             has_length=true; left=value;
+-        } else if (equal(line.data(),colon,"transfer-encoding")) {
+-            if (trailer || chunked || !equal(line.data()+first,n-first,"chunked")) return fail(Error::FRAMING);
++        } else if (equal(line.get(),colon,"transfer-encoding")) {
++            if (trailer || chunked || !equal(line.get()+first,n-first,"chunked")) return fail(Error::FRAMING);
+             chunked=true;
+         }
+         return true;
+     }
+     void finish() {
++        if (cfg.expected_body_bytes>=0 && body!=uint64_t(cfg.expected_body_bytes)) {
++            fail(Error::CONTENT); return;
++        }
+         if (!cfg.body_contains.empty() && !found) { fail(Error::CONTENT); return; }
+         if (event && !event(owner,true)) { fail(Error::TRANSACTION); return; }
+         matched=0; found=started=false;
+diff --git a/src/44bsd/tcp_socket.cpp b/src/44bsd/tcp_socket.cpp
+--- a/src/44bsd/tcp_socket.cpp
++++ b/src/44bsd/tcp_socket.cpp
+@@ -49,6 +49,9 @@
+     std::unique_ptr<astf_http::Transactions> transactions;
+     uint64_t now_ns=0;
+     bool waiting_request=false;
++    bool message_wait=false;
++    uint32_t consumed_messages=0;
++    uint64_t message_deadline_ns=0;
+     astf_http::Response parser;
+     uint64_t http_first_ns=0, http_last_ns=0;
+     bool http_received=false, http_eof=false, http_error=false, aborted=false;
+@@ -180,7 +183,7 @@
+         if (m_tls) clean=clean && !m_tls->error_reported && !m_tls->session.failed() &&
+             m_tls->close_done && m_tls->session.peer_closed();
+ #endif
+-        if (clean && t.parser.done() && !t.http_error && m_http_syn_started && t.http_received &&
++        if (!m_program->m_http.request && clean && t.parser.done() && !t.http_error && m_http_syn_started && t.http_received &&
+             t.http_first_ns>=m_http_syn_ns && t.http_last_ns>=t.http_first_ns) {
+             auto &tp=m_flow->m_tcp;
+             tcp_latency_add(&tp.t_stat->tcps_ttfb, t.http_first_ns-m_http_syn_ns);
+@@ -189,7 +192,7 @@
+                 tcp_latency_add(&tp.t_stat_ex->tcps_ttfb, t.http_first_ns-m_http_syn_ns);
+                 tcp_latency_add(&tp.t_stat_ex->tcps_ttlb, t.http_last_ns-m_http_syn_ns);
+             }
+-        } else if (!t.http_error) INC_STAT(m_pctx, m_flow->m_tg_id, tcps_http_aborted);
++        } else if (!t.http_error && (!clean || !t.parser.done())) INC_STAT(m_pctx, m_flow->m_tg_id, tcps_http_aborted);
+         delete m_http;
+     }
+ #ifdef TREX_TLS
+@@ -348,7 +351,7 @@
+ void CEmulApp::http_syn() {
+     // Program metadata exists before TCP connects and before the TLS flow is
+     // allocated. Retransmitted SYNs must retain the first timestamp (even zero).
+-    if (!m_http_syn_started && m_program && (m_program->m_http.enabled || m_program->m_http2.enabled)) {
++    if (!m_http_syn_started && m_program && ((m_program->m_http.enabled && !m_program->m_http.request) || m_program->m_http2.enabled)) {
+         m_http_syn_ns=uint64_t(now_sec()*1000000000.0);
+         m_http_syn_started=true;
+     }
+@@ -383,7 +386,8 @@
+     uint32_t before=t.parser.completed();
+     bool ok=eof ? t.parser.eof() : t.parser.feed(data,len);
+     if (eof) t.http_eof=true;
+-    INC_STAT_CNT(m_pctx, m_flow->m_tg_id, tcps_http_responses, t.parser.completed()-before);
++    if (!m_program->m_http.request)
++        INC_STAT_CNT(m_pctx, m_flow->m_tg_id, tcps_http_responses, t.parser.completed()-before);
+     if (!ok && !t.http_error) {
+         t.http_error=true;
+         INC_STAT(m_pctx, m_flow->m_tg_id, tcps_http_errors);
+@@ -403,7 +407,7 @@
+ }
+ 
+ bool CEmulApp::needs_rx_timestamps() const {
+-    return m_program && (m_program->m_http.enabled ||
++    return m_program && ((m_program->m_http.enabled && !m_program->m_http.request) ||
+            (m_program->m_http2.enabled && !m_program->m_http2.server));
+ }
+ bool CEmulApp::needs_rx_payload() const {
+@@ -673,7 +677,50 @@
+ }
+ 
+ /* on tick */
++// The simulator advances only timer-wheel level zero (51.2 seconds).
++// Production supports higher levels; keep every usec conversion within uint32_t.
++#ifdef TREX_SIM
++static const uint64_t http_timer_slice_usec=30000000;
++#else
++static const uint64_t http_timer_slice_usec=600000000;
++#endif
++
++uint64_t CEmulApp::http_clock_ns() const {
++#ifdef TREX_SIM
++    return uint64_t(m_pctx->m_ctx->m_tick)*TCP_TIMER_W_1_TICK_US*1000;
++#else
++    return uint64_t(now_sec()*1000000000.0);
++#endif
++}
++
++bool CEmulApp::check_http_rx_condition() {
++    if (!m_http || !m_http->message_wait) return false;
++    auto &h=*m_http;
++    if (h.http_error || h.aborted) return true;
++    if (h.parser.completed()>h.consumed_messages) {
++        ++h.consumed_messages;
++        h.message_wait=false; h.message_deadline_ns=0;
++        force_stop_timer();
++        m_cmd_rx_bytes=0;
++        next(); // parser has returned; TCP close/output use existing interrupt handling
++    }
++    return true;
++}
++
+ void CEmulApp::on_tick(){
++    if (m_http && m_http->message_wait) {
++        const uint64_t now=http_clock_ns();
++        if(now<m_http->message_deadline_ns) {
++            run_cmd_delay(tw_time_usec_to_ticks(std::min<uint64_t>(http_timer_slice_usec, (m_http->message_deadline_ns-now+999)/1000)));
++            m_state=te_WAIT_RX;
++        } else {
++            m_http->aborted=true; m_http->message_wait=false;
++            INC_STAT(m_pctx,m_flow->m_tg_id,tcps_http_errors);
++            INC_STAT(m_pctx,m_flow->m_tg_id,tcps_http_timeouts);
++            payload_fail(false);do_disconnect();
++        }
++        return;
++    }
+     if (m_udp_rtt_deadline_ns) {
+         const uint64_t now = uint64_t(now_sec()*1000000000.0);
+         if (now < m_udp_rtt_deadline_ns) {
+@@ -821,6 +868,22 @@
+             h2_schedule_timer();
+         } catch (const std::exception &) { tls_fail(astf_tls::Failure::RESOURCE); }
+ #endif
++        break;
++    case tcHTTP_RECV_REQUEST:
++    case tcHTTP_RECV_RESPONSE:
++        if (!m_http || m_http->http_error || m_http->aborted) { payload_fail(false); break; }
++        if (m_http->parser.completed()>m_http->consumed_messages) {
++            ++m_http->consumed_messages;
++            m_cmd_rx_bytes=0;
++            return next_cmd(); // preserve interpreter budget; no recursive next()
++        }
++        if (m_http->http_eof) {payload_fail(false);break;}
++        m_http->message_wait=true;
++        m_http->message_deadline_ns=http_clock_ns()+uint64_t(cmd->u.m_delay_cmd.m_ticks)*1000000;
++        set_rx_disabled(false);
++        run_cmd_delay(tw_time_usec_to_ticks(std::min<uint64_t>(http_timer_slice_usec, uint64_t(cmd->u.m_delay_cmd.m_ticks)*1000)));
++        m_state=te_WAIT_RX;
++        check_http_rx_condition();
+         break;
+     case tcHTTP_REQUEST:
+         if (m_http && m_http->transactions && !(m_flags&taCONNECTED)) {
+@@ -1424,6 +1487,10 @@
+ #endif
+         if (event==te_SOOTHERISDISCONNECTING && !m_http->http_eof) {
+             if (!http_rx(nullptr,0,true)) payload_fail(false);
++            else if (m_state==te_WAIT_RX) {
++                bool saved=get_interrupt();set_interrupt(true);
++                check_http_rx_condition();set_interrupt(saved);
++            }
+         }
+     }
+ #ifdef TREX_TLS
+@@ -1734,6 +1801,10 @@
+         break;
+     case tcHTTP2:
+         fprintf(fd," http2 session\n");
++        break;
++    case tcHTTP_RECV_REQUEST:
++    case tcHTTP_RECV_RESPONSE:
++        fprintf(fd," http_recv_message timeout_ms=%u\n",u.m_delay_cmd.m_ticks);
+         break;
+     case tcHTTP_REQUEST:
+         fprintf(fd," http_request_start\n");
+@@ -2449,6 +2520,7 @@
+             if (m_http && t.session.peer_closed() && !m_http->http_eof && !http_rx(nullptr,0,true)) {
+                 tls_fail(astf_tls::Failure::APPLICATION); break;
+             }
++            if (m_http && m_http->http_eof && m_state==te_WAIT_RX) check_http_rx_condition();
+             if (t.http2) {
+                 t.http2->set_pacing_clock(h2_clock_ns());
+                 if(t.session.peer_closed() && !t.http2->eof()) {tls_fail(astf_tls::Failure::APPLICATION);break;}
+@@ -2480,7 +2552,7 @@
+             if (t.session.peer_closed() &&
+                 ((t.plain && t.offset < t.plain->len() && !t.session.can_write()) ||
+                  (m_state == te_WAIT_RX && m_cmd_index < m_program->get_size() &&
+-                  m_cmd_rx_bytes < m_cmd_rx_bytes_wm))) {
++                  ((m_http && m_http->message_wait) || m_cmd_rx_bytes < m_cmd_rx_bytes_wm)))) {
+                 tls_fail(astf_tls::Failure::APPLICATION);
+                 break;
+             }
+diff --git a/src/44bsd/tcp_socket.h b/src/44bsd/tcp_socket.h
+--- a/src/44bsd/tcp_socket.h
++++ b/src/44bsd/tcp_socket.h
+@@ -272,6 +272,8 @@
+                tcHTTP2                =26,  /* native HTTP/2 session */
+                tcUDP_REQUEST          =25,  /* one UDP request and response */
+                tcHTTP_REQUEST         =24,  /* begin one measured HTTP request */
++               tcHTTP_RECV_REQUEST    =27,
++               tcHTTP_RECV_RESPONSE   =28,
+                tcNO_CMD                =255  /* explicit reset */
+ } tcp_app_cmd_enum_t;
+ 
+@@ -1121,7 +1123,10 @@
+ 
+     void run_cmd_delay(htw_ticks_t ticks);
+ 
++    uint64_t http_clock_ns() const;
++    bool check_http_rx_condition();
+     inline void check_rx_condition(){
++        if (m_http && check_http_rx_condition()) return;
+         if (m_cmd_rx_bytes >= m_cmd_rx_bytes_wm) {
+             m_cmd_rx_bytes -= m_cmd_rx_bytes_wm;
+             if (get_rx_clear()){
+diff --git a/src/44bsd/tcp_var.h b/src/44bsd/tcp_var.h
+--- a/src/44bsd/tcp_var.h
++++ b/src/44bsd/tcp_var.h
+@@ -245,6 +245,7 @@
+     uint64_t    tcps_http_truncated;
+     uint64_t    tcps_http_bad_content;
+     uint64_t    tcps_http_transaction_errors;
++    uint64_t    tcps_http_timeouts; /* HTTP message receive deadlines exceeded */
+     uint64_t    tcps_http_framing;
+     uint64_t    tcps_http_aborted; /* validated HTTP connection did not close cleanly */
+     uint64_t    tcps_nombuf;        /* no mbuf for tcp - drop the packets */
+diff --git a/src/stt_cp.cpp b/src/stt_cp.cpp
+--- a/src/stt_cp.cpp
++++ b/src/stt_cp.cpp
+@@ -656,10 +656,11 @@
+     TCP_S_ADD_CNT(tcps_http_responses,"complete HTTP responses with expected status");
+     TCP_S_ADD_CNT_E(tcps_http_errors,"HTTP validation failures");
+     TCP_S_ADD_CNT_E(tcps_http_bad_status,"unexpected HTTP response status");
+-    TCP_S_ADD_CNT_E(tcps_http_truncated,"incomplete HTTP responses at stream EOF");
+-    TCP_S_ADD_CNT_E(tcps_http_bad_content,"HTTP response content mismatches");
++    TCP_S_ADD_CNT_E(tcps_http_truncated,"incomplete HTTP messages at stream EOF");
++    TCP_S_ADD_CNT_E(tcps_http_bad_content,"HTTP message content mismatches");
+     TCP_S_ADD_CNT_E(tcps_http_transaction_errors,"HTTP request tracking errors");
+-    TCP_S_ADD_CNT_E(tcps_http_framing,"HTTP framing or response limit errors");
++    TCP_S_ADD_CNT_E(tcps_http_timeouts,"HTTP message receive timeouts");
++    TCP_S_ADD_CNT_E(tcps_http_framing,"HTTP framing or message limit errors");
+     TCP_S_ADD_CNT_E(tcps_http_aborted,"HTTP flows aborted");
+     TCP_S_ADD_CNT_E(tcps_nombuf,"no mbuf for tcp - drop the packets");
+ 
+diff --git a/src/44bsd/sim_cs_tcp.cpp b/src/44bsd/sim_cs_tcp.cpp
+--- a/src/44bsd/sim_cs_tcp.cpp
++++ b/src/44bsd/sim_cs_tcp.cpp
+@@ -1419,6 +1419,71 @@
+ #ifdef TREX_TLS
+ // Match the NIC HTTP/1.1 profile: ten sequential requests, 16-KiB bodies,
+ // blocking sends and a server waiting for the client's TLS close.
++int CClientServerTcp::http_message_exchange(const std::string &version, unsigned scenario) {
++    return simple_http_generic([this,&version,scenario](CMbufBuffer *req, CMbufBuffer *res,
++            CEmulAppProgram *c, CEmulAppProgram *s, uint32_t) {
++        std::string request="GET / HTTP/1.1\r\nHost: localhost\r\nX-Inspection: added-header\r\n\r\n";
++        std::string response="HTTP/1.1 200 OK\r\nX-Inspection: added\r\nContent-Length: 5\r\n\r\nhello";
++        if(scenario==14 || scenario==15) response="HTTP/1.1 200 OK\r\nContent-Length: 16384\r\n\r\nhello"+std::string(16379,'x');
++        if(scenario==1) response="HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhe\r\n3\r\nllo\r\n0\r\nX-End: yes\r\n\r\n";
++        if(scenario==2) response="HTTP/1.1 403 Denied\r\nContent-Length: 0\r\n\r\n";
++        if(scenario==3 || scenario==5) response="HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nhello";
++        if(scenario==4) response="HTTP/1.0 200 OK\r\n\r\nhello";
++        if(scenario==6) {
++            request="POST / HTTP/1.1\r\nHost: localhost\r\nX-Inspection: "+std::string(700,'a')+
++                    "\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhe\r\n3\r\nllo\r\n0\r\nX-End: yes\r\n\r\n";
++            response="HTTP/1.1 200 OK\r\nX-Inspection: "+std::string(700,'b')+
++                     "\r\nContent-Length: 32768\r\n\r\nhello"+std::string(32763,'x');
++        }
++        if(scenario==10) request="POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n";
++        if(scenario==11) request="POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhell";
++        req->Delete();res->Delete();
++        utl_mbuf_buffer_create_and_copy(0,req,2048,(uint8_t*)&request[0],request.size());
++        utl_mbuf_buffer_create_and_copy(0,res,2048,(uint8_t*)&response[0],response.size());
++        const unsigned count=(scenario<2 || scenario>=14) ? 10 : (scenario==12 ? 2 : 1);
++        c->m_http.enabled=true;c->m_http.responses=count;c->m_http.transactions=true;
++        c->m_http.body_contains="hello";
++        if(scenario==9)c->m_http.expected_body_bytes=6;
++        s->m_http.enabled=scenario!=14;s->m_http.request=true;s->m_http.responses=count;
++        if(scenario==7) {CEmulAppCmd delay;delay.m_cmd=tcDELAY;
++            delay.u.m_delay_cmd.m_ticks=tw_time_usec_to_ticks(20000);s->add_cmd(delay);}
++        if(scenario==8)m_sim.add_event(new CTcpSimEventStop(0.03));
++        for(unsigned i=0;i<count;++i) {
++            CEmulAppCmd mark;mark.m_cmd=tcHTTP_REQUEST;c->add_cmd(mark);
++            CEmulAppCmd tx;tx.m_cmd=tcTX_BUFFER;tx.u.m_tx_cmd.m_buf=req;c->add_cmd(tx);
++            if(scenario==7) {CEmulAppCmd delay;delay.m_cmd=tcDELAY;
++                delay.u.m_delay_cmd.m_ticks=tw_time_usec_to_ticks(50000);c->add_cmd(delay);}
++            CEmulAppCmd rx;rx.m_cmd=tcHTTP_RECV_RESPONSE;rx.u.m_delay_cmd.m_ticks=scenario==12 ? 900000 : (scenario==6 ? 30000 : 1000);
++            if(scenario==14) {
++                rx.m_cmd=tcRX_BUFFER;rx.u.m_rx_cmd.m_flags=CEmulAppCmdRxBuffer::rxcmd_WAIT;
++                rx.u.m_rx_cmd.m_rx_bytes_wm=response.size();
++            }
++            if(scenario!=11)c->add_cmd(rx);
++            if(scenario==12 && i==0) { CEmulAppCmd delay;delay.m_cmd=tcDELAY;
++                delay.u.m_delay_cmd.m_ticks=tw_time_usec_to_ticks(20000000);
++                for(unsigned pause=0;pause<35;++pause)c->add_cmd(delay); }
++            if(scenario==14) rx.u.m_rx_cmd.m_rx_bytes_wm=request.size();
++            else rx.m_cmd=tcHTTP_RECV_REQUEST;
++            s->add_cmd(rx);
++            if(scenario==8) {CEmulAppCmd delay;delay.m_cmd=tcDELAY;
++                delay.u.m_delay_cmd.m_ticks=tw_time_usec_to_ticks(1000000);s->add_cmd(delay);}
++            tx.u.m_tx_cmd.m_buf=res;s->add_cmd(tx);
++        }
++        if(scenario!=3 && scenario!=4) {CEmulAppCmd wait;wait.m_cmd=tcDONT_CLOSE;s->add_cmd(wait);}
++        if(!version.empty()) {
++            astf_tls::Config config;config.version=version;
++            const char *cert=std::getenv("TREX_TLS_TEST_CERT"),*key=std::getenv("TREX_TLS_TEST_KEY");
++            if(!cert || !key)throw std::runtime_error("TLS simulator needs TREX_TLS_TEST_CERT/KEY");
++            config.ca=cert;config.sni="localhost";
++            c->m_tls_context=std::make_shared<astf_tls::Context>(config);
++            config.server=true;config.cert=cert;config.key=key;
++            s->m_tls_context=std::make_shared<astf_tls::Context>(config);
++        }
++        for(auto p:{c,s}) {p->set_stream(true);p->set_addon(nullptr);if(!version.empty())p->prepare_tls_buffers();}
++        return 0;
++    });
++}
++
+ int CClientServerTcp::tls_http_transactions(const std::string &version) {
+     return simple_http_generic([this,&version](CMbufBuffer *req, CMbufBuffer *res,
+             CEmulAppProgram *c, CEmulAppProgram *s, uint32_t) {
+diff --git a/src/44bsd/sim_cs_tcp.h b/src/44bsd/sim_cs_tcp.h
+--- a/src/44bsd/sim_cs_tcp.h
++++ b/src/44bsd/sim_cs_tcp.h
+@@ -294,6 +294,7 @@
+     int validated_http(unsigned scenario, bool transactions=false);
+ #ifdef TREX_TLS
+     enum tls_scenario_t { TLS_NORMAL, TLS_SNI_MISMATCH, TLS_STALL, TLS_RESET, TLS_CANCEL, TLS_SHORT_READ, TLS_DUPLEX, TLS_NONBLOCK, TLS_WORK_BUDGET, TLS_WORK_CANCEL, TLS_HANDSHAKE_TIMEOUT, TLS_CLOSE_STALL, TLS_HTTP_OK, TLS_HTTP_CHUNKED, TLS_HTTP_BAD_STATUS, TLS_HTTP_TRUNCATED, TLS_HTTP_BAD_BODY };
++    int http_message_exchange(const std::string &version, unsigned scenario);
+     int tls_http_transactions(const std::string &version);
+     int simple_tls(const std::string &version, size_t bio_capacity = 65536,
+                    uint32_t window = 0, tls_scenario_t scenario = TLS_NORMAL);
+diff --git a/src/astf/astf_db.cpp b/src/astf/astf_db.cpp
+--- a/src/astf/astf_db.cpp
++++ b/src/astf/astf_db.cpp
+@@ -450,6 +450,8 @@
+ 
+     if (cmd["name"] == "http2") return tcHTTP2;
+     if (cmd["name"] == "udp_request") return tcUDP_REQUEST;
++    if (cmd["name"] == "http_recv_request") return tcHTTP_RECV_REQUEST;
++    if (cmd["name"] == "http_recv_response") return tcHTTP_RECV_RESPONSE;
+     if (cmd["name"] == "http_request") return tcHTTP_REQUEST;
+     if (cmd["name"] == "tx") {
+         return tcTX_BUFFER;
+@@ -1798,7 +1800,7 @@
+                 if (!http.isObject() || !m_val["program_list"][program_index].get("stream",true).asBool())
+                     throw std::runtime_error("HTTP response validation requires a TCP client");
+ #ifdef TREX_TLS
+-                if (prog->m_tls_context && (prog->m_tls_context->config.server || prog->m_tls_context->config.alpn != "http/1.1"))
++                if (prog->m_tls_context && (prog->m_tls_context->config.alpn != "http/1.1"))
+                     throw std::runtime_error("HTTP response validation requires HTTP/1.1 on the client");
+ #endif
+                 auto &cfg=prog->m_http; cfg.enabled=true;
+@@ -1808,18 +1810,29 @@
+                             throw std::runtime_error("body_contains must be 1..4096 UTF-8 bytes");
+                         cfg.body_contains=http[name].asString(); continue;
+                     }
++                    if (name=="server" || name=="head_response") {
++                        if (!http[name].isBool()) throw std::runtime_error("HTTP flag must be boolean");
++                        if(name=="server") cfg.request=http[name].asBool();
++                        else cfg.head_response=http[name].asBool();
++                        continue;
++                    }
+                     if (name=="transactions") {
+                         if (!http[name].isBool()) throw std::runtime_error("transactions must be boolean");
+                         cfg.transactions=http[name].asBool(); continue;
+                     }
+                     if (!http[name].isUInt()) throw std::runtime_error("HTTP option must be an unsigned integer");
+                     uint32_t v=http[name].asUInt();
+-                    if (name=="responses") cfg.responses=v;
++                    if (name=="responses" || name=="requests") cfg.responses=v;
++                    else if (name=="expected_body_bytes") cfg.expected_body_bytes=v;
+                     else if (name=="expected_status") cfg.expected_status=v;
+                     else if (name=="max_header_bytes") cfg.max_header_bytes=v;
+                     else if (name=="max_body_bytes") cfg.max_body_bytes=v;
+                     else throw std::runtime_error("Unknown HTTP option: " + name);
+                 }
++                if ((cfg.request && (http.isMember("responses") || cfg.transactions || http.isMember("expected_status") || cfg.head_response)) ||
++                    (!cfg.request && http.isMember("requests")) ||
++                    (cfg.expected_body_bytes>=0 && uint64_t(cfg.expected_body_bytes)>cfg.max_body_bytes))
++                    throw std::runtime_error("HTTP options conflict with role or body limit");
+                 if (!cfg.responses || cfg.responses>1000000 || cfg.expected_status<200 || cfg.expected_status>599 ||
+                     cfg.max_header_bytes<512 || cfg.max_header_bytes>65536 || cfg.max_body_bytes>1073741824)
+                     throw std::runtime_error("HTTP option outside supported bounds");
+@@ -1883,6 +1896,12 @@
+ #endif
+             } catch(const std::exception &e) {delete prog;throw TrexException(std::string("HTTP/2 profile: ")+e.what());}
+         }
++        bool message_rx=false, byte_rx=false;
++        for(const auto &c : m_val["program_list"][program_index]["commands"]) {
++            message_rx |= c["name"]=="http_recv_request" || c["name"]=="http_recv_response";
++            byte_rx |= c["name"]=="rx";
++        }
++        if(message_rx && byte_rx) {delete prog; throw TrexException("Cannot mix HTTP message waits and byte receive commands");}
+         uint64_t total_rx_wm = 0;
+ 
+         cmd_index = 0;
+@@ -1920,6 +1939,17 @@
+             case tcHTTP2:
+                 if(!prog->m_http2.enabled) {delete prog;throw TrexException("http2 command requires HTTP/2 options");}
+                 cmd.m_cmd=tcHTTP2;prog->add_cmd(cmd);break;
++            case tcHTTP_RECV_REQUEST:
++            case tcHTTP_RECV_RESPONSE: {
++                const auto &j=m_val["program_list"][program_index]["commands"][cmd_index];
++                if(!prog->m_http.enabled || prog->m_http.request!=(cmd_type==tcHTTP_RECV_REQUEST) ||
++                   !j["timeout_ms"].isUInt() || !j["timeout_ms"].asUInt() || j["timeout_ms"].asUInt()>86400000) {
++                    delete prog;throw TrexException("Invalid HTTP message wait role or timeout");
++                }
++                cmd.m_cmd=cmd_type;
++                cmd.u.m_delay_cmd.m_ticks=j["timeout_ms"].asUInt(); // milliseconds, converted at execution
++                prog->add_cmd(cmd);break;
++            }
+             case tcHTTP_REQUEST:
+                 if (!prog->m_http.enabled || !prog->m_http.transactions) {
+                     delete prog;
+diff --git a/src/astf/astf_json_validator.cpp b/src/astf/astf_json_validator.cpp
+--- a/src/astf/astf_json_validator.cpp
++++ b/src/astf/astf_json_validator.cpp
+@@ -142,8 +142,9 @@
+                     return false;
+                 }
+             }
+-            if (!program["http"].isNull() && (server || !program.get("stream",true).asBool() || !program["addon"].isNull())) {
+-                err = "HTTP response validation requires a TCP client program";
++            if (!program["http"].isNull() && (!program.get("stream",true).asBool() || !program["addon"].isNull() ||
++                 program["http"].get("server",false).asBool()!=server)) {
++                err = "HTTP options must match TCP template role without addon";
+                 return false;
+             }
+             const auto &tls = profile["program_list"][index]["tls"];
+diff --git a/src/gtest/bp_tcp_gtest.cpp b/src/gtest/bp_tcp_gtest.cpp
+--- a/src/gtest/bp_tcp_gtest.cpp
++++ b/src/gtest/bp_tcp_gtest.cpp
+@@ -4563,3 +4563,109 @@
+     }
+ }
+ #endif
++
++#ifdef TREX_TLS
++TEST_F(gt_tcp, http_message_receive) {
++    for(const auto &version : {std::string(),std::string("1.2"),std::string("1.3")}) {
++        for(unsigned scenario=0;scenario<13;++scenario) {
++          for(auto mode : {csSIM_NONE,csSIM_DROP,csSIM_REORDER}) {
++            // Fault injection applies to completed exchanges; intentional
++            // timeout/abort cases have a separate deterministic timeline.
++            if(mode!=csSIM_NONE && !(scenario<2 || scenario==6 || scenario==7))continue;
++            SCOPED_TRACE(::testing::Message()<<"version="<<version<<" scenario="<<scenario<<" mode="<<mode);
++            CClientServerTcp sim;sim.Create("generated","http_message_receive");sim.m_mss=256;
++            CClientServerTcpCfgExt cfg;cfg.m_check_counters=false;cfg.m_rate=0.03;
++            sim.set_cfg_ext(&cfg);sim.set_simulate_rst_error(mode);
++            sim.http_message_exchange(version,scenario);
++            const auto &c=sim.m_c_ctx.get_tcpstat()->m_sts;
++            const auto &s=sim.m_s_ctx.get_tcpstat()->m_sts;
++            const bool good=scenario<2 || scenario==4 || scenario==6 || scenario==7 || scenario==12;
++            unsigned expected=scenario<2 ? 10 : (scenario==12 ? 2 : (good ? 1 : 0));
++            EXPECT_EQ_UINT32(expected,c.tcps_http_responses);
++            EXPECT_EQ_UINT32(expected,c.tcps_http_req_ttlb.values.count);
++            EXPECT_EQ_UINT32(0,s.tcps_http_responses);
++            EXPECT_EQ_UINT32(0,s.tcps_ttlb.count);
++            if(good) {
++                EXPECT_EQ_UINT32(0,c.tcps_http_errors);EXPECT_EQ_UINT32(0,s.tcps_http_errors);
++                EXPECT_EQ_UINT32(0,c.tcps_http_aborted);EXPECT_EQ_UINT32(0,s.tcps_http_aborted);
++                EXPECT_EQ_UINT32(1,c.tcps_closed);EXPECT_EQ_UINT32(1,s.tcps_closed);
++            } else if(scenario!=8 && scenario<10) { EXPECT_GT(c.tcps_http_errors,0); }
++            if(scenario==9) { EXPECT_EQ_UINT32(1,c.tcps_http_bad_content); }
++            if(scenario==10 || scenario==11) {
++                EXPECT_EQ_UINT32(1,s.tcps_http_errors);
++                EXPECT_EQ_UINT32(scenario==10 ? 1 : 0,s.tcps_http_framing);
++                EXPECT_EQ_UINT32(scenario==11 ? 1 : 0,s.tcps_http_truncated);
++                EXPECT_EQ_UINT32(1,c.tcps_closed);EXPECT_EQ_UINT32(1,s.tcps_closed);
++            }
++            EXPECT_EQ_UINT32(scenario==5 ? 1 : 0,c.tcps_http_timeouts);
++            EXPECT_EQ_UINT32(0,c.tcps_http_transaction_errors);
++            if(scenario==6 && mode!=csSIM_NONE) {
++                EXPECT_GT(c.tcps_rcvoopack+s.tcps_rcvoopack,0u);
++            }
++            EXPECT_FALSE(sim.m_c_ctx.m_timer_w.is_any_events_left());
++            EXPECT_FALSE(sim.m_s_ctx.m_timer_w.is_any_events_left());
++            for(unsigned tick=0;tick<2048;++tick) {
++                sim.m_c_ctx.timer_w_on_tick();sim.m_s_ctx.timer_w_on_tick();
++            }
++            sim.close_file();sim.Delete();
++          }
++        }
++    }
++}
++#endif
++
++#ifdef TREX_TLS
++TEST_F(gt_tcp, http_message_reassembly_exhaustion) {
++    struct Reset {~Reset(){tls_test_reass_failure(-1);}} reset;
++    for(const auto &version:{std::string(),std::string("1.2"),std::string("1.3")}) {
++        for(int site:{TLS_REASS_OBJECT,TLS_REASS_SHARED,TLS_REASS_RESERVE,TLS_REASS_COPY,TLS_REASS_MAP,TLS_REASS_MERGE}) {
++            SCOPED_TRACE(::testing::Message()<<version<<" site="<<site);
++            CClientServerTcp sim;sim.Create("generated","http_message_exhaustion");sim.m_mss=256;
++            CClientServerTcpCfgExt cfg;cfg.m_check_counters=false;cfg.m_rate=.2;
++            sim.set_cfg_ext(&cfg);sim.set_simulate_rst_error(csSIM_REORDER);
++            tls_test_reass_failure(site);
++            sim.http_message_exchange(version,6);
++            tls_test_reass_failure(-1);
++            const auto &c=sim.m_c_ctx.get_tcpstat()->m_sts,&s=sim.m_s_ctx.get_tcpstat()->m_sts;
++            EXPECT_EQ_UINT32(0,c.tcps_http_responses);
++            EXPECT_EQ_UINT32(0,c.tcps_http_req_ttlb.values.count);
++            EXPECT_EQ_UINT32(1,c.tcps_closed);EXPECT_EQ_UINT32(1,s.tcps_closed);
++            if(version.empty()) { EXPECT_GT(c.tcps_http_aborted+s.tcps_http_aborted,0u); }
++            else { EXPECT_GT(c.tcps_tls_err_resource+s.tcps_tls_err_resource,0u); }
++            EXPECT_FALSE(sim.m_c_ctx.m_timer_w.is_any_events_left());
++            EXPECT_FALSE(sim.m_s_ctx.m_timer_w.is_any_events_left());
++            sim.close_file();sim.Delete();
++        }
++    }
++}
++#endif
++
++#ifdef TREX_TLS
++TEST_F(gt_tcp, http_message_cost_comparison) {
++    if(!std::getenv("TREX_HTTP_MESSAGE_BENCH"))return;
++    struct Reset {~Reset(){rx_phase_benchmark=false;}} reset;
++    rx_phase_benchmark=true;
++    for(const auto &version:{std::string(),std::string("1.3")}) {
++        for(unsigned repeat=0;repeat<5;++repeat)for(unsigned order=0;order<2;++order) {
++            unsigned scenario=14+(repeat+order)%2;
++            double cpu=0;uint64_t acks=0;
++            for(unsigned i=0;i<68;++i) {
++                CClientServerTcp sim;sim.Create("generated","http_message_cost");
++                sim.m_rx_ack_batch_test=true;sim.m_rx_burst_test=true;
++                sim.m_mss=1440;sim.m_initwnd_factor=10;sim.set_rtt(100);
++                CClientServerTcpCfgExt cfg;cfg.m_check_counters=false;sim.set_cfg_ext(&cfg);
++                sim.http_message_exchange(version,scenario);
++                const auto &c=sim.m_c_ctx.get_tcpstat()->m_sts,&s=sim.m_s_ctx.get_tcpstat()->m_sts;
++                EXPECT_EQ_UINT32(10,c.tcps_http_responses);
++                EXPECT_EQ_UINT32(10,c.tcps_http_req_ttlb.values.count);
++                EXPECT_EQ_UINT32(0,c.tcps_http_errors+s.tcps_http_errors);
++                EXPECT_EQ_UINT32(1,c.tcps_closed);EXPECT_EQ_UINT32(1,s.tcps_closed);
++                if(i>=4){cpu+=rx_phase_cpu;acks+=c.tcps_sndacks+s.tcps_sndacks;}
++                sim.close_file();sim.Delete();
++            }
++            printf("HTTP_MESSAGE_COST transport=%s repeat=%u message=%u flows=64 cpu_seconds=%.9f acks=%llu\n",
++                version.empty()?"TCP":"TLS13",repeat,scenario-14,cpu,(unsigned long long)acks);
++        }
++    }
++}
++#endif
+diff --git a/src/gtest/bp_astf_interactive_gtest.cpp b/src/gtest/bp_astf_interactive_gtest.cpp
+--- a/src/gtest/bp_astf_interactive_gtest.cpp
++++ b/src/gtest/bp_astf_interactive_gtest.cpp
+@@ -507,3 +507,49 @@
+     db->clear_db_ro_rw(nullptr,0);
+     CAstfDB::free_instance(id);
+ }
++
++TEST_F(gt_astf_inter, http_message_profile_loading) {
++    std::ifstream input("automation/regression/data/astf_dns.json");
++    Json::Value profile;Json::Reader reader;ASSERT_TRUE(reader.parse(input,profile));
++    profile["buf_list"]=Json::Value(Json::arrayValue);profile["buf_list"].append("eA==");
++    profile["program_list"]=Json::Value(Json::arrayValue);
++    for(int side=0;side<2;++side) {
++        Json::Value program,command;program["stream"]=true;
++        program["http"][side ? "requests" : "responses"]=2;
++        if(side)program["http"]["server"]=true;
++        command["name"]=side ? "http_recv_request" : "http_recv_response";
++        command["timeout_ms"]=30000;
++        program["commands"].append(command);
++        Json::Value tx;tx["name"]="tx";tx["buf_index"]=0;program["commands"].append(tx);
++        profile["program_list"].append(program);
++    }
++    const profile_id_t id=0x1234567c;
++    auto db=CAstfDB::get_instance(id);db->Create();
++    Json::FastWriter writer;std::string error;
++    for(unsigned bad=0;bad<4;++bad) {
++        auto invalid=profile;
++        if(bad==0)invalid["program_list"][1]["http"]["server"]=false;
++        if(bad==1)invalid["program_list"][0]["commands"][0]["timeout_ms"]=0;
++        if(bad==2)invalid["program_list"][0]["commands"][0].removeMember("timeout_ms");
++        if(bad==3)invalid["program_list"][0]["http"]["server"]=true;
++        EXPECT_FALSE(db->set_profile_one_msg(writer.write(invalid),error));
++    }
++    ASSERT_TRUE(db->set_profile_one_msg(writer.write(profile),error))<<error;
++    auto ro=db->get_db_ro(0);ASSERT_TRUE(ro!=nullptr);
++    auto c=ro->get_client_prog(0);
++    EXPECT_TRUE(c->m_http.enabled);EXPECT_FALSE(c->m_http.request);
++    EXPECT_EQ_UINT32(tcHTTP_RECV_RESPONSE,c->get_index(0)->m_cmd);
++    EXPECT_EQ_UINT32(30000,c->get_index(0)->u.m_delay_cmd.m_ticks);
++    db->clear_db_ro_rw(nullptr,0);
++    // Reuse the profile ID after teardown; each load must own fresh programs.
++    for(unsigned cycle=0;cycle<20;++cycle) {
++        profile["program_list"][0]["commands"][0]["timeout_ms"]=86400000;
++        profile["program_list"][0]["http"]["responses"]=cycle+1;
++        ASSERT_TRUE(db->set_profile_one_msg(writer.write(profile),error))<<error;
++        ro=db->get_db_ro(0);ASSERT_TRUE(ro!=nullptr);
++        EXPECT_EQ_UINT32(cycle+1,ro->get_client_prog(0)->m_http.responses);
++        EXPECT_EQ_UINT32(86400000,ro->get_client_prog(0)->get_index(0)->u.m_delay_cmd.m_ticks);
++        db->clear_db_ro_rw(nullptr,0);
++    }
++    CAstfDB::free_instance(id);
++}
+diff --git a/scripts/astf_schema.json b/scripts/astf_schema.json
+--- a/scripts/astf_schema.json
++++ b/scripts/astf_schema.json
+@@ -298,6 +298,15 @@
+            },
+ 
+            
++          "program_command_http_receive_t": {
++              "type": "object", "additionalProperties": false,
++              "properties": {
++                  "name": {"type":"string", "enum":["http_recv_request","http_recv_response"]},
++                  "timeout_ms": {"type":"integer", "minimum":1, "maximum":86400000}
++              },
++              "required": ["name","timeout_ms"]
++          },
++
+           "program_command_gen_t" : {
+                "type": "object",
+                 "properties": {
+@@ -582,7 +591,7 @@
+               
+               "properties": {
+                       "http2": {"type": "object", "additionalProperties": false, "properties": {"request_interval_ms": {"type": "integer", "minimum": 0, "maximum": 3600000}, "final_hold_ms": {"type": "integer", "minimum": 0, "maximum": 3600000},"server": {"type": "boolean"},"requests": {"type": "integer", "minimum": 1, "maximum": 1000000}, "concurrency": {"type": "integer", "minimum": 1, "maximum": 128}, "body_sizes": {"type": "array", "minItems": 1, "maxItems": 128, "items": {"type": "integer", "minimum": 0, "maximum": 1073741824}}, "body_size": {"type": "integer", "minimum": 0, "maximum": 1073741824}, "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 600000}, "max_body_size": {"type": "integer", "minimum": 0, "maximum": 1073741824}, "max_header_size": {"type": "integer", "minimum": 512, "maximum": 65536}, "status": {"type": "integer", "minimum": 200, "maximum": 599}, "expected_status": {"type": "integer", "minimum": 200, "maximum": 599}, "authority": {"type": "string", "minLength": 1, "maxLength": 1024}, "path": {"type": "string", "minLength": 1, "maxLength": 1024}}},
+-                      "http": {"type": "object", "additionalProperties": false, "properties": {"body_contains": {"type": "string", "minLength": 1, "maxLength": 4096}, "transactions": {"type": "boolean"}, "responses": {"type": "integer", "minimum": 1, "maximum": 1000000}, "expected_status": {"type": "integer", "minimum": 200, "maximum": 599}, "max_header_bytes": {"type": "integer", "minimum": 512, "maximum": 65536}, "max_body_bytes": {"type": "integer", "minimum": 0, "maximum": 1073741824}}},
++                      "http": {"type": "object", "additionalProperties": false, "properties": {"server": {"type":"boolean"}, "head_response": {"type":"boolean"}, "requests": {"type":"integer", "minimum":1, "maximum":1000000}, "expected_body_bytes": {"type":"integer", "minimum":0, "maximum":1073741824}, "body_contains": {"type": "string", "minLength": 1, "maxLength": 4096}, "transactions": {"type": "boolean"}, "responses": {"type": "integer", "minimum": 1, "maximum": 1000000}, "expected_status": {"type": "integer", "minimum": 200, "maximum": 599}, "max_header_bytes": {"type": "integer", "minimum": 512, "maximum": 65536}, "max_body_bytes": {"type": "integer", "minimum": 0, "maximum": 1073741824}}},
+                       "tls": {
+                           "type": "object",
+                           "additionalProperties": false,
+@@ -619,6 +628,7 @@
+                                     {"$ref": "#/definitions/program_command_tx_msg_t"},
+                                     {"$ref": "#/definitions/program_command_udp_request_t"},
+                                     {"$ref": "#/definitions/program_command_gen_t"},
++                                    {"$ref": "#/definitions/program_command_http_receive_t"},
+                                     {"$ref": "#/definitions/program_command_delay_t"},
+                                     {"$ref": "#/definitions/program_command_delay_rnd_t"},
+                                     {"$ref": "#/definitions/program_command_set_val_t"},
+diff --git a/scripts/astf/http_messages.py b/scripts/astf/http_messages.py
+new file mode 100644
+--- /dev/null
++++ b/scripts/astf/http_messages.py
+@@ -0,0 +1,75 @@
++# SPDX-License-Identifier: Apache-2.0
++"""HTTP/1.1 message receives, over plaintext TCP or native TLS."""
++import argparse
++from pathlib import Path
++from trex.astf.api import (ASTFProgram, ASTFIPGen, ASTFIPGenDist, ASTFIPGenGlobal,
++                          ASTFTCPClientTemplate, ASTFTCPServerTemplate,
++                          ASTFAssociationRule, ASTFTemplate, ASTFProfile)
++
++
++class Profile:
++    def get_profile(self, tunables, **kwargs):
++        p = argparse.ArgumentParser(description=__doc__)
++        p.add_argument('--requests', type=int, default=10)
++        p.add_argument('--body-size', type=int, default=16384)
++        p.add_argument('--timeout-ms', type=int, default=30000)
++        p.add_argument('--chunked', action='store_true')
++        p.add_argument('--tls', action='store_true')
++        p.add_argument('--authority', default='localhost')
++        for name in ('cert', 'key', 'ca'):
++            p.add_argument('--' + name)
++        a = p.parse_args(tunables)
++        if not 1 <= a.requests <= 1000000 or not 1 <= a.body_size <= 1048576:
++            p.error('requests must be 1..1000000 and body-size 1..1048576')
++        if not 1 <= a.timeout_ms <= 600000:
++            p.error('timeout-ms must be 1..600000')
++        if not a.authority or len(a.authority) > 253 or any(
++                c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-' for c in a.authority):
++            p.error('authority must be a DNS name or IPv4 address')
++        client_tls = server_tls = None
++        if a.tls:
++            for name in ('cert', 'key', 'ca'):
++                value = getattr(a, name)
++                if not value or not Path(value).expanduser().is_file():
++                    p.error('--tls requires existing --cert, --key and --ca files')
++                setattr(a, name, str(Path(value).expanduser().resolve()))
++            client_tls = dict(version='1.3', sni=a.authority, ca=a.ca, verify=True)
++            server_tls = dict(version='1.3', cert=a.cert, key=a.key)
++        elif any(getattr(a, name) for name in ('cert', 'key', 'ca')):
++            p.error('certificate options require --tls')
++
++        client = ASTFProgram(tls=client_tls, http=dict(responses=a.requests,
++            transactions=True, expected_status=200, expected_body_bytes=a.body_size,
++            max_body_bytes=a.body_size, body_contains='x'))
++        server = ASTFProgram(side='s', tls=server_tls, http=dict(requests=a.requests))
++        request = ('GET / HTTP/1.1\r\nHost: %s\r\nAccept: */*\r\n\r\n' % a.authority).encode('ascii')
++        body = b'x' * a.body_size
++        if a.chunked:
++            response = (b'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n' +
++                        ('%x;source=trex\r\n' % a.body_size).encode('ascii') + body +
++                        b'\r\n0\r\nX-Complete: yes\r\n\r\n')
++        else:
++            response = ('HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n' % a.body_size).encode('ascii') + body
++        for program in (client, server):
++            program.set_var('remaining', a.requests)
++            program.set_label('exchange')
++        client.http_request_start()
++        client.send(request)
++        client.recv_http_response(a.timeout_ms)
++        client.jmp_nz('remaining', 'exchange')
++        server.recv_http_request(a.timeout_ms)
++        server.send(response)
++        server.jmp_nz('remaining', 'exchange')
++        server.wait_for_peer_close()
++        ip = ASTFIPGen(glob=ASTFIPGenGlobal(ip_offset='1.0.0.0'),
++            dist_client=ASTFIPGenDist(ip_range=['16.0.0.1', '16.0.255.199'], distribution='seq'),
++            dist_server=ASTFIPGenDist(ip_range=['48.0.0.1', '48.0.255.199'], distribution='seq'))
++        port = 443 if a.tls else 80
++        template = ASTFTemplate(
++            client_template=ASTFTCPClientTemplate(program=client, ip_gen=ip, cps=1, port=port),
++            server_template=ASTFTCPServerTemplate(program=server, assoc=ASTFAssociationRule(port=port)))
++        return ASTFProfile(default_ip_gen=ip, templates=template)
++
++
++def register():
++    return Profile()
+diff --git a/doc/astf-http-messages.md b/doc/astf-http-messages.md
+new file mode 100644
+--- /dev/null
++++ b/doc/astf-http-messages.md
+@@ -0,0 +1,105 @@
++# HTTP/1.1 message receives
++
++Available in the RFC 9411 extension starting with 1.1.0.
++
++```python
++client = ASTFProgram(http=dict(responses=10, transactions=True,
++                               expected_status=200, expected_body_bytes=1024))
++server = ASTFProgram(side='s', http=dict(requests=10))
++
++# Repeat the following commands using normal ASTF loop commands as needed.
++client.http_request_start()
++client.send(request)
++client.recv_http_response(timeout_ms=30000)
++server.recv_http_request(timeout_ms=30000)
++server.send(response)
++```
++
++The same commands work with TLS options on both programs. Request and response
++counts describe the entire program, including loop iterations. The timeout is
++per receive command, in milliseconds (1..86400000), beginning when that command
++executes. It does not replace the TLS handshake timeout.
++
++A receive consumes one completed message. Input is parsed as it arrives, even
++while a blocking send is waiting for acknowledgment. Completed messages and
++partial parser state survive until the program reaches the receive command.
++Payloads are not retained in full. ASTF continuation never occurs inside the
++parser event callback. Byte-count receives and HTTP-message receives cannot be
++mixed in one program.
++
++`expected_body_bytes` checks the decoded framing payload length: chunk-size
++lines and trailers do not contribute. It does not decompress Content-Encoding.
++`max_body_bytes` limits accepted body size. `body_contains` searches body bytes
++across fragments and chunks, as in 1.0.1. Unexpected status or content fails the
++transaction; redirects are not followed. A client may opt into `head_response`
++for a program issuing only HEAD requests; automatic mixed-method association is
++not implemented yet.
++
++Server parsing uses `requests`, not `responses`; it does not contribute client
++response or latency samples. The server must consume the full request body
++before sending the scripted response. HTTP/1.1 headers may change length without
++changing program synchronization.
++
++Current scope excludes CONNECT, protocol Upgrade, Expect/100-continue request
++handling and HTTP pipelining guarantees. The parser rejects CONNECT, Upgrade
++and Expect requests rather than waiting indefinitely for an unsupported exchange.
++Close-delimited responses complete only at EOF; a subsequent request on that
++connection cannot be fulfilled. TLS EOF must come through the existing TLS
++closure validation, not be inferred from an arbitrary TCP reset.
++
++## Diagnostics
++
++`tcps_http_timeouts` counts expired HTTP-message receives, on either endpoint.
++The same event increments `tcps_http_errors`; it is not a request-tracking error.
++`tcps_http_transaction_errors` remains reserved for invalid latency request
++tracking. `tcps_http_bad_status`, `tcps_http_bad_content`, `tcps_http_truncated`
++and `tcps_http_framing` retain separate failure categories. Request-side
++failures appear in server statistics. Failed exchanges do not add successful
++response or TTLB samples. Transport aborts may additionally increment TLS and
++HTTP-aborted counters; these categories must not be summed as distinct flows.
++
++The request parser is a framing validator, not a general-purpose HTTP server:
++it does not route requests by Host/path, decompress content, or synthesize
++HTTP error pages. It discards trailer metadata after syntax validation and
++never merges it into framing headers. Chunk extensions accept whitespace,
++tokens and quoted values according to [RFC 9112 section 7.1.1](https://www.rfc-editor.org/rfc/rfc9112.html#section-7.1.1);
++their semantics are ignored. Ambiguous framing is rejected.
++
++## Memory and CPU scope
++
++Each enabled endpoint owns a bounded header buffer of `max_header_bytes + 1`
++bytes (16,385 bytes by default). Parsing a message performs no buffer growth or
++body allocation. Enabling request parsing therefore adds a server-side header
++buffer; the response-side allocation already existed in 1.0.1. Body matching
++also owns a prefix array proportional to the configured search string.
++
++The header buffer is not zero-initialized: every inspected byte has already
++been written by the incremental scanner. This removes a full-buffer clear at
++flow creation. It does not reduce the configured memory capacity. The parser
++microbenchmark is `tests/tls/http_bench.cpp`, built with a normal C++11 compiler
++and `-O3 -I src`. It measures construction plus one or ten 16-KiB responses
++fragmented into 1460-byte inputs. It is not an estimate of end-to-end CPU usage.
++
++## Standalone example
++
++`scripts/astf/http_messages.py` uses message receives on both endpoints. The
++plain TCP default uses ten 16-KiB responses. Add `--chunked` for chunk framing
++and trailers, or `--tls --cert SERVER_CERT --key SERVER_KEY --ca CLIENT_TRUST`
++for TLS 1.3. With inspection, CLIENT_TRUST must trust the CA used by the DUT to
++sign the certificate presented to the client; `--authority` controls Host/SNI.
++See the release validation report for simulator, live software-port and NIC coverage.
++
++## Concurrent-connection profiles and long deadlines
++
++HTTP-message deadlines accept up to one day (86,400,000 ms). Production arms
++at most ten minutes at a time and checks the absolute deadline before failure;
++the simulator uses shorter slices to remain within its serviced timer level.
++This avoids overflow when converting milliseconds to the timer's microseconds.
++
++The staged standalone HTTPS profiles expose `--http-timeout-ms` (default 30000).
++The server request deadline includes the configured CC pause automatically.
++The client response deadline excludes the intentional pause, because its next
++receive command executes only after the next request. The original final CC
++hold and maximum one-hour pause are preserved. Mixed-object TP continues to
++validate framing, status and body content; its per-program size limit does not
++assert each individual object's expected size.
+diff --git a/scripts/automation/trex_control_plane/interactive/trex/astf/trex_astf_profile.py b/scripts/automation/trex_control_plane/interactive/trex/astf/trex_astf_profile.py
+--- a/scripts/automation/trex_control_plane/interactive/trex/astf/trex_astf_profile.py
++++ b/scripts/automation/trex_control_plane/interactive/trex/astf/trex_astf_profile.py
+@@ -204,6 +204,20 @@
+         super(ASTFCmdHTTPRequest, self).__init__()
+         self.fields['name'] = 'http_request'
+         self.stream = True
++
++    def dump(self):
++        return 'ASTFCmdHTTPRequest()'
++
++class ASTFCmdHTTPReceive(ASTFCmd):
++    def __init__(self, request, timeout_ms):
++        super(ASTFCmdHTTPReceive, self).__init__()
++        self.fields.update(name='http_recv_request' if request else 'http_recv_response',
++                           timeout_ms=timeout_ms)
++        self.stream = True
++
++    def dump(self):
++        return 'ASTFCmdHTTPReceive({0!r}, {1})'.format(
++            self.fields['name'] == 'http_recv_request', self.fields['timeout_ms'])
+ 
+ class ASTFCmdConnect(ASTFCmd):
+     def __init__(self):
+@@ -496,25 +510,33 @@
+                 raise ASTFError("TLS ALPN must be http/1.1 or h2")
+         self.http = None
+         if http is not None:
+-            if (not isinstance(http, dict) or not stream or addon is not None or side != 'c'
++            if (not isinstance(http, dict) or not stream or addon is not None
+                     or (self.tls is not None and self.tls.get('alpn', 'http/1.1') != 'http/1.1')):
+-                raise ASTFError("http response validation requires a TCP HTTP/1.1 client program without an addon")
++                raise ASTFError("http parsing requires a TCP HTTP/1.1 program without an addon")
+             limits = {'responses': (1, 1000000), 'expected_status': (200, 599),
++                      'requests': (1, 1000000), 'expected_body_bytes': (0, 1073741824),
+                       'max_header_bytes': (512, 65536), 'max_body_bytes': (0, 1073741824)}
+-            if set(http) - set(limits) - {'body_contains', 'transactions'}:
++            if set(http) - set(limits) - {'body_contains', 'transactions', 'head_response'}:
+                 raise ASTFError("Unknown HTTP validation option")
+             for name, value in http.items():
+                 if name == 'body_contains':
+                     if not isinstance(value,str) or not 1 <= len(value.encode('utf-8')) <= 4096:
+                         raise ASTFError('body_contains must be a nonempty UTF-8 string, at most 4096 bytes')
+                     continue
+-                if name == 'transactions':
+-                    if not isinstance(value,bool): raise ASTFError('transactions must be boolean')
++                if name in ('transactions', 'head_response'):
++                    if not isinstance(value,bool): raise ASTFError(name + ' must be boolean')
+                     continue
+                 lo, hi = limits[name]
+                 if isinstance(value, bool) or not isinstance(value, int) or not lo <= value <= hi:
+                     raise ASTFError("Invalid HTTP validation option: " + name)
++            if side == 's' and any(k in http for k in ('responses','transactions','expected_status','head_response')):
++                raise ASTFError('Server HTTP options use requests, not response validation options')
++            if side == 'c' and 'requests' in http:
++                raise ASTFError('Client HTTP options use responses')
++            if http.get('expected_body_bytes',0) > http.get('max_body_bytes',1073741824):
++                raise ASTFError('expected_body_bytes exceeds max_body_bytes')
+             self.http = dict(http)
++            if side == 's': self.http['server'] = True
+         if file is not None:
+             cap = pcap_reader(_ASTFCapPath.get_pcap_file_path(file))
+             cap.analyze()
+@@ -831,6 +853,21 @@
+         if self.http is None or not self.http.get('transactions',False):
+             raise ASTFError('http_request_start requires http transactions=True')
+         self.fields['commands'].append(ASTFCmdHTTPRequest())
++
++    def _recv_http(self, request, timeout_ms):
++        if self.http is None or bool(self.http.get('server',False)) != request:
++            raise ASTFError('HTTP receive command requires matching HTTP client/server options')
++        if isinstance(timeout_ms,bool) or not isinstance(timeout_ms,int) or not 1 <= timeout_ms <= 86400000:
++            raise ASTFError('HTTP receive timeout_ms must be 1..86400000')
++        self.fields['commands'].append(ASTFCmdHTTPReceive(request,timeout_ms))
++
++    def recv_http_request(self, timeout_ms=30000):
++        """Wait for one complete HTTP/1.1 request on the server."""
++        self._recv_http(True,timeout_ms)
++
++    def recv_http_response(self, timeout_ms=30000):
++        """Wait for one validated HTTP/1.1 response on the client."""
++        self._recv_http(False,timeout_ms)
+ 
+     def connect(self):
+         """
+@@ -1293,6 +1330,9 @@
+ 
+     def to_json(self):
+         self.__compile()
++        names = {cmd.fields['name'] for cmd in self.fields['commands']}
++        if 'rx' in names and names & {'http_recv_request', 'http_recv_response'}:
++            raise ASTFError('Byte and HTTP message receives cannot be mixed in one program')
+         if self.http2 is not None and (len(self.fields['commands'])!=1 or self.fields['commands'][0].fields['name']!='http2'):
+             raise ASTFError('HTTP/2 program owns its session; additional ASTF commands are not supported')
+         ret = {}
+@@ -1317,15 +1357,18 @@
+         for cmd in self.fields['commands']:
+             out.write("cmd_list.append({0})\n".format(cmd.dump()))
+ 
++        http_options = dict(self.http) if self.http is not None else None
++        http_server = http_options.pop('server', False) if http_options is not None else False
+         if self.tls is not None:
+             options = dict(self.tls)
+             side = 's' if options.pop('server') else 'c'
+-            out.write("{0} = {1}(side={2!r}, tls={3!r}, http={4!r})\n".format(var_name, self.__class__.__name__, side, options, self.http))
++            out.write("{0} = {1}(side={2!r}, tls={3!r}, http={4!r}, commands=cmd_list)\n".format(var_name, self.__class__.__name__, side, options, http_options))
++        elif http_server:
++            out.write("{0} = {1}(side='s', http={2!r}, commands=cmd_list)\n".format(var_name, self.__class__.__name__, http_options))
+         elif self.http is not None:
+-            out.write("{0} = {1}(http={2!r})\n".format(var_name, self.__class__.__name__, self.http))
++            out.write("{0} = {1}(http={2!r}, commands=cmd_list)\n".format(var_name, self.__class__.__name__, self.http))
+         else:
+-            out.write("{0} = {1}()\n".format(var_name, self.__class__.__name__))
+-        out.write("{0}.set_cmds(cmd_list)\n".format(var_name))
++            out.write("{0} = {1}(commands=cmd_list)\n".format(var_name, self.__class__.__name__))
+ 
+     @property
+     def payload_len(self):
+diff --git a/tests/tls/http_message_live.py b/tests/tls/http_message_live.py
+new file mode 100644
+--- /dev/null
++++ b/tests/tls/http_message_live.py
+@@ -0,0 +1,106 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Live HTTP message receive lifecycle checks on a dedicated veth TRex instance."""
++import argparse
++import time
++import uuid
++from trex.astf.api import (ASTFClient, ASTFProgram, ASTFProfile, ASTFTemplate,
++    ASTFTCPClientTemplate, ASTFTCPServerTemplate, ASTFAssociationRule,
++    ASTFIPGen, ASTFIPGenGlobal, ASTFIPGenDist)
++from interactive_lifecycle import remove_profile
++
++
++def profile(args, version, stage, port):
++    c_tls = dict(version=version, ca=args.cert, sni='localhost', verify=True) if version else None
++    s_tls = dict(version=version, cert=args.cert, key=args.key) if version else None
++    count = 3 if stage in ('fixed', 'chunked') else 1
++    c = ASTFProgram(tls=c_tls, http=dict(responses=count, transactions=True,
++        expected_status=200, expected_body_bytes=2, body_contains='OK'))
++    s = ASTFProgram(side='s', tls=s_tls, http=dict(requests=count))
++    request = b'GET / HTTP/1.1\r\nHost: localhost\r\nX-Inspection: rewritten\r\n\r\n'
++    response = b'HTTP/1.1 200 OK\r\nX-Inspection: added\r\nContent-Length: 2\r\n\r\nOK'
++    if stage == 'chunked':
++        response = b'HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1; x="y"\r\nO\r\n1\r\nK\r\n0\r\nX-End: yes\r\n\r\n'
++    if stage == 'blocked':
++        response = b'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nNO'
++    if stage in ('request_wait', 'survivor'):
++        c.delay(1000000000 if stage == 'survivor' else 30000000)
++    for _ in range(count):
++        c.http_request_start(); c.send(request)
++        c.recv_http_response(100 if stage == 'timeout' else 60000)
++        s.recv_http_request(1200000)
++        if stage in ('response_wait', 'timeout'):
++            s.delay(30000000 if stage == 'response_wait' else 2000000)
++        s.send(response)
++    s.wait_for_peer_close()
++    ip = ASTFIPGen(glob=ASTFIPGenGlobal(ip_offset='1.0.0.0'),
++        dist_client=ASTFIPGenDist(ip_range=['16.0.0.1','16.0.0.254'],distribution='seq'),
++        dist_server=ASTFIPGenDist(ip_range=['48.0.0.1','48.0.0.254'],distribution='seq'))
++    return ASTFProfile(default_ip_gen=ip,templates=ASTFTemplate(
++        client_template=ASTFTCPClientTemplate(program=c,ip_gen=ip,port=port,cps=1),
++        server_template=ASTFTCPServerTemplate(program=s,assoc=ASTFAssociationRule(port=port))))
++
++
++def wait_active(client, pid, tls):
++    until=time.monotonic()+15
++    while time.monotonic()<until:
++        stats=client.get_traffic_stats(skip_zero=False,pid_input=pid)
++        if all(stats[side]['m_est_flows']>0 and
++               (not tls or stats[side]['tcps_tls_handshakes']>0) for side in ('client','server')):
++            return
++        time.sleep(.05)
++    raise AssertionError('No established test flow: '+pid)
++
++
++def main():
++    p=argparse.ArgumentParser(description=__doc__)
++    p.add_argument('--cert',required=True);p.add_argument('--key',required=True)
++    p.add_argument('--server',default='localhost');p.add_argument('--iterations',type=int,default=2)
++    args=p.parse_args()
++    if not 1<=args.iterations<=100:p.error('iterations must be 1..100')
++    client=ASTFClient(server=args.server,sync_timeout=15,async_timeout=15)
++    pid='http_message_'+uuid.uuid4().hex[:8];keep=pid+'_keep';owned=set()
++    client.connect()
++    try:
++        client.acquire()
++        client.load_profile(profile(args,'','survivor',444),pid_input=keep);owned.add(keep)
++        client.start(mult=1,pid_input=keep);wait_active(client,keep,False)
++        for version in ('','1.2','1.3'):
++            for iteration in range(args.iterations):
++                for stage in ('request_wait','response_wait'):
++                    client.load_profile(profile(args,version,stage,443),pid_input=pid);owned.add(pid)
++                    client.start(mult=1,pid_input=pid);wait_active(client,pid,bool(version))
++                    client.stop(pid_input=pid)
++                    stats=client.get_traffic_stats(skip_zero=False,pid_input=pid)
++                    assert all(stats[s]['m_active_flows']==0 for s in ('client','server')),stats
++                    remove_profile(client,pid);owned.remove(pid)
++                    survivor=client.get_traffic_stats(skip_zero=False,pid_input=keep)
++                    assert survivor['client']['m_active_flows']>0,survivor
++                    print(version or 'TCP',iteration,stage,'stop/remove; survivor active: PASS',flush=True)
++            for stage in ('fixed','chunked','blocked','timeout'):
++                client.load_profile(profile(args,version,stage,443),pid_input=pid);owned.add(pid)
++                client.start(mult=3,duration=1,pid_input=pid)
++                client.wait_on_traffic(timeout=30,profile_id=pid)
++                stats=client.get_traffic_stats(skip_zero=False,pid_input=pid);c=stats['client'];s=stats['server']
++                assert c['m_active_flows']==s['m_active_flows']==0,stats
++                if stage in ('fixed','chunked'):
++                    assert c['tcps_connects']>0,c
++                    assert c['tcps_http_responses']==c['tcps_connects']*3,c
++                    assert c['tcps_http_req_ttlb_count']==c['tcps_http_responses'],c
++                    assert c['tcps_http_errors']==s['tcps_http_errors']==0,stats
++                    assert c['tcps_http_timeouts']==s['tcps_http_timeouts']==0,stats
++                    assert c['tcps_http_aborted']==s['tcps_http_aborted']==0,stats
++                else:
++                    key='tcps_http_bad_content' if stage=='blocked' else 'tcps_http_timeouts'
++                    assert c[key]>0,c
++                    assert c['tcps_http_responses']==c['tcps_http_req_ttlb_count']==0,c
++                print(version or 'TCP',stage,'RPC counters and completion: PASS',flush=True)
++                remove_profile(client,pid);owned.remove(pid)
++    finally:
++        try:
++            for current in list(owned):
++                if current in client.get_profiles():
++                    client.stop(pid_input=current);remove_profile(client,current)
++        finally:client.disconnect()
++
++
++if __name__=='__main__':main()
+diff --git a/tests/tls/run_interactive_veth.sh b/tests/tls/run_interactive_veth.sh
+--- a/tests/tls/run_interactive_veth.sh
++++ b/tests/tls/run_interactive_veth.sh
+@@ -53,6 +53,6 @@
+ else:
+     raise SystemExit('TRex RPC startup timeout')
+ PY
+-python3 ../tests/tls/interactive_lifecycle.py --cert "$logs/cert.pem" --key "$logs/key.pem" "$@" > "$logs/client.log" 2>&1 || { cat "$logs/client.log"; exit 1; }
++python3 "${TREX_TLS_LIVE_CLIENT:-../tests/tls/interactive_lifecycle.py}" --cert "$logs/cert.pem" --key "$logs/key.pem" "$@" > "$logs/client.log" 2>&1 || { cat "$logs/client.log"; exit 1; }
+ cat "$logs/client.log"
+ echo "Live validation logs: $logs"
+diff --git a/tests/tls/api_test.py b/tests/tls/api_test.py
+--- a/tests/tls/api_test.py
++++ b/tests/tls/api_test.py
+@@ -65,11 +65,50 @@
+         opts['responses']=20
+         self.assertEqual(p.to_json()['http']['responses'],10)
+         self.assertNotEqual(p.calc_hash(),ASTFProgram(tls={}).calc_hash())
+-        for kwargs in ({'http':{},'stream':False},{'http':{},'side':'s'}, {'http':{},'addon':'x'}, {'tls':{},'side':'s','http':{}},
++        for kwargs in ({'http':{},'stream':False}, {'http':{},'addon':'x'},
+                        {'tls':{'alpn':'h2'},'http':{}},{'tls':{},'http':{'responses':True}},
+                        {'tls':{},'http':{'responses':0}},{'tls':{},'http':{'expected_status':100}},
+                        {'tls':{},'http':{'extra':1}}):
+             with self.assertRaises(ASTFError): ASTFProgram(**kwargs)
++
++    def test_http_message_commands(self):
++        c=ASTFProgram(http={'responses':2, 'transactions':True})
++        c.recv_http_response(123)
++        self.assertEqual(c.to_json()['commands'][0], {'name':'http_recv_response','timeout_ms':123})
++        s=ASTFProgram(side='s',http={'requests':2})
++        s.recv_http_request()
++        self.assertTrue(s.to_json()['http']['server'])
++        self.assertEqual(s.to_json()['commands'][0]['name'],'http_recv_request')
++        with self.assertRaises(ASTFError): c.recv_http_request()
++        with self.assertRaises(ASTFError): s.recv_http_response()
++        for timeout in (0,86400001,True,1.5):
++            with self.assertRaises(ASTFError): c.recv_http_response(timeout)
++        s.recv_http_request(86400000)
++        self.assertEqual(s.to_json()['commands'][-1]['timeout_ms'],86400000)
++        with self.assertRaises(ASTFError): ASTFProgram(side='s',http={'responses':2})
++        with self.assertRaises(ASTFError): ASTFProgram(http={'requests':2})
++
++    def test_http_message_dump(self):
++        import io
++        import trex.astf.trex_astf_profile as module
++        for encrypted in (False,True):
++            for side in ('c','s'):
++                options={'requests':1} if side=='s' else {'responses':1,'transactions':True}
++                p=ASTFProgram(side=side,http=options,tls={} if encrypted else None)
++                if side=='s': p.recv_http_request(150)
++                else:
++                    p.http_request_start()
++                    p.recv_http_response(150)
++                out=io.StringIO();p.dump(out,'restored')
++                scope=dict(vars(module))
++                exec(out.getvalue(),scope)
++                self.assertEqual(p.to_json(),scope['restored'].to_json())
++        for reverse in (False,True):
++            p=ASTFProgram(http={})
++            if reverse: p.recv(10)
++            p.recv_http_response()
++            if not reverse: p.recv(10)
++            with self.assertRaises(ASTFError): p.to_json()
+ 
+     def test_plain_http(self):
+         import io
+diff --git a/tests/tls/http_message_test.cpp b/tests/tls/http_message_test.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/tls/http_message_test.cpp
+@@ -0,0 +1,77 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++#include "44bsd/http/astf_http.h"
++#include <cassert>
++#include <iostream>
++#include <string>
++using namespace astf_http;
++static bool feed(Response &parser,const std::string &s) {
++    return parser.feed(reinterpret_cast<const uint8_t *>(s.data()),s.size());
++}
++static void fragments(const std::string &s,Config cfg,bool valid) {
++    for(size_t split=0;split<=s.size();++split) {
++        Response parser(cfg);
++        bool ok=feed(parser,s.substr(0,split));
++        if(ok) ok=feed(parser,s.substr(split));
++        if(ok) ok=parser.eof();
++        assert(ok==valid);
++    }
++}
++int main() {
++    Config request; request.request=true;
++    const std::string get="GET /index.html HTTP/1.1\r\nHost: localhost\r\nX-Inspection: added\r\n\r\n";
++    const std::string post="POST /upload HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello";
++    const std::string chunks="POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhe\r\n3\r\nllo\r\n0\r\nX-End: yes\r\n\r\n";
++    fragments(get,request,true); fragments(post,request,true); fragments(chunks,request,true);
++    request.expected_body_bytes=5;
++    fragments(post,request,true); fragments(chunks,request,true); fragments(get,request,false);
++    request.expected_body_bytes=-1;
++    for(const auto &s : {"GET  HTTP/1.1\r\n\r\n", "GET / HTTP/2.0\r\n\r\n",
++        "CONNECT host:443 HTTP/1.1\r\n\r\n", "GET / HTTP/1.1\r\nUpgrade: websocket\r\n\r\n",
++        "POST / HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\nhello",
++        "POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n",
++        "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhell"}) fragments(s,request,false);
++    request.responses=2;
++    // A single input buffer contains two requests: do not consume the next one.
++    Response parser(request); size_t used=999;
++    const auto both=get+post;
++    assert(parser.feed((const uint8_t*)both.data(),both.size(),used,true));
++    assert(used==get.size() && parser.completed()==1);
++    size_t rest=0;
++    assert(parser.feed((const uint8_t*)both.data()+used,both.size()-used,rest,true));
++    assert(rest==post.size() && parser.done() && parser.eof());
++    // Completion at a fragment boundary must not consume a suffix.
++    for(size_t split=0;split<get.size();++split) {
++        Response p(request); assert(feed(p,get.substr(0,split)));
++        size_t n=0; assert(p.feed((const uint8_t*)both.data()+split,both.size()-split,n,true));
++        assert(n==get.size()-split && p.completed()==1);
++    }
++    Config response; response.head_response=true;
++    fragments("HTTP/1.1 200 OK\r\nContent-Length: 123\r\n\r\n",response,true);
++    response.max_body_bytes=0; response.expected_body_bytes=0;
++    fragments("HTTP/1.1 200 OK\r\nContent-Length: 123\r\n\r\n",response,true);
++    response.head_response=false; response.expected_status=304;
++    fragments("HTTP/1.1 304 Not Modified\r\nContent-Length: 123\r\n\r\n",response,true);
++    fragments("HTTP/1.1 304 Not Modified\r\nTransfer-Encoding: chunked\r\n\r\n",response,true);
++    response.expected_status=204;
++    fragments("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n",response,false);
++    response.expected_status=200; response.max_body_bytes=1073741824;
++    response.head_response=false; response.expected_body_bytes=5;
++    fragments("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",response,true);
++    fragments("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",response,true);
++    fragments("HTTP/1.0 200 OK\r\n\r\nhello",response,true);
++    fragments("HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nhell",response,false);
++    response.expected_body_bytes=-1; response.max_body_bytes=5;
++    fragments("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nhel\r\n3\r\nlo!\r\n0\r\n\r\n",response,false);
++    // Chunk extensions may contain BWS and quoted delimiters, but not malformed syntax.
++    response.max_body_bytes=100;
++    const std::string head="HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
++    for (const auto &extension : {";a", ";a=b", " ; a = \"b;\\\"c\" ; flag", ";a=\"\""})
++        fragments(head+"5"+extension+"\r\nhello\r\n0;done\r\n\r\n",response,true);
++    for (const auto &extension : {";", ";=x", ";a=", ";a=\"unterminated", ";a=\"x\"junk", " xyz", ";a=()"})
++        fragments(head+"5"+extension+"\r\nhello\r\n0\r\n\r\n",response,false);
++    // Close-delimited input consumes the complete buffer, but completes at EOF.
++    Response close(response); const std::string wire="HTTP/1.0 200 OK\r\n\r\nhello";
++    assert(close.feed((const uint8_t*)wire.data(),wire.size(),used,true));
++    assert(used==wire.size() && !close.done() && close.eof());
++    std::cout << "HTTP message boundaries, requests, HEAD, exact body size and split points: PASS\n";
++}
+diff --git a/tests/tls/http_bench.cpp b/tests/tls/http_bench.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/tls/http_bench.cpp
+@@ -0,0 +1,29 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++// Parser-only microbenchmark; this does not measure TLS, TCP or NIC throughput.
++#include "44bsd/http/astf_http.h"
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <string>
++#include <algorithm>
++int main(int argc,char **argv) {
++    unsigned flows=argc>1?std::strtoul(argv[1],nullptr,10):100000;
++    const std::string response="HTTP/1.1 200 OK\r\nContent-Length: 16384\r\nContent-Type: text/html\r\n\r\n"+std::string(16384,'x');
++    for(unsigned count:{1u,10u}) {
++        astf_http::Config c;c.responses=count;c.body_contains="x";
++        auto begin=std::chrono::steady_clock::now();
++        size_t completed=0;
++        for(unsigned i=0;i<flows;++i) {
++            astf_http::Response parser(c);
++            for(unsigned j=0;j<count;++j) {
++                for(size_t off=0;off<response.size();off+=1460) {
++                    if(!parser.feed((const uint8_t*)response.data()+off,std::min<size_t>(1460,response.size()-off)))return 1;
++                }
++            }
++            if(!parser.eof())return 2;
++            completed+=parser.completed();
++        }
++        auto ns=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-begin).count();
++        std::printf("responses_per_flow=%u flows=%u completed=%zu ns_per_flow=%.1f parser_object_bytes=%zu\n",count,flows,completed,double(ns)/flows,sizeof(astf_http::Response));
++    }
++}

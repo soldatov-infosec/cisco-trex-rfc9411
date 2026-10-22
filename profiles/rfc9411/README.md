@@ -92,7 +92,7 @@ prior knowledge on port 80, not HTTP/1.1 Upgrade. TLS defaults to port 443.
 | `--timeout_ms` | HTTP/2: 30000 for CPS/TP; CC defaults to total holds + 30000 (330000 at defaults); absolute deadline, maximum 600000 |
 | `--cert`, `--key`, `--ca` | Required for TLS; readable local files, resolved to absolute paths |
 | `--version` | TLS only: `1.3` or `1.2` |
-| `--cipher-suite` | Optional version-compatible cipher policy |
+| `--cipher-suite` | Override the version-specific AES-128-GCM default |
 | `--groups`, `--signature-algorithms` | Optional lists accepted by the extension's TLS API |
 
 IP ranges: clients `16.0.0.1..16.0.255.199`, servers
@@ -172,3 +172,28 @@ For HTTPS, select `https_max_tp_mix.py` or `https2_max_tp_mix.py` and supply
 `--cert`, `--key` and `--ca` as in the fixed-size examples. Client addresses remain
 `16.0.0.1..16.0.255.199`. The total response body per complete connection is
 537804 bytes; nominal body throughput at multiplier N is `N × 537804 × 8` bits/s.
+
+## HTTP/1.1 inspection-aware receives
+
+The HTTPS profiles use complete HTTP messages on both endpoints. `--http-timeout-ms` defaults to 30000 and accepts 1..86400000. CC server deadlines include the intentional pause automatically. Fixed-object profiles validate exact body length; mixed-object TP validates framing, status and content without a separate exact length for each object. See [the API guide](../../docs/http-message-api.md) for trust configuration, memory costs and unsupported exchanges.
+
+## Explicit TLS and TCP defaults (1.1.0)
+
+All 22 HTTPS/HTTPS2 workloads default to `TLS_AES_128_GCM_SHA256` for TLS 1.3.
+TLS 1.2 defaults to `ECDHE-ECDSA-AES128-GCM-SHA256` and group `P-256`; use an
+ECDSA P-256 certificate. For an RSA certificate select
+`--cipher-suite ECDHE-RSA-AES128-GCM-SHA256` explicitly. `--cipher-suite`,
+`--groups` and `--signature-algorithms` remain user overrides on both endpoints.
+TLS 1.3 retains the engine's classical group/signature defaults; AES-128 does
+not select the certificate's signature algorithm. Resumption remains disabled.
+
+All 33 workloads explicitly configure IPv4 MSS 1460, initial congestion window
+10 segments, and TCP RX/TX buffers 65535 bytes on both endpoints. These match
+existing engine MSS/initial-window defaults; no delayed-ACK policy is changed.
+The buffers are TRex socket limits, not a guarantee that every packet advertises
+an unchanged 65535-byte window. These scripts use IPv4; do not carry MSS 1460
+over to a future IPv6 profile without reviewing it.
+
+See the [configuration review](../../docs/profile-defaults-rfc9411.md). The NIC
+measurement helper historically used MSS 1440 and 1-MiB buffers; its historical
+performance results are not an identical configuration to these workloads.

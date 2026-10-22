@@ -19,6 +19,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--cc-defaults', action='store_true', help='Use ten requests and 30-second holds instead of shortened CC')
     parser.add_argument('--named-groups', action='store_true', help='Exercise simulator template-group statistics')
+    parser.add_argument('--release', action='store_true', help='Use the release simulator instead of the debug simulator')
     parser.add_argument('--trex', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True, help='New directory for text logs; no keys retained')
     args = parser.parse_args()
@@ -41,6 +42,8 @@ def main():
                     source.write_text(profile.read_text().replace('template = ASTFTemplate(',
                         "template = ASTFTemplate(tg_name='smoke',"))
                 cmd = ['./astf-sim', '-v', '-f', str(source), '-o', str(tmp / name)]
+                if args.release:
+                    cmd += ['--release']
                 opts = []
                 if version != 'clear':
                     opts += ['--version', version, '--cert', str(cert), '--key', str(key), '--ca', str(cert)]

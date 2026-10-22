@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.0
+
+- Add opt-in HTTP/1.1 request and response message receives over TCP and TLS.
+- Parse fixed-length, chunked and close-delimited framing without relying on header byte counts.
+- Validate request framing, expected response status and optional exact body length.
+- Add bounded receive deadlines, timeout diagnostics and lifecycle regression tests.
+- Migrate standalone HTTPS workloads to message receives, preserving CC pauses.
+
+See [release notes](docs/release-1.1.0.md) for compatibility and validation limits.
+
 ## 1.0.1
 
 - Process TCP input and submit transport ACKs before deferred TLS work in each RX burst.

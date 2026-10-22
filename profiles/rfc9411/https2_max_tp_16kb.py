@@ -42,7 +42,7 @@ class Profile:
             p.add_argument('--key', required=True)
             p.add_argument('--ca', required=True)
             p.add_argument('--version', choices=['1.2', '1.3'], default='1.3')
-            p.add_argument('--cipher-suite')
+            p.add_argument('--cipher-suite', help='Default: TLS_AES_128_GCM_SHA256 (1.3), ECDHE-ECDSA-AES128-GCM-SHA256 (1.2)')
             p.add_argument('--groups', nargs='+')
             p.add_argument('--signature-algorithms', nargs='+')
         a = p.parse_args(tunables)
@@ -81,7 +81,11 @@ class Profile:
                 if not value.is_file():
                     p.error('%s file does not exist: %s' % (name, value))
                 setattr(a, name, str(value))
-            policy = dict(version=a.version, resumption=False)
+            policy = dict(version=a.version, resumption=False,
+                          cipher_suite='TLS_AES_128_GCM_SHA256' if a.version == '1.3'
+                          else 'ECDHE-ECDSA-AES128-GCM-SHA256')
+            if a.version == '1.2':
+                policy['groups'] = ['P-256']
             for option in ('cipher_suite', 'groups', 'signature_algorithms'):
                 value = getattr(a, option)
                 if value is not None:
@@ -129,6 +133,9 @@ class Profile:
             dist_server=ASTFIPGenDist(ip_range=['48.0.0.1', '48.1.255.199'], distribution=distribution))
         cg, sg = ASTFGlobalInfo(), ASTFGlobalInfo()
         for glob in (cg, sg):
+            # IPv4 defaults from RFC 9411 sections 4.3.1.1 and 4.3.2.1.
+            glob.tcp.mss = 1460
+            glob.tcp.initwnd = 10
             glob.tcp.rxbufsize = 65535
             glob.tcp.txbufsize = 65535
             if cc:

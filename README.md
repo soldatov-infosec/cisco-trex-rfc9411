@@ -48,7 +48,7 @@ flowchart LR
 
 ## Release and compatibility
 
-- **Extension:** `1.0.1` — transport-first TLS receive processing.
+- **Extension:** `1.1.0` — message-aware HTTP/1.1 receives for TCP and TLS.
 - **Upstream:** TRex **v3.06**, commit `46be64bedbe9d505dfb55099c38119d6e86267ca`.
 - **TLS backend:** AWS-LC **5.11.0**, shared libraries; OpenSSL is not an alternative backend.
 - **HTTP/2:** a maintained nghttp2 development package exposing continuation limits.
@@ -58,8 +58,8 @@ flowchart LR
 The series applies directly to a **clean v3.06 checkout**. Apply the complete series once to the unmodified source tree. Arbitrary TRex master/main
 revisions and newer tags are not yet supported.
 
-For changes, validation limits and the upgrade from 1.0.0, see
-[release notes](docs/release-1.0.1.md).
+For changes, validation limits and the upgrade from 1.0.1, see
+[release notes](docs/release-1.1.0.md).
 
 ## Start here
 
@@ -79,14 +79,14 @@ traffic](docs/getting-started.md).
 
 ## Validation, without headline benchmarks
 
-Validation covers TCP/ASTF/scheduler simulator tests, TLS and HTTP/2 protocol
-tests, sanitizer/interoperability checks, standalone profiles and patch integrity.
-The protocol implementation has 103 passing simulator regression tests and 45
-passing profile scenarios, including CC holds and named template groups.
+Version 1.1.0 passed 115 simulator tests in each of two RX modes, 55 standalone
+profile runs, 11 API tests and 24 live RPC scenarios on isolated DPDK software
+ports. Standalone HTTP parser tests passed ASan/UBSan. Both patch application
+methods reproduce all 154 expected source hashes.
 
-A complete build and physical-NIC qualification of the final release artifact
-remain pending. These checks are not a capacity result or RFC certification.
-[Validation details](validation/README.md) document the exact evidence and limits.
+Physical-NIC qualification of 1.1.0 remains pending. These checks are not a
+capacity result or RFC certification. See the [1.1.0 validation report](validation/http-message-1.1.0.md)
+for build scope, local benchmark limitations and memory costs.
 
 ## Find your way around
 

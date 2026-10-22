@@ -50,6 +50,8 @@ class Profiles(unittest.TestCase):
                 if path.name.startswith('https'):
                     self.assertFalse(client['tls']['resumption'])
                     self.assertTrue(client['tls']['verify'])
+                    for program in programs:
+                        self.assertEqual(program['tls']['cipher_suite'], 'TLS_AES_128_GCM_SHA256')
                 else:
                     self.assertNotIn('tls', client)
                 if 'http2' in client:
@@ -74,6 +76,26 @@ class Profiles(unittest.TestCase):
                     self.assertTrue(client['http']['transactions'])
                 temp = doc['templates'][0]
                 self.assertEqual(temp['client_template']['cps'], 1)
+                for side in ('c_glob_info', 's_glob_info'):
+                    tcp = doc[side]['tcp']
+                    self.assertEqual(tcp['mss'], 1460)
+                    self.assertEqual(tcp['initwnd'], 10)
+                    self.assertEqual(tcp['rxbufsize'], 65535)
+                    self.assertEqual(tcp['txbufsize'], 65535)
+
+    def test_cipher_defaults_and_overrides_all_tls_profiles(self):
+        for path in (ROOT / 'profiles/rfc9411').glob('https*_max_*.py'):
+            for args, cipher, groups in (
+                (['--version', '1.2'], 'ECDHE-ECDSA-AES128-GCM-SHA256', ['P-256']),
+                (['--cipher-suite', 'TLS_AES_256_GCM_SHA384', '--groups', 'X25519'],
+                 'TLS_AES_256_GCM_SHA384', ['X25519']),
+                (['--version', '1.2', '--cipher-suite', 'ECDHE-RSA-AES128-GCM-SHA256'],
+                 'ECDHE-RSA-AES128-GCM-SHA256', ['P-256']),
+            ):
+                with self.subTest(profile=path.name, args=args):
+                    for program in self.load(path.name, args)['program_list']:
+                        self.assertEqual(program['tls']['cipher_suite'], cipher)
+                        self.assertEqual(program['tls']['groups'], groups)
 
     def test_cc_hold_and_no_delayed_ack_override(self):
         doc = self.load('https_max_cc_1kb.py')

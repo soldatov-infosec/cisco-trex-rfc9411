@@ -18,7 +18,21 @@ diff --git a/scripts/astf_schema.json b/scripts/astf_schema.json
            "program_command_tx_msg_t" : {
                 "type": "object",
                  "properties": {
-@@ -293,7 +303,7 @@
+@@ -288,12 +298,21 @@
+            },
+ 
+            
++          "program_command_http_receive_t": {
++              "type": "object", "additionalProperties": false,
++              "properties": {
++                  "name": {"type":"string", "enum":["http_recv_request","http_recv_response"]},
++                  "timeout_ms": {"type":"integer", "minimum":1, "maximum":86400000}
++              },
++              "required": ["name","timeout_ms"]
++          },
++
+           "program_command_gen_t" : {
+                "type": "object",
                  "properties": {
                        "name": {
                            "type" : "string",
@@ -27,12 +41,12 @@ diff --git a/scripts/astf_schema.json b/scripts/astf_schema.json
                        }
                  },
                  "required": ["name"]
-@@ -571,6 +581,33 @@
+@@ -571,6 +590,33 @@
                "type": "object",
                
                "properties": {
 +                      "http2": {"type": "object", "additionalProperties": false, "properties": {"request_interval_ms": {"type": "integer", "minimum": 0, "maximum": 3600000}, "final_hold_ms": {"type": "integer", "minimum": 0, "maximum": 3600000},"server": {"type": "boolean"},"requests": {"type": "integer", "minimum": 1, "maximum": 1000000}, "concurrency": {"type": "integer", "minimum": 1, "maximum": 128}, "body_sizes": {"type": "array", "minItems": 1, "maxItems": 128, "items": {"type": "integer", "minimum": 0, "maximum": 1073741824}}, "body_size": {"type": "integer", "minimum": 0, "maximum": 1073741824}, "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 600000}, "max_body_size": {"type": "integer", "minimum": 0, "maximum": 1073741824}, "max_header_size": {"type": "integer", "minimum": 512, "maximum": 65536}, "status": {"type": "integer", "minimum": 200, "maximum": 599}, "expected_status": {"type": "integer", "minimum": 200, "maximum": 599}, "authority": {"type": "string", "minLength": 1, "maxLength": 1024}, "path": {"type": "string", "minLength": 1, "maxLength": 1024}}},
-+                      "http": {"type": "object", "additionalProperties": false, "properties": {"body_contains": {"type": "string", "minLength": 1, "maxLength": 4096}, "transactions": {"type": "boolean"}, "responses": {"type": "integer", "minimum": 1, "maximum": 1000000}, "expected_status": {"type": "integer", "minimum": 200, "maximum": 599}, "max_header_bytes": {"type": "integer", "minimum": 512, "maximum": 65536}, "max_body_bytes": {"type": "integer", "minimum": 0, "maximum": 1073741824}}},
++                      "http": {"type": "object", "additionalProperties": false, "properties": {"server": {"type":"boolean"}, "head_response": {"type":"boolean"}, "requests": {"type":"integer", "minimum":1, "maximum":1000000}, "expected_body_bytes": {"type":"integer", "minimum":0, "maximum":1073741824}, "body_contains": {"type": "string", "minLength": 1, "maxLength": 4096}, "transactions": {"type": "boolean"}, "responses": {"type": "integer", "minimum": 1, "maximum": 1000000}, "expected_status": {"type": "integer", "minimum": 200, "maximum": 599}, "max_header_bytes": {"type": "integer", "minimum": 512, "maximum": 65536}, "max_body_bytes": {"type": "integer", "minimum": 0, "maximum": 1073741824}}},
 +                      "tls": {
 +                          "type": "object",
 +                          "additionalProperties": false,
@@ -61,18 +75,20 @@ diff --git a/scripts/astf_schema.json b/scripts/astf_schema.json
                        "commands": {
                              "type": "array",
                              "items": {
-@@ -580,6 +617,7 @@
+@@ -580,7 +626,9 @@
                                      {"$ref": "#/definitions/program_command_keepalive_t"},
                                      {"$ref": "#/definitions/program_command_rx_msg_t"},
                                      {"$ref": "#/definitions/program_command_tx_msg_t"},
 +                                    {"$ref": "#/definitions/program_command_udp_request_t"},
                                      {"$ref": "#/definitions/program_command_gen_t"},
++                                    {"$ref": "#/definitions/program_command_http_receive_t"},
                                      {"$ref": "#/definitions/program_command_delay_t"},
                                      {"$ref": "#/definitions/program_command_delay_rnd_t"},
+                                     {"$ref": "#/definitions/program_command_set_val_t"},
 diff --git a/scripts/automation/trex_control_plane/interactive/trex/astf/trex_astf_profile.py b/scripts/automation/trex_control_plane/interactive/trex/astf/trex_astf_profile.py
 --- a/scripts/automation/trex_control_plane/interactive/trex/astf/trex_astf_profile.py
 +++ b/scripts/automation/trex_control_plane/interactive/trex/astf/trex_astf_profile.py
-@@ -199,6 +199,12 @@
+@@ -199,6 +199,26 @@
          self.fields['name'] = 'nc'
          self.stream=True
  
@@ -82,10 +98,24 @@ diff --git a/scripts/automation/trex_control_plane/interactive/trex/astf/trex_as
 +        self.fields['name'] = 'http_request'
 +        self.stream = True
 +
++    def dump(self):
++        return 'ASTFCmdHTTPRequest()'
++
++class ASTFCmdHTTPReceive(ASTFCmd):
++    def __init__(self, request, timeout_ms):
++        super(ASTFCmdHTTPReceive, self).__init__()
++        self.fields.update(name='http_recv_request' if request else 'http_recv_response',
++                           timeout_ms=timeout_ms)
++        self.stream = True
++
++    def dump(self):
++        return 'ASTFCmdHTTPReceive({0!r}, {1})'.format(
++            self.fields['name'] == 'http_recv_request', self.fields['timeout_ms'])
++
  class ASTFCmdConnect(ASTFCmd):
      def __init__(self):
          super(ASTFCmdConnect, self).__init__()
-@@ -336,7 +342,7 @@
+@@ -336,7 +356,7 @@
      MAX_DELAY = 700000 
      MAX_KEEPALIVE = 500000 
  
@@ -94,7 +124,7 @@ diff --git a/scripts/automation/trex_control_plane/interactive/trex/astf/trex_as
          """
  
          :parameters:
-@@ -358,6 +364,24 @@
+@@ -358,6 +378,24 @@
  
                    udp_mtu: int or None
                        MTU for udp packets, if packets exceeding the specified value they will be cut down from L7 in order to fit. defaults to None.
@@ -119,7 +149,7 @@ diff --git a/scripts/automation/trex_control_plane/interactive/trex/astf/trex_as
  
                    addon : string
                        add-on name to handle data between program and base protocol.
-@@ -388,6 +412,109 @@
+@@ -388,6 +426,117 @@
          self.udp_mtu = udp_mtu
          self.s_delay = s_delay
          self.addon = addon
@@ -207,29 +237,37 @@ diff --git a/scripts/automation/trex_control_plane/interactive/trex/astf/trex_as
 +                raise ASTFError("TLS ALPN must be http/1.1 or h2")
 +        self.http = None
 +        if http is not None:
-+            if (not isinstance(http, dict) or not stream or addon is not None or side != 'c'
++            if (not isinstance(http, dict) or not stream or addon is not None
 +                    or (self.tls is not None and self.tls.get('alpn', 'http/1.1') != 'http/1.1')):
-+                raise ASTFError("http response validation requires a TCP HTTP/1.1 client program without an addon")
++                raise ASTFError("http parsing requires a TCP HTTP/1.1 program without an addon")
 +            limits = {'responses': (1, 1000000), 'expected_status': (200, 599),
++                      'requests': (1, 1000000), 'expected_body_bytes': (0, 1073741824),
 +                      'max_header_bytes': (512, 65536), 'max_body_bytes': (0, 1073741824)}
-+            if set(http) - set(limits) - {'body_contains', 'transactions'}:
++            if set(http) - set(limits) - {'body_contains', 'transactions', 'head_response'}:
 +                raise ASTFError("Unknown HTTP validation option")
 +            for name, value in http.items():
 +                if name == 'body_contains':
 +                    if not isinstance(value,str) or not 1 <= len(value.encode('utf-8')) <= 4096:
 +                        raise ASTFError('body_contains must be a nonempty UTF-8 string, at most 4096 bytes')
 +                    continue
-+                if name == 'transactions':
-+                    if not isinstance(value,bool): raise ASTFError('transactions must be boolean')
++                if name in ('transactions', 'head_response'):
++                    if not isinstance(value,bool): raise ASTFError(name + ' must be boolean')
 +                    continue
 +                lo, hi = limits[name]
 +                if isinstance(value, bool) or not isinstance(value, int) or not lo <= value <= hi:
 +                    raise ASTFError("Invalid HTTP validation option: " + name)
++            if side == 's' and any(k in http for k in ('responses','transactions','expected_status','head_response')):
++                raise ASTFError('Server HTTP options use requests, not response validation options')
++            if side == 'c' and 'requests' in http:
++                raise ASTFError('Client HTTP options use responses')
++            if http.get('expected_body_bytes',0) > http.get('max_body_bytes',1073741824):
++                raise ASTFError('expected_body_bytes exceeds max_body_bytes')
 +            self.http = dict(http)
++            if side == 's': self.http['server'] = True
          if file is not None:
              cap = pcap_reader(_ASTFCapPath.get_pcap_file_path(file))
              cap.analyze()
-@@ -510,6 +637,21 @@
+@@ -510,6 +659,21 @@
          cmd.index = None
          self.fields['commands'].append(cmd)
  
@@ -251,7 +289,7 @@ diff --git a/scripts/automation/trex_control_plane/interactive/trex/astf/trex_as
      def set_send_blocking (self,block):
          """
             set_send_blocking (block), set the stream transmit mode 
-@@ -679,6 +821,16 @@
+@@ -679,6 +843,31 @@
          """
  
          self.fields['commands'].append(ASTFCmdNoClose())
@@ -265,13 +303,31 @@ diff --git a/scripts/automation/trex_control_plane/interactive/trex/astf/trex_as
 +        if self.http is None or not self.http.get('transactions',False):
 +            raise ASTFError('http_request_start requires http transactions=True')
 +        self.fields['commands'].append(ASTFCmdHTTPRequest())
++
++    def _recv_http(self, request, timeout_ms):
++        if self.http is None or bool(self.http.get('server',False)) != request:
++            raise ASTFError('HTTP receive command requires matching HTTP client/server options')
++        if isinstance(timeout_ms,bool) or not isinstance(timeout_ms,int) or not 1 <= timeout_ms <= 86400000:
++            raise ASTFError('HTTP receive timeout_ms must be 1..86400000')
++        self.fields['commands'].append(ASTFCmdHTTPReceive(request,timeout_ms))
++
++    def recv_http_request(self, timeout_ms=30000):
++        """Wait for one complete HTTP/1.1 request on the server."""
++        self._recv_http(True,timeout_ms)
++
++    def recv_http_response(self, timeout_ms=30000):
++        """Wait for one validated HTTP/1.1 response on the client."""
++        self._recv_http(False,timeout_ms)
  
      def connect(self):
          """
-@@ -1141,10 +1293,19 @@
+@@ -1141,10 +1330,22 @@
  
      def to_json(self):
          self.__compile()
++        names = {cmd.fields['name'] for cmd in self.fields['commands']}
++        if 'rx' in names and names & {'http_recv_request', 'http_recv_response'}:
++            raise ASTFError('Byte and HTTP message receives cannot be mixed in one program')
 +        if self.http2 is not None and (len(self.fields['commands'])!=1 or self.fields['commands'][0].fields['name']!='http2'):
 +            raise ASTFError('HTTP/2 program owns its session; additional ASTF commands are not supported')
          ret = {}
@@ -288,23 +344,28 @@ diff --git a/scripts/automation/trex_control_plane/interactive/trex/astf/trex_as
          if self.stream==False:
              ret['stream']=False
          if self.addon:
-@@ -1156,7 +1317,14 @@
+@@ -1156,8 +1357,18 @@
          for cmd in self.fields['commands']:
              out.write("cmd_list.append({0})\n".format(cmd.dump()))
  
 -        out.write("{0} = {1}()\n".format(var_name, self.__class__.__name__))
+-        out.write("{0}.set_cmds(cmd_list)\n".format(var_name))
++        http_options = dict(self.http) if self.http is not None else None
++        http_server = http_options.pop('server', False) if http_options is not None else False
 +        if self.tls is not None:
 +            options = dict(self.tls)
 +            side = 's' if options.pop('server') else 'c'
-+            out.write("{0} = {1}(side={2!r}, tls={3!r}, http={4!r})\n".format(var_name, self.__class__.__name__, side, options, self.http))
++            out.write("{0} = {1}(side={2!r}, tls={3!r}, http={4!r}, commands=cmd_list)\n".format(var_name, self.__class__.__name__, side, options, http_options))
++        elif http_server:
++            out.write("{0} = {1}(side='s', http={2!r}, commands=cmd_list)\n".format(var_name, self.__class__.__name__, http_options))
 +        elif self.http is not None:
-+            out.write("{0} = {1}(http={2!r})\n".format(var_name, self.__class__.__name__, self.http))
++            out.write("{0} = {1}(http={2!r}, commands=cmd_list)\n".format(var_name, self.__class__.__name__, self.http))
 +        else:
-+            out.write("{0} = {1}()\n".format(var_name, self.__class__.__name__))
-         out.write("{0}.set_cmds(cmd_list)\n".format(var_name))
++            out.write("{0} = {1}(commands=cmd_list)\n".format(var_name, self.__class__.__name__))
  
      @property
-@@ -1907,6 +2075,9 @@
+     def payload_len(self):
+@@ -1907,6 +2118,9 @@
                      }
          ArgVerify.verify(self.__class__.__name__, ver_args)
  
@@ -363,7 +424,7 @@ diff --git a/src/astf/astf_db.cpp b/src/astf/astf_db.cpp
      } catch(std::exception &e) {
          assert(0);
      }
-@@ -430,11 +443,14 @@
+@@ -430,11 +443,16 @@
      Json::Value cmd;
  
      try {
@@ -375,11 +436,13 @@ diff --git a/src/astf/astf_db.cpp b/src/astf/astf_db.cpp
  
 +    if (cmd["name"] == "http2") return tcHTTP2;
 +    if (cmd["name"] == "udp_request") return tcUDP_REQUEST;
++    if (cmd["name"] == "http_recv_request") return tcHTTP_RECV_REQUEST;
++    if (cmd["name"] == "http_recv_response") return tcHTTP_RECV_RESPONSE;
 +    if (cmd["name"] == "http_request") return tcHTTP_REQUEST;
      if (cmd["name"] == "tx") {
          return tcTX_BUFFER;
      }
-@@ -505,7 +521,7 @@
+@@ -505,7 +523,7 @@
      Json::Value cmd;
  
      try {
@@ -388,7 +451,7 @@ diff --git a/src/astf/astf_db.cpp b/src/astf/astf_db.cpp
      } catch(std::exception &e) {
          assert(0);
      }
-@@ -517,7 +533,7 @@
+@@ -517,7 +535,7 @@
  
  void CAstfDB::assert_cmd(uint32_t program_index, uint32_t cmd_index, const std::string &cmd_name, Json::Value &cmd) {
      try {
@@ -397,7 +460,7 @@ diff --git a/src/astf/astf_db.cpp b/src/astf/astf_db.cpp
      } catch(std::exception &e) {
          assert(0);
      }
-@@ -1723,6 +1739,150 @@
+@@ -1723,6 +1741,167 @@
          bool is_stream = get_emul_stream(program_index);
          prog->set_stream(is_stream);
          prog->set_addon(get_emul_addon(program_index));
@@ -460,7 +523,7 @@ diff --git a/src/astf/astf_db.cpp b/src/astf/astf_db.cpp
 +                if (!http.isObject() || !m_val["program_list"][program_index].get("stream",true).asBool())
 +                    throw std::runtime_error("HTTP response validation requires a TCP client");
 +#ifdef TREX_TLS
-+                if (prog->m_tls_context && (prog->m_tls_context->config.server || prog->m_tls_context->config.alpn != "http/1.1"))
++                if (prog->m_tls_context && (prog->m_tls_context->config.alpn != "http/1.1"))
 +                    throw std::runtime_error("HTTP response validation requires HTTP/1.1 on the client");
 +#endif
 +                auto &cfg=prog->m_http; cfg.enabled=true;
@@ -470,18 +533,29 @@ diff --git a/src/astf/astf_db.cpp b/src/astf/astf_db.cpp
 +                            throw std::runtime_error("body_contains must be 1..4096 UTF-8 bytes");
 +                        cfg.body_contains=http[name].asString(); continue;
 +                    }
++                    if (name=="server" || name=="head_response") {
++                        if (!http[name].isBool()) throw std::runtime_error("HTTP flag must be boolean");
++                        if(name=="server") cfg.request=http[name].asBool();
++                        else cfg.head_response=http[name].asBool();
++                        continue;
++                    }
 +                    if (name=="transactions") {
 +                        if (!http[name].isBool()) throw std::runtime_error("transactions must be boolean");
 +                        cfg.transactions=http[name].asBool(); continue;
 +                    }
 +                    if (!http[name].isUInt()) throw std::runtime_error("HTTP option must be an unsigned integer");
 +                    uint32_t v=http[name].asUInt();
-+                    if (name=="responses") cfg.responses=v;
++                    if (name=="responses" || name=="requests") cfg.responses=v;
++                    else if (name=="expected_body_bytes") cfg.expected_body_bytes=v;
 +                    else if (name=="expected_status") cfg.expected_status=v;
 +                    else if (name=="max_header_bytes") cfg.max_header_bytes=v;
 +                    else if (name=="max_body_bytes") cfg.max_body_bytes=v;
 +                    else throw std::runtime_error("Unknown HTTP option: " + name);
 +                }
++                if ((cfg.request && (http.isMember("responses") || cfg.transactions || http.isMember("expected_status") || cfg.head_response)) ||
++                    (!cfg.request && http.isMember("requests")) ||
++                    (cfg.expected_body_bytes>=0 && uint64_t(cfg.expected_body_bytes)>cfg.max_body_bytes))
++                    throw std::runtime_error("HTTP options conflict with role or body limit");
 +                if (!cfg.responses || cfg.responses>1000000 || cfg.expected_status<200 || cfg.expected_status>599 ||
 +                    cfg.max_header_bytes<512 || cfg.max_header_bytes>65536 || cfg.max_body_bytes>1073741824)
 +                    throw std::runtime_error("HTTP option outside supported bounds");
@@ -545,16 +619,33 @@ diff --git a/src/astf/astf_db.cpp b/src/astf/astf_db.cpp
 +#endif
 +            } catch(const std::exception &e) {delete prog;throw TrexException(std::string("HTTP/2 profile: ")+e.what());}
 +        }
++        bool message_rx=false, byte_rx=false;
++        for(const auto &c : m_val["program_list"][program_index]["commands"]) {
++            message_rx |= c["name"]=="http_recv_request" || c["name"]=="http_recv_response";
++            byte_rx |= c["name"]=="rx";
++        }
++        if(message_rx && byte_rx) {delete prog; throw TrexException("Cannot mix HTTP message waits and byte receive commands");}
          uint64_t total_rx_wm = 0;
  
          cmd_index = 0;
-@@ -1757,6 +1917,15 @@
+@@ -1757,6 +1936,26 @@
                  cmd.m_cmd = tcDONT_CLOSE;
                  prog->add_cmd(cmd);
                  break;
 +            case tcHTTP2:
 +                if(!prog->m_http2.enabled) {delete prog;throw TrexException("http2 command requires HTTP/2 options");}
 +                cmd.m_cmd=tcHTTP2;prog->add_cmd(cmd);break;
++            case tcHTTP_RECV_REQUEST:
++            case tcHTTP_RECV_RESPONSE: {
++                const auto &j=m_val["program_list"][program_index]["commands"][cmd_index];
++                if(!prog->m_http.enabled || prog->m_http.request!=(cmd_type==tcHTTP_RECV_REQUEST) ||
++                   !j["timeout_ms"].isUInt() || !j["timeout_ms"].asUInt() || j["timeout_ms"].asUInt()>86400000) {
++                    delete prog;throw TrexException("Invalid HTTP message wait role or timeout");
++                }
++                cmd.m_cmd=cmd_type;
++                cmd.u.m_delay_cmd.m_ticks=j["timeout_ms"].asUInt(); // milliseconds, converted at execution
++                prog->add_cmd(cmd);break;
++            }
 +            case tcHTTP_REQUEST:
 +                if (!prog->m_http.enabled || !prog->m_http.transactions) {
 +                    delete prog;
@@ -564,7 +655,7 @@ diff --git a/src/astf/astf_db.cpp b/src/astf/astf_db.cpp
              case tcCONNECT_WAIT:
                  cmd.m_cmd = tcCONNECT_WAIT;
                  prog->add_cmd(cmd);
-@@ -1802,6 +1971,21 @@
+@@ -1802,6 +2001,21 @@
                  prog->add_cmd(cmd);
                  break;
  
@@ -586,7 +677,7 @@ diff --git a/src/astf/astf_db.cpp b/src/astf/astf_db.cpp
              case tcTX_PKT :
                  cmd.m_cmd = tcTX_PKT;
                  fill_tx_pkt(program_index, cmd_index,socket_id,cmd);
-@@ -1862,8 +2046,13 @@
+@@ -1862,8 +2076,13 @@
          if (!prog->sanity_check(err)){
              prog->Dump(stdout);
              fprintf(stdout,"ERROR program is not valid '%s' \n",err.c_str());
@@ -600,7 +691,7 @@ diff --git a/src/astf/astf_db.cpp b/src/astf/astf_db.cpp
          m_tcp_data[socket_id].m_prog_list.push_back(prog);
          m_prog_lens.push_back(prog_len);
          prog_len = 0;
-@@ -1949,9 +2138,8 @@
+@@ -1949,9 +2168,8 @@
  }
  
  void CAstfDbRO::Delete() {
@@ -649,7 +740,7 @@ diff --git a/src/astf/astf_json_validator.cpp b/src/astf/astf_json_validator.cpp
          int pinx_c=temp["client_template"]["program_index"].asInt();
          int pinx_s=temp["server_template"]["program_index"].asInt();
          int ip_gen_c=temp["client_template"]["ip_gen"]["dist_client"]["index"].asInt();
-@@ -122,6 +129,55 @@
+@@ -122,6 +129,56 @@
          err = ss.str();
          return(false);
      }
@@ -666,8 +757,9 @@ diff --git a/src/astf/astf_json_validator.cpp b/src/astf/astf_json_validator.cpp
 +                    return false;
 +                }
 +            }
-+            if (!program["http"].isNull() && (server || !program.get("stream",true).asBool() || !program["addon"].isNull())) {
-+                err = "HTTP response validation requires a TCP client program";
++            if (!program["http"].isNull() && (!program.get("stream",true).asBool() || !program["addon"].isNull() ||
++                 program["http"].get("server",false).asBool()!=server)) {
++                err = "HTTP options must match TCP template role without addon";
 +                return false;
 +            }
 +            const auto &tls = profile["program_list"][index]["tls"];

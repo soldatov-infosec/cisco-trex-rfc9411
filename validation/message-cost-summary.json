@@ -1,0 +1,177 @@
+{
+  "scope": "same-engine byte-receive versus message-receive; simulation under x86_64 emulation; not NIC or released-baseline measurement",
+  "rows": [
+    {
+      "transport": "TCP",
+      "repeat": 0,
+      "message": 0,
+      "flows": "64",
+      "cpu_seconds": 0.007637333,
+      "acks": "384"
+    },
+    {
+      "transport": "TCP",
+      "repeat": 0,
+      "message": 1,
+      "flows": "64",
+      "cpu_seconds": 0.00790283,
+      "acks": "384"
+    },
+    {
+      "transport": "TCP",
+      "repeat": 1,
+      "message": 1,
+      "flows": "64",
+      "cpu_seconds": 0.008971636,
+      "acks": "384"
+    },
+    {
+      "transport": "TCP",
+      "repeat": 1,
+      "message": 0,
+      "flows": "64",
+      "cpu_seconds": 0.007786501,
+      "acks": "384"
+    },
+    {
+      "transport": "TCP",
+      "repeat": 2,
+      "message": 0,
+      "flows": "64",
+      "cpu_seconds": 0.008653416,
+      "acks": "384"
+    },
+    {
+      "transport": "TCP",
+      "repeat": 2,
+      "message": 1,
+      "flows": "64",
+      "cpu_seconds": 0.008711921,
+      "acks": "384"
+    },
+    {
+      "transport": "TCP",
+      "repeat": 3,
+      "message": 1,
+      "flows": "64",
+      "cpu_seconds": 0.007802128,
+      "acks": "384"
+    },
+    {
+      "transport": "TCP",
+      "repeat": 3,
+      "message": 0,
+      "flows": "64",
+      "cpu_seconds": 0.010424041,
+      "acks": "384"
+    },
+    {
+      "transport": "TCP",
+      "repeat": 4,
+      "message": 0,
+      "flows": "64",
+      "cpu_seconds": 0.008245041,
+      "acks": "384"
+    },
+    {
+      "transport": "TCP",
+      "repeat": 4,
+      "message": 1,
+      "flows": "64",
+      "cpu_seconds": 0.008813422,
+      "acks": "384"
+    },
+    {
+      "transport": "TLS13",
+      "repeat": 0,
+      "message": 0,
+      "flows": "64",
+      "cpu_seconds": 0.066908961,
+      "acks": "3648"
+    },
+    {
+      "transport": "TLS13",
+      "repeat": 0,
+      "message": 1,
+      "flows": "64",
+      "cpu_seconds": 0.064883291,
+      "acks": "3648"
+    },
+    {
+      "transport": "TLS13",
+      "repeat": 1,
+      "message": 1,
+      "flows": "64",
+      "cpu_seconds": 0.071027385,
+      "acks": "3648"
+    },
+    {
+      "transport": "TLS13",
+      "repeat": 1,
+      "message": 0,
+      "flows": "64",
+      "cpu_seconds": 0.066852212,
+      "acks": "3648"
+    },
+    {
+      "transport": "TLS13",
+      "repeat": 2,
+      "message": 0,
+      "flows": "64",
+      "cpu_seconds": 0.063451215,
+      "acks": "3648"
+    },
+    {
+      "transport": "TLS13",
+      "repeat": 2,
+      "message": 1,
+      "flows": "64",
+      "cpu_seconds": 0.062515336,
+      "acks": "3648"
+    },
+    {
+      "transport": "TLS13",
+      "repeat": 3,
+      "message": 1,
+      "flows": "64",
+      "cpu_seconds": 0.083389574,
+      "acks": "3648"
+    },
+    {
+      "transport": "TLS13",
+      "repeat": 3,
+      "message": 0,
+      "flows": "64",
+      "cpu_seconds": 0.079532043,
+      "acks": "3648"
+    },
+    {
+      "transport": "TLS13",
+      "repeat": 4,
+      "message": 0,
+      "flows": "64",
+      "cpu_seconds": 0.064433125,
+      "acks": "3648"
+    },
+    {
+      "transport": "TLS13",
+      "repeat": 4,
+      "message": 1,
+      "flows": "64",
+      "cpu_seconds": 0.066644339,
+      "acks": "3648"
+    }
+  ],
+  "summary": {
+    "TCP": {
+      "paired_ratio_median": 1.0347630514474098,
+      "paired_ratio_min": 0.7484744160158234,
+      "paired_ratio_max": 1.1522037947468318
+    },
+    "TLS13": {
+      "paired_ratio_median": 1.0343179692122646,
+      "paired_ratio_min": 0.9697249819796184,
+      "paired_ratio_max": 1.0624537749027663
+    }
+  }
+}

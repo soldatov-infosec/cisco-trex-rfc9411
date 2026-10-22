@@ -2,7 +2,7 @@ diff --git a/src/44bsd/http/astf_http.h b/src/44bsd/http/astf_http.h
 new file mode 100644
 --- /dev/null
 +++ b/src/44bsd/http/astf_http.h
-@@ -0,0 +1,197 @@
+@@ -0,0 +1,283 @@
 +/* SPDX-License-Identifier: Apache-2.0 */
 +#ifndef TREX_ASTF_HTTP_H
 +#define TREX_ASTF_HTTP_H
@@ -10,6 +10,8 @@ new file mode 100644
 +#include <cstdint>
 +#include <cstring>
 +#include <vector>
++#include <memory>
++#include <limits>
 +#include <string>
 +namespace astf_http {
 +struct Config {
@@ -19,16 +21,19 @@ new file mode 100644
 +    unsigned expected_status=200;
 +    std::string body_contains; // UTF-8 bytes in the dechunked body, per response.
 +    bool transactions=false;
++    // Request framing and HEAD responses are opt-in; legacy response defaults remain.
++    bool request=false, head_response=false;
++    int64_t expected_body_bytes=-1; // Dechunked bytes; -1 disables exact-size checking.
 +};
 +enum class Error { NONE, STATUS, FRAMING, LIMIT, TRUNCATED, EXCESS, CONTENT, TRANSACTION };
-+// Streaming HTTP/1.x GET response validator. A single bounded allocation at
++// Streaming HTTP/1.x request/response validator. A single bounded allocation at
 +// flow creation; body bytes are skipped, never retained or copied. No callbacks
 +// into the application while the parser holds an input buffer.
 +class Response {
 +public:
 +    typedef bool (*Event)(void *, bool); // false: first byte; true: validated response end
 +    explicit Response(const Config &c, Event event=nullptr, void *owner=nullptr):
-+        cfg(c), line(c.max_header_bytes+1), prefix(c.body_contains.size()), event(event), owner(owner) {
++        cfg(c), line(new char[size_t(c.max_header_bytes)+1]), prefix(c.body_contains.size()), event(event), owner(owner) {
 +        for (size_t i=1,j=0;i<prefix.size();++i) {
 +            while (j && cfg.body_contains[i]!=cfg.body_contains[j]) j=prefix[j-1];
 +            if (cfg.body_contains[i]==cfg.body_contains[j]) ++j;
@@ -39,8 +44,21 @@ new file mode 100644
 +    bool done() const { return error==Error::NONE && count==cfg.responses; }
 +    Error failure() const { return error; }
 +    bool feed(const uint8_t *p, size_t len) {
++        size_t consumed=0;
++        return feed(p,len,consumed,false);
++    }
++    // Stop at one complete message when requested. The caller owns the unconsumed
++    // suffix; this parser neither copies it nor invokes ASTF command execution.
++    bool feed(const uint8_t *p, size_t len, size_t &consumed, bool one_message) {
++        const uint32_t initial_count=count;
++        struct Consumption {
++            size_t &out; const size_t total; size_t &remaining;
++            ~Consumption() { out=total-remaining; }
++        } consumption{consumed,len,len};
++        consumed=0;
 +        if (error!=Error::NONE) return false;
 +        while (len) {
++            if (one_message && count!=initial_count) return error==Error::NONE;
 +            if (error!=Error::NONE) return false;
 +            if (done()) return fail(Error::EXCESS);
 +            if (!started) {
@@ -49,17 +67,18 @@ new file mode 100644
 +            }
 +            if (state==BODY || state==CHUNK_BODY) {
 +                size_t n=size_t(std::min<uint64_t>(left,len));
-+                body_data(p,n); p+=n; len-=n; left-=n;
++                body_data(p,n); body+=n; p+=n; len-=n; left-=n;
 +                if (!left) { if (state==BODY) finish(); else state=CHUNK_CR; }
 +                continue;
 +            }
 +            if (state==CLOSE_BODY) {
 +                if (len>cfg.max_body_bytes-body) return fail(Error::LIMIT);
-+                body_data(p,len); body+=len; return true;
++                body_data(p,len); body+=len; len=0; return true;
 +            }
 +            if (state==CHUNK_CR || state==CHUNK_LF) {
-+                if (*p++ != (state==CHUNK_CR ? '\r' : '\n')) return fail(Error::FRAMING);
-+                --len; state=state==CHUNK_CR ? CHUNK_LF : CHUNK_SIZE; continue;
++                const unsigned char c=*p++; --len;
++                if (c != (state==CHUNK_CR ? '\r' : '\n')) return fail(Error::FRAMING);
++                state=state==CHUNK_CR ? CHUNK_LF : CHUNK_SIZE; continue;
 +            }
 +            unsigned char c=*p++; --len;
 +            if ((c<32 && c!='\r' && c!='\n' && c!='\t') || c==127) return fail(Error::FRAMING);
@@ -69,10 +88,13 @@ new file mode 100644
 +            if (c!='\n') continue;
 +            if (used<2 || line[used-2]!='\r') return fail(Error::FRAMING);
 +            size_t n=used-2; line[n]=0;
-+            if (std::memchr(line.data(),'\r',n)) return fail(Error::FRAMING);
++            if (std::memchr(line.get(),'\r',n)) return fail(Error::FRAMING);
 +            used=0;
-+            if (state==STATUS_LINE) {
-+                if (n<12 || (std::memcmp(line.data(),"HTTP/1.1 ",9) && std::memcmp(line.data(),"HTTP/1.0 ",9)) ||
++            if (state==STATUS_LINE && cfg.request) {
++                if (!request_line(n)) return fail(Error::FRAMING);
++                state=HEADERS;
++            } else if (state==STATUS_LINE) {
++                if (n<12 || (std::memcmp(line.get(),"HTTP/1.1 ",9) && std::memcmp(line.get(),"HTTP/1.0 ",9)) ||
 +                    (n>12 && line[12]!=' ')) return fail(Error::FRAMING);
 +                status=0;
 +                for (size_t i=9;i<12;++i) {
@@ -85,13 +107,18 @@ new file mode 100644
 +                if (n) { if (!field(n,false)) return false; }
 +                else {
 +                    if (has_length && chunked) return fail(Error::FRAMING);
-+                    if (status<200) {
++                    if (cfg.request) {
++                        // Requests without an explicit body length have no body.
++                        if (chunked) state=CHUNK_SIZE;
++                        else if (has_length && left) state=BODY;
++                        else finish();
++                    } else if (status<200) {
 +                        if (has_length || chunked || ++interims>16) return fail(Error::FRAMING);
 +                        state=STATUS_LINE; // Bound all informational headers together.
 +                    } else {
 +                        if (status!=cfg.expected_status) return fail(Error::STATUS);
-+                        if (status==204 || status==304) {
-+                            if (chunked || (status==204 && left)) return fail(Error::FRAMING);
++                        if (cfg.head_response || status==204 || status==304) {
++                            if (status==204 && (chunked || has_length)) return fail(Error::FRAMING);
 +                            finish();
 +                        } else if (chunked) state=CHUNK_SIZE;
 +                        else if (has_length) { if (left) state=BODY; else finish(); }
@@ -100,16 +127,16 @@ new file mode 100644
 +                }
 +            } else if (state==CHUNK_SIZE) {
 +                uint64_t value=0; size_t i=0;
-+                for (;i<n && line[i]!=';';++i) {
++                for (;i<n;++i) {
 +                    int digit=hex(line[i]);
-+                    if (digit<0) return fail(Error::FRAMING);
++                    if (digit<0) break;
 +                    if (uint64_t(digit)>cfg.max_body_bytes || value>(cfg.max_body_bytes-uint64_t(digit))/16)
 +                        return fail(Error::LIMIT);
 +                    value=value*16+unsigned(digit);
 +                }
-+                if (!i) return fail(Error::FRAMING);
++                if (!i || !chunk_extensions(i,n)) return fail(Error::FRAMING);
 +                if (value>cfg.max_body_bytes-body) return fail(Error::LIMIT);
-+                body+=value; left=value;
++                left=value;
 +                if (value) state=CHUNK_BODY;
 +                else { state=TRAILERS; header_bytes=0; }
 +            } else if (state==TRAILERS) {
@@ -128,7 +155,9 @@ new file mode 100644
 +private:
 +    enum State { STATUS_LINE, HEADERS, BODY, CLOSE_BODY, CHUNK_SIZE, CHUNK_BODY, CHUNK_CR, CHUNK_LF, TRAILERS };
 +    Config cfg;
-+    std::vector<char> line;
++    // Only bytes already received are read; avoid clearing the header limit
++    // worth of memory on every new connection. Capacity stays bounded.
++    std::unique_ptr<char[]> line;
 +    std::vector<size_t> prefix;
 +    Event event; void *owner;
 +    size_t matched=0;
@@ -163,6 +192,56 @@ new file mode 100644
 +        }
 +        return true;
 +    }
++    static bool token(unsigned char c) {
++        return (c>='a'&&c<='z') || (c>='A'&&c<='Z') || (c>='0'&&c<='9') ||
++               (c && std::strchr("!#$%&'*+-.^_`|~",c));
++    }
++    bool chunk_extensions(size_t i, size_t n) const {
++        // RFC 9112 section 7.1.1: validate syntax, ignore extension semantics.
++        while (i<n) {
++            while (i<n && (line[i]==' ' || line[i]=='\t')) ++i;
++            if (i==n || line[i++]!=';') return false;
++            while (i<n && (line[i]==' ' || line[i]=='\t')) ++i;
++            const size_t start=i;
++            while (i<n && token(line[i])) ++i;
++            if (i==start) return false;
++            const size_t after_name=i;
++            while (i<n && (line[i]==' ' || line[i]=='\t')) ++i;
++            if (i==n || line[i]!='=') { i=after_name; continue; }
++            ++i;
++            while (i<n && (line[i]==' ' || line[i]=='\t')) ++i;
++            if (i==n) return false;
++            if (line[i]=='"') {
++                ++i;
++                while (i<n && line[i]!='"') {
++                    if (line[i]=='\\' && ++i==n) return false;
++                    ++i; // Controls other than HTAB were rejected by line scanning.
++                }
++                if (i==n) return false;
++                ++i;
++            } else {
++                const size_t value=i;
++                while (i<n && token(line[i])) ++i;
++                if (i==value) return false;
++            }
++        }
++        return true;
++    }
++    bool request_line(size_t n) {
++        size_t method=0;
++        while (method<n && token(line[method])) ++method;
++        if (!method || method==n || line[method]!=' ') return false;
++        // Tunnels need a different interpreter and are not HTTP messages here.
++        if (method==7 && !std::memcmp(line.get(),"CONNECT",7)) return false;
++        size_t end=method+1;
++        while (end<n && line[end]!=' ') {
++            if (static_cast<unsigned char>(line[end])<=32) return false;
++            ++end;
++        }
++        if (end==method+1 || n-end!=9) return false;
++        return !std::memcmp(line.get()+end," HTTP/1.1",9) ||
++               !std::memcmp(line.get()+end," HTTP/1.0",9);
++    }
 +    bool field(size_t n, bool trailer) {
 +        size_t colon=0;
 +        while (colon<n && line[colon]!=':') {
@@ -174,23 +253,30 @@ new file mode 100644
 +        size_t first=colon+1;
 +        while (first<n && (line[first]==' ' || line[first]=='\t')) ++first;
 +        while (n>first && (line[n-1]==' ' || line[n-1]=='\t')) --n;
-+        if (equal(line.data(),colon,"content-length")) {
++        if (cfg.request && (equal(line.get(),colon,"upgrade") ||
++                            equal(line.get(),colon,"expect"))) return fail(Error::FRAMING);
++        if (equal(line.get(),colon,"content-length")) {
 +            if (trailer || has_length || first==n) return fail(Error::FRAMING);
++            const uint64_t limit=(!cfg.request && (cfg.head_response || status==304))
++                ? std::numeric_limits<uint64_t>::max() : cfg.max_body_bytes;
 +            uint64_t value=0;
 +            for (size_t i=first;i<n;++i) {
 +                if (line[i]<'0' || line[i]>'9') return fail(Error::FRAMING);
 +                unsigned digit=unsigned(line[i]-'0');
-+                if (digit>cfg.max_body_bytes || value>(cfg.max_body_bytes-digit)/10) return fail(Error::LIMIT);
++                if (digit>limit || value>(limit-digit)/10) return fail(Error::LIMIT);
 +                value=value*10+digit;
 +            }
 +            has_length=true; left=value;
-+        } else if (equal(line.data(),colon,"transfer-encoding")) {
-+            if (trailer || chunked || !equal(line.data()+first,n-first,"chunked")) return fail(Error::FRAMING);
++        } else if (equal(line.get(),colon,"transfer-encoding")) {
++            if (trailer || chunked || !equal(line.get()+first,n-first,"chunked")) return fail(Error::FRAMING);
 +            chunked=true;
 +        }
 +        return true;
 +    }
 +    void finish() {
++        if (cfg.expected_body_bytes>=0 && body!=uint64_t(cfg.expected_body_bytes)) {
++            fail(Error::CONTENT); return;
++        }
 +        if (!cfg.body_contains.empty() && !found) { fail(Error::CONTENT); return; }
 +        if (event && !event(owner,true)) { fail(Error::TRANSACTION); return; }
 +        matched=0; found=started=false;
